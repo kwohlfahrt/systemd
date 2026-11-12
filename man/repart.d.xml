@@ -141,27 +141,27 @@
               </row>
 
               <row>
-                <entry><constant>root-verity</constant></entry>
+                <entry><constant>root-verity</constant>, <constant>root-vty</constant></entry>
                 <entry>Verity data for the root file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-verity-sig</constant></entry>
+                <entry><constant>root-verity-sig</constant>, <constant>root-vsig</constant></entry>
                 <entry>Verity signature data for the root file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-secondary</constant></entry>
+                <entry><constant>root-secondary</constant>, <constant>root2</constant></entry>
                 <entry>Root file system partition of the secondary architecture of the local architecture (usually the matching 32-bit architecture for the local 64-bit architecture)</entry>
               </row>
 
               <row>
-                <entry><constant>root-secondary-verity</constant></entry>
+                <entry><constant>root-secondary-verity</constant>, <constant>root-vty2</constant></entry>
                 <entry>Verity data for the root file system partition of the secondary architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-secondary-verity-sig</constant></entry>
+                <entry><constant>root-secondary-verity-sig</constant>, <constant>root-vsig2</constant></entry>
                 <entry>Verity signature data for the root file system partition of the secondary architecture</entry>
               </row>
 
@@ -171,12 +171,12 @@
               </row>
 
               <row>
-                <entry><constant>root-{arch}-verity</constant></entry>
+                <entry><constant>root-{arch}-verity</constant>, <constant>root-{arch}-vty</constant></entry>
                 <entry>Verity data for the root file system partition of the given architecture</entry>
               </row>
 
               <row>
-                <entry><constant>root-{arch}-verity-sig</constant></entry>
+                <entry><constant>root-{arch}-verity-sig</constant>, <constant>root-{arch}-vsig</constant></entry>
                 <entry>Verity signature data for the root file system partition of the given architecture</entry>
               </row>
 
@@ -186,27 +186,27 @@
               </row>
 
               <row>
-                <entry><constant>usr-verity</constant></entry>
+                <entry><constant>usr-verity</constant>, <constant>usr-vty</constant></entry>
                 <entry>Verity data for the <filename>/usr/</filename> file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-verity-sig</constant></entry>
+                <entry><constant>usr-verity-sig</constant>, <constant>usr-vsig</constant></entry>
                 <entry>Verity signature data for the <filename>/usr/</filename> file system partition for the local architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-secondary</constant></entry>
+                <entry><constant>usr-secondary</constant>, <constant>usr2</constant></entry>
                 <entry><filename>/usr/</filename> file system partition of the secondary architecture of the local architecture (usually the matching 32-bit architecture for the local 64-bit architecture)</entry>
               </row>
 
               <row>
-                <entry><constant>usr-secondary-verity</constant></entry>
+                <entry><constant>usr-secondary-verity</constant>, <constant>usr-vty2</constant></entry>
                 <entry>Verity data for the <filename>/usr/</filename> file system partition of the secondary architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-secondary-verity-sig</constant></entry>
+                <entry><constant>usr-secondary-verity-sig</constant>, <constant>usr-vsig2</constant></entry>
                 <entry>Verity signature data for the <filename>/usr/</filename> file system partition of the secondary architecture</entry>
               </row>
 
@@ -216,12 +216,12 @@
               </row>
 
               <row>
-                <entry><constant>usr-{arch}-verity</constant></entry>
+                <entry><constant>usr-{arch}-verity</constant>, <constant>usr-{arch}-vty</constant></entry>
                 <entry>Verity data for the <filename>/usr/</filename> file system partition of the given architecture</entry>
               </row>
 
               <row>
-                <entry><constant>usr-{arch}-verity-sig</constant></entry>
+                <entry><constant>usr-{arch}-verity-sig</constant>, <constant>usr-{arch}-vsig</constant></entry>
                 <entry>Verity signature data for the <filename>/usr/</filename> file system partition of the given architecture</entry>
               </row>
             </tbody>
@@ -236,6 +236,23 @@
         <constant>ppc64-le</constant>, <constant>riscv32</constant>, <constant>riscv64</constant>,
         <constant>s390</constant>, <constant>s390x</constant>, <constant>tilegx</constant>,
         <constant>x86</constant> (32-bit, aka i386) and <constant>x86-64</constant> (64-bit, aka amd64).</para>
+
+        <para>In partition type identifiers, <constant>-vty</constant> stands for
+        <constant>-verity</constant>, <constant>-vsig</constant> stands for <constant>-verity-sig</constant>,
+        and a <constant>2</constant> suffix stands for <constant>-secondary</constant>. For example,
+        <constant>usr-vsig2</constant> is the same partition type as
+        <constant>usr-secondary-verity-sig</constant>. The partition identifiers in
+        <citerefentry><refentrytitle>systemd.image-policy</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        and
+        <citerefentry><refentrytitle>systemd.image-filter</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        accept the same abbreviations.</para>
+
+        <para>GPT limits partition labels to 36 characters. Use an abbreviated identifier in
+        <varname>Label=</varname> to leave more room for a version string, for example
+        <literal>usr-x86-64-vsig_1.2.3</literal>. The label that
+        <citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        derives from the partition type when <varname>Label=</varname> is not set uses the long spelling.
+        <command>systemd-repart</command> always shows partition types with the long spelling.</para>
 
         <para>Most of the partition type UUIDs listed above are defined in the <ulink
         url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">UAPI.2 Discoverable Partitions
@@ -978,6 +995,25 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>ManifestName=</varname></term>
+
+        <listitem><para>Configures the suffix to append to the manifest file written for the partition when
+        the <option>--manifest</option> option of
+        <citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry> is
+        used. The manifest describes the file system tree the partition was populated with (via
+        <varname>CopyFiles=</varname>, <varname>MakeDirectories=</varname>, <varname>MakeSymlinks=</varname>),
+        in the <ulink url="https://uapi-group.org/specifications/specs/file_manifest/">UAPI.16 File
+        Manifest</ulink> format, i.e. what
+        <citerefentry><refentrytitle>systemd-manifest</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        would generate for the tree. Simple specifier expansion is supported, see below, the same
+        specifiers as for <varname>SplitName=</varname> are understood. Defaults to <literal>%t</literal>.
+        To disable manifest generation for a partition, set <varname>ManifestName=</varname> to
+        <literal>-</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v263"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>Minimize=</varname></term>
 
         <listitem><para>Takes one of <literal>off</literal>, <literal>best</literal>, and
@@ -1053,6 +1089,23 @@
         This option will be overridden by the global <varname>--tpm2-pcrs=</varname> option.</para>
 
         <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>TPM2PublicKeyPolicyRef=</varname></term>
+
+        <listitem><para>Configures the policy reference to bind the signed PCR policy to for LUKS2 volumes
+        configured with the <varname>Encrypt=tpm2</varname> setting in partition files. Takes the same
+        parameter as the <option>--tpm2-public-key-policyref=</option> option of
+        <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        and has the same effect on partitions where TPM2 enrollment is requested. For example, set it to
+        <literal>initrd</literal> to only allow unlocking the partition from the initrd, given the PCR
+        signatures for that policy reference were created with <option>--sign-initrd-pcrs</option> of
+        <citerefentry><refentrytitle>ukify</refentrytitle><manvolnum>1</manvolnum></citerefentry>. The
+        setting has no effect if no PCR public key is used. This option will be overridden by the global
+        <option>--tpm2-public-key-policyref=</option> option.</para>
+
+        <xi:include href="version-info.xml" xpointer="v263"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1231,7 +1284,15 @@
         scenarios, which puts together the mount hierarchy from untrusted data from the GPT partition
         table. As these extended attributes are stored inside the file system, they are typically
         authenticated as part of the file system (assuming it is contained in protected volume; i.e. LUKS or
-        dm-verity), and hence may be used to securely validate the matching partition table fields.</para>
+        dm-verity), and hence may be used to securely validate the matching partition table fields. The
+        same constraints are also enforced when the partitions are mounted as part of a disk image, for
+        example via
+        <citerefentry><refentrytitle>systemd-dissect</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        or
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>.
+        Note that this means that a file system generated with this option enabled cannot be used as bare
+        file system image without partition table anymore, since its GPT constraints cannot be fulfilled
+        then.</para>
 
         <xi:include href="version-info.xml" xpointer="v258"/></listitem>
       </varlistentry>
@@ -1263,7 +1324,8 @@
 
     <para>Specifiers may be used in the <varname>Label=</varname>, <varname>CopyBlocks=</varname>,
     <varname>CopyFiles=</varname>, <varname>MakeDirectories=</varname>, <varname>MakeSymlinks=</varname>,
-    <varname>SplitName=</varname> settings. The following expansions are understood:</para>
+    <varname>SplitName=</varname>, <varname>ManifestName=</varname> settings. The following expansions are
+    understood:</para>
       <table class='specifiers'>
         <title>Specifiers available</title>
         <tgroup cols='3' align='left' colsep='1' rowsep='1'>
@@ -1298,8 +1360,8 @@
         </tgroup>
       </table>
 
-    <para>Additionally, for the <varname>SplitName=</varname> setting, the following specifiers are also
-    understood:</para>
+    <para>Additionally, for the <varname>SplitName=</varname> and <varname>ManifestName=</varname> settings,
+    the following specifiers are also understood:</para>
       <table class='specifiers'>
         <title>Specifiers available</title>
         <tgroup cols='3' align='left' colsep='1' rowsep='1'>

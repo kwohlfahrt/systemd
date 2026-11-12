@@ -5,6 +5,7 @@
 #include "alloc-util.h"
 #include "ansi-color.h"
 #include "build.h"
+#include "env-util.h"
 #include "extract-word.h"
 #include "log.h"
 #include "string-util.h"
@@ -232,6 +233,13 @@ const char* const systemd_features =
         " -LIBARCHIVE"
 #endif
 
+#if EXPERIMENTAL == EXPERIMENTAL_ENABLED
+        " +EXPERIMENTAL"
+#elif EXPERIMENTAL == EXPERIMENTAL_ENVVAR
+        " +EXPERIMENTAL-ENVVAR"
+#else
+        " -EXPERIMENTAL"
+#endif
         ;
 
 static char* systemd_features_with_color(void) {
@@ -243,7 +251,7 @@ static char* systemd_features_with_color(void) {
                 _cleanup_free_ char *word = NULL;
                 char *q;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0) {
                         log_warning_errno(r, "Cannot split features string, ignoring: %m");
                         return NULL;
@@ -285,4 +293,20 @@ int version_only(void) {
         /* Used by udev. Dracut relies on the version being a single integer */
         puts(PROJECT_VERSION_STR);
         return 0;
+}
+
+bool experimental_enabled(void) {
+#if EXPERIMENTAL == EXPERIMENTAL_DISABLED
+        return false;
+#else
+        int r;
+
+        r = secure_getenv_bool("SYSTEMD_EXPERIMENTAL");
+        if (r >= 0)
+                return r;
+        if (r != -ENXIO)
+                log_debug_errno(r, "Failed to parse $SYSTEMD_EXPERIMENTAL, ignoring: %m");
+
+        return EXPERIMENTAL == EXPERIMENTAL_ENABLED;
+#endif
 }

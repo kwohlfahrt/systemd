@@ -15,14 +15,17 @@
 #include "escape.h"
 #include "fd-util.h"
 #include "format-util.h"
+#include "fs-util.h"
 #include "iovec-util.h"
 #include "journal-internal.h"
+#include "journald-counters.h"
 #include "journald-kmsg.h"
 #include "journald-manager.h"
 #include "journald-sync.h"
 #include "journald-syslog.h"
 #include "log.h"
 #include "log-ratelimit.h"
+#include "memory-util.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "stdio-util.h"
@@ -276,9 +279,14 @@ void dev_kmsg_record(Manager *m, char *p, size_t l) {
         xsprintf(syslog_facility, "SYSLOG_FACILITY=%i", LOG_FAC(priority));
         iovec[n++] = IOVEC_MAKE_STRING(syslog_facility);
 
-        if (LOG_FAC(priority) == LOG_KERN)
+        /* Messages are counted below, i.e. after the kernel seqnum check above (so that messages we already
+         * saw before a restart of journald are not counted twice), but before any filtering or rate
+         * limiting. Our own messages are not counted. */
+        if (LOG_FAC(priority) == LOG_KERN) {
+                manager_count_message(m, JOURNAL_TRANSPORT_KERNEL, priority);
+
                 iovec[n++] = IOVEC_MAKE_STRING("SYSLOG_IDENTIFIER=kernel");
-        else {
+        } else {
                 _cleanup_free_ char *identifier = NULL;
                 pid_t pid;
 
@@ -293,7 +301,8 @@ void dev_kmsg_record(Manager *m, char *p, size_t l) {
                         saved_log_max_level = log_get_max_level();
                         c = m->my_context;
                         log_set_max_level(LOG_NULL);
-                }
+                } else
+                        manager_count_message(m, JOURNAL_TRANSPORT_KERNEL, priority);
 
                 if (identifier) {
                         syslog_identifier = strjoin("SYSLOG_IDENTIFIER=", identifier);
@@ -310,7 +319,7 @@ void dev_kmsg_record(Manager *m, char *p, size_t l) {
         if (cunescape_length_with_prefix(p, pl, "MESSAGE=", UNESCAPE_RELAX, &message) >= 0)
                 iovec[n++] = IOVEC_MAKE_STRING(message);
 
-        manager_dispatch_message(m, iovec, n, ELEMENTSOF(iovec), c, NULL, priority, 0);
+        manager_dispatch_message(m, iovec, n, ELEMENTSOF(iovec), c, /* tv= */ NULL, priority, /* object_pid= */ 0);
 
         if (saved_log_max_level != INT_MAX)
                 log_set_max_level(saved_log_max_level);
@@ -390,12 +399,12 @@ int manager_open_dev_kmsg(Manager *m) {
         assert(m->dev_kmsg_fd < 0);
         assert(!m->dev_kmsg_event_source);
 
-        mode_t mode = O_CLOEXEC|O_NONBLOCK|O_NOCTTY|(m->config.read_kmsg ? O_RDWR : O_WRONLY);
+        mode_t mode = O_NONBLOCK|O_NOCTTY|(m->config.read_kmsg ? O_RDWR : O_WRONLY);
 
-        _cleanup_close_ int fd = open("/dev/kmsg", mode);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, "/dev/kmsg", mode);
         if (fd < 0) {
-                log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
-                               errno, "Failed to open /dev/kmsg for %s access, ignoring: %m", accmode_to_string(mode));
+                log_full_errno(fd == -ENOENT ? LOG_DEBUG : LOG_WARNING,
+                               fd, "Failed to open /dev/kmsg for %s access, ignoring: %m", accmode_to_string(mode));
                 return 0;
         }
 
@@ -437,20 +446,6 @@ int manager_open_kernel_seqnum(Manager *m) {
         return 0;
 }
 
-void manager_close_kernel_seqnum(Manager *m) {
-        assert(m);
-
-        manager_unmap_seqnum_file(m->kernel_seqnum, sizeof(*m->kernel_seqnum));
-        m->kernel_seqnum = NULL;
-}
-
-static int manager_unlink_kernel_seqnum(Manager *m) {
-        assert(m);
-        assert(!m->kernel_seqnum); /* The file must not be mmap()ed. */
-
-        return manager_unlink_seqnum_file(m, "kernel-seqnum");
-}
-
 int manager_reopen_dev_kmsg(Manager *m, bool old_read_kmsg) {
         int r;
 
@@ -470,11 +465,11 @@ int manager_reopen_dev_kmsg(Manager *m, bool old_read_kmsg) {
                 m->config.read_kmsg = false;
 
                 /* seqnum file is not necessary anymore. Let's close it. */
-                manager_close_kernel_seqnum(m);
+                m->kernel_seqnum = munmap_safe(m->kernel_seqnum, sizeof(*m->kernel_seqnum));
 
                 /* Also, unlink the file name as we will not warn some kmsg are lost when reading kmsg is
                  * re-enabled later. */
-                manager_unlink_kernel_seqnum(m);
+                (void) manager_unlink_seqnum_file(m, "kernel-seqnum");
         }
 
         /* Close previously configured event source and opened file descriptor. */

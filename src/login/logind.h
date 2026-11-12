@@ -140,6 +140,9 @@ typedef struct Manager {
         dual_timestamp init_ts;
 
         sd_varlink_server *varlink_server;
+        sd_varlink_server *metrics_varlink_server;
+
+        LoginCounters *counters;
 } Manager;
 
 void manager_reset_config(Manager *m);
@@ -178,6 +181,7 @@ const struct ConfigPerfItem* logind_gperf_lookup(const char *str, GPERF_LEN_TYPE
 int manager_set_lid_switch_ignore(Manager *m, usec_t until);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_n_autovts);
+CONFIG_PARSER_PROTOTYPE(config_parse_kill_exclude_users);
 CONFIG_PARSER_PROTOTYPE(config_parse_tmpfs_size);
 
 int manager_setup_wall_message_timer(Manager *m);

@@ -58,9 +58,11 @@
 #define SYNC_TIMEOUT_USEC (10*USEC_PER_SEC)
 #define DEFAULT_MINIMUM_UPTIME_USEC (15U * USEC_PER_SEC)
 
-static const char *arg_verb = NULL;
+static char *arg_verb = NULL;
 static uint8_t arg_exit_code = 0;
 static usec_t arg_timeout = DEFAULT_TIMEOUT_USEC;
+
+STATIC_DESTRUCTOR_REGISTER(arg_verb, freep);
 
 COMMAND(
         "systemd-shutdown\0",
@@ -157,9 +159,11 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 OPTION_POSITIONAL:
-                        if (!arg_verb)
-                                arg_verb = opts.arg;
-                        else
+                        if (!arg_verb) {
+                                arg_verb = strdup(opts.arg);
+                                if (!arg_verb)
+                                        return log_oom();
+                        } else
                                 log_warning("Got extraneous argument, ignoring.");
                         break;
                 }
@@ -485,7 +489,7 @@ static int run(int argc, char *argv[]) {
 
         /* We need to make mounts private so that we can MS_MOVE in unmount_all(). Kernel does not allow
          * MS_MOVE when parent mountpoints have shared propagation. */
-        if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0)
+        if (mount(/* source= */ NULL, "/", /* filesystemtype= */ NULL, MS_REC|MS_PRIVATE, /* data= */ NULL) < 0)
                 log_warning_errno(errno, "Failed to make mounts private, ignoring: %m");
 
         /* Synchronize everything that is not written to disk yet at this point already. This is a good idea so that
@@ -499,10 +503,10 @@ static int run(int argc, char *argv[]) {
         (void) disable_binfmt();
 
         log_info("Sending SIGTERM to remaining processes...");
-        broadcast_signal(SIGTERM, true, true, arg_timeout);
+        broadcast_signal(SIGTERM, /* wait_for_exit= */ true, /* send_sighup= */ true, arg_timeout);
 
         log_info("Sending SIGKILL to remaining processes...");
-        broadcast_signal(SIGKILL, true, false, arg_timeout);
+        broadcast_signal(SIGKILL, /* wait_for_exit= */ true, /* send_sighup= */ false, arg_timeout);
 
         bool need_umount = !in_container, need_swapoff = !in_container, need_loop_detach = !in_container,
              need_dm_detach = !in_container, need_md_detach = !in_container,
@@ -517,7 +521,7 @@ static int run(int argc, char *argv[]) {
                 /* Let's trim the cgroup tree on each iteration so that we leave an empty cgroup tree around,
                  * so that container managers get a nice notify event when we are down */
                 if (cgroup)
-                        (void) cg_trim(cgroup, false);
+                        (void) cg_trim(cgroup, /* delete_root= */ false);
 
                 if (need_umount) {
                         log_info("Unmounting file systems.");

@@ -102,7 +102,7 @@ int bus_wait_for_jobs_new(sd_bus *bus, BusWaitForJobs **ret) {
                         "/org/freedesktop/systemd1",
                         "org.freedesktop.systemd1.Manager",
                         "JobRemoved",
-                        match_job_removed, NULL, d);
+                        match_job_removed, /* install_callback= */ NULL, d);
         if (r < 0)
                 return r;
 
@@ -110,10 +110,10 @@ int bus_wait_for_jobs_new(sd_bus *bus, BusWaitForJobs **ret) {
                         bus,
                         &d->slot_disconnected,
                         "org.freedesktop.DBus.Local",
-                        NULL,
+                        /* path= */ NULL,
                         "org.freedesktop.DBus.Local",
                         "Disconnected",
-                        match_disconnected, NULL, d);
+                        match_disconnected, /* install_callback= */ NULL, d);
         if (r < 0)
                 return r;
 
@@ -126,7 +126,7 @@ static int bus_process_wait(sd_bus *bus) {
         int r;
 
         for (;;) {
-                r = sd_bus_process(bus, NULL);
+                r = sd_bus_process(bus, /* ret= */ NULL);
                 if (r < 0)
                         return r;
                 if (r > 0)
@@ -157,7 +157,7 @@ static int bus_job_get_service_result(BusWaitForJobs *d, char **ret) {
                                           dbus_path,
                                           "org.freedesktop.systemd1.Service",
                                           "Result",
-                                          NULL,
+                                          /* reterr_error= */ NULL,
                                           ret);
 }
 
@@ -189,7 +189,7 @@ static int log_job_error_with_service_result(
 
         assert(service);
 
-        service_shell_quoted = shell_maybe_quote(service, 0);
+        service_shell_quoted = shell_maybe_quote(service, /* flags= */ 0);
 
         if (!strv_isempty((char* const*) extra_args)) {
                 _cleanup_free_ char *t = NULL;
@@ -294,7 +294,7 @@ static int check_wait_response(BusWaitForJobs *d, WaitJobsFlags flags, const cha
                         extra_args);
 }
 
-int bus_wait_for_jobs(BusWaitForJobs *d, WaitJobsFlags flags, const char* const* extra_args) {
+int bus_wait_for_jobs_full(BusWaitForJobs *d, WaitJobsFlags flags, const char* const* extra_args) {
         int r = 0;
 
         assert(d);
@@ -303,6 +303,10 @@ int bus_wait_for_jobs(BusWaitForJobs *d, WaitJobsFlags flags, const char* const*
                 int q;
 
                 q = bus_process_wait(d->bus);
+                /* A fiber that waits for jobs gets -ETIME when its SD_FIBER_TIMEOUT() scope expires, and
+                 * -ECANCELED when the fiber is cancelled. The caller reports both errors. */
+                if (IN_SET(q, -ETIME, -ECANCELED))
+                        return q;
                 if (q < 0)
                         return log_error_errno(q, "Failed to wait for response: %m");
 
@@ -328,12 +332,12 @@ int bus_wait_for_jobs_add(BusWaitForJobs *d, const char *path) {
         return set_put_strdup(&d->jobs, path);
 }
 
-int bus_wait_for_jobs_one(BusWaitForJobs *d, const char *path, WaitJobsFlags flags, const char* const* extra_args) {
+int bus_wait_for_jobs_one_full(BusWaitForJobs *d, const char *path, WaitJobsFlags flags, const char* const* extra_args) {
         int r;
 
         r = bus_wait_for_jobs_add(d, path);
         if (r < 0)
                 return log_oom();
 
-        return bus_wait_for_jobs(d, flags, extra_args);
+        return bus_wait_for_jobs_full(d, flags, extra_args);
 }

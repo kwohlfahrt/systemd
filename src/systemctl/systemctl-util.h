@@ -2,6 +2,7 @@
 #pragma once
 
 #include "systemctl.h"
+#include "unit-def.h"
 
 /* The init script exit codes for the LSB 'status' verb. (This is different from the 'start' verb, whose exit
    codes are defined in exit-status.h.)
@@ -34,7 +35,7 @@ typedef enum BusFocus {
 
 int acquire_bus_full(BusFocus focus, bool graceful, sd_bus **ret);
 static inline int acquire_bus(BusFocus focus, sd_bus **ret) {
-        return acquire_bus_full(focus, false, ret);
+        return acquire_bus_full(focus, /* graceful= */ false, ret);
 }
 void release_busses(void);
 
@@ -64,7 +65,19 @@ int unit_find_paths(sd_bus *bus, const char *unit_name, LookupPaths *lp, bool fo
 int unit_is_masked(sd_bus *bus, const char *unit);
 int unit_exists(LookupPaths *lp, const char *unit);
 
-int unit_get_dependencies(sd_bus *bus, const char *name, char ***ret);
+typedef struct UnitDependencyInfo {
+        char *name;
+        char **deps;
+        UnitActiveState active_state;
+} UnitDependencyInfo;
+
+UnitDependencyInfo* unit_dependency_info_free(UnitDependencyInfo *info);
+DEFINE_TRIVIAL_CLEANUP_FUNC(UnitDependencyInfo*, unit_dependency_info_free);
+
+/* Keyed by UnitDependencyInfo.name, frees the value */
+extern const struct hash_ops unit_dependency_info_hash_ops;
+
+int unit_get_dependencies(sd_bus *bus, const char *name, UnitDependencyInfo **ret);
 
 const char* unit_type_suffix(const char *unit);
 bool output_show_unit(const UnitInfo *u, char **patterns);
@@ -76,6 +89,7 @@ typedef enum InstallClientSide {
         INSTALL_CLIENT_SIDE_OFFLINE,
         INSTALL_CLIENT_SIDE_NOT_BOOTED,
         INSTALL_CLIENT_SIDE_GLOBAL_SCOPE,
+        INSTALL_CLIENT_SIDE_VENDOR,
 } InstallClientSide;
 
 InstallClientSide install_client_side(void);

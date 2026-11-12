@@ -10,8 +10,8 @@
 #include "capability-util.h"
 #include "daemon-util.h"
 #include "dlopen-note.h"
-#include "main-func.h"
 #include "mkdir.h"
+#include "networkd.h"
 #include "networkd-conf.h"
 #include "networkd-manager.h"
 #include "networkd-manager-bus.h"
@@ -31,7 +31,7 @@ COMMAND(
                 "Bus introspection\0",
 );
 
-static int run(int argc, char *argv[]) {
+int run_networkd(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
         _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
@@ -59,7 +59,7 @@ static int run(int argc, char *argv[]) {
                 uid_t uid;
                 gid_t gid;
 
-                r = get_user_creds("systemd-network", /* flags= */ 0, NULL, &uid, &gid, NULL, NULL);
+                r = get_user_creds("systemd-network", /* flags= */ 0, /* ret_username= */ NULL, &uid, &gid, /* ret_home= */ NULL, /* ret_shell= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Cannot resolve user name %s: %m", "systemd-network");
 
@@ -128,5 +128,3 @@ static int run(int argc, char *argv[]) {
 
         return 0;
 }
-
-DEFINE_MAIN_FUNCTION(run);

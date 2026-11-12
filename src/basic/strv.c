@@ -17,16 +17,6 @@
 #include "strv.h"
 #include "utf8.h"
 
-char* strv_find(char * const *l, const char *name) {
-        assert(name);
-
-        STRV_FOREACH(i, l)
-                if (streq(*i, name))
-                        return *i;
-
-        return NULL;
-}
-
 char* strv_find_case(char * const *l, const char *name) {
         assert(name);
 
@@ -406,7 +396,7 @@ int strv_split_newlines_full(char ***ret, const char *s, ExtractFlags flags) {
 char** strv_split_newlines(const char *s) {
         char **ret;
 
-        if (strv_split_newlines_full(&ret, s, 0) < 0)
+        if (strv_split_newlines_full(&ret, s, /* flags= */ 0) < 0)
                 return NULL;
 
         return ret;
@@ -475,7 +465,7 @@ int strv_split_and_extend_full(char ***t, const char *s, const char *separators,
 }
 
 int strv_split_and_extend(char ***t, const char *s, const char *separators, bool filter_duplicates) {
-        return strv_split_and_extend_full(t, s, separators, filter_duplicates, 0);
+        return strv_split_and_extend_full(t, s, separators, filter_duplicates, /* flags= */ 0);
 }
 
 int strv_split_colon_pairs(char ***t, const char *s) {
@@ -489,7 +479,7 @@ int strv_split_colon_pairs(char ***t, const char *s) {
         for (;;) {
                 _cleanup_free_ char *first = NULL, *second = NULL, *tuple = NULL, *second_or_empty = NULL;
 
-                r = extract_first_word(&s, &tuple, NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
+                r = extract_first_word(&s, &tuple, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -853,19 +843,30 @@ char** strv_sort(char **l) {
         return l;
 }
 
-char** strv_sort_uniq(char **l) {
+char** strv_sort_uniq_full(char **l, int (*compare)(char * const *a, char * const *b)) {
+        assert(compare);
+
         if (strv_isempty(l))
                 return l;
 
-        char **tail = strv_sort(l), *prev = NULL;
-        STRV_FOREACH(i, l)
-                if (streq_ptr(*i, prev))
+        /* Sorts with the given comparison function, then drops entries that compare equal to the previous
+         * one. The comparison function hence must only return 0 for entries that are to be merged. */
+
+        typesafe_qsort(l, strv_length(l), compare);
+
+        char **tail = l + 1;
+        STRV_FOREACH(i, l + 1)
+                if (compare(i, tail - 1) == 0)
                         free(*i);
                 else
-                        *(tail++) = prev = *i;
+                        *(tail++) = *i;
 
         *tail = NULL;
         return l;
+}
+
+char** strv_sort_uniq(char **l) {
+        return strv_sort_uniq_full(l, str_compare);
 }
 
 int strv_compare(char * const *a, char * const *b) {

@@ -11,6 +11,8 @@
 #include "dlopen-note.h"
 #include "errno-util.h"
 #include "format-table.h"
+#include "hexdecoct.h"
+#include "iovec-util.h"
 #include "json-util.h"
 #include "log.h"
 #include "main-func.h"
@@ -35,7 +37,7 @@
 #include "web-util.h"
 
 /* We limit per source, with the METRICS_LINKS_MAX this gives us a global cap too */
-#define METRICS_PER_SOURCE_MAX 4096U
+#define METRICS_PER_SOURCE_MAX 16384U
 #define METRICS_LINKS_MAX 128U
 #define TIMEOUT_USEC (30 * USEC_PER_SEC) /* 30 seconds */
 
@@ -50,18 +52,21 @@ char *arg_trust = NULL;
 char **arg_extra_headers = NULL;
 usec_t arg_network_timeout_usec = TIMEOUT_USEC;
 ReportSignMode arg_sign_mode = REPORT_SIGN_NO;
+static struct iovec arg_nonce = {};
 
 STATIC_DESTRUCTOR_REGISTER(arg_url, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_key, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_cert, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_trust, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_extra_headers, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_nonce, iovec_done);
 
 COMMAND(
         "systemd-report\0",
         "Acquire metrics from local sources.",
         .man_pages = "systemd-report(1)\0",
         .pager_flags = &arg_pager_flags,
+        .flags = COMMAND_EXPERIMENTAL,
 );
 
 typedef struct LinkInfo {
@@ -124,9 +129,9 @@ static int metric_compare(sd_json_variant *const *a, sd_json_variant *const *b) 
         fields_a = sd_json_variant_by_key(*a, "fields");
         fields_b = sd_json_variant_by_key(*b, "fields");
         if (fields_a)
-                (void) sd_json_variant_format(fields_a, 0, &fields_str_a);
+                (void) sd_json_variant_format(fields_a, /* flags= */ 0, &fields_str_a);
         if (fields_b)
-                (void) sd_json_variant_format(fields_b, 0, &fields_str_b);
+                (void) sd_json_variant_format(fields_b, /* flags= */ 0, &fields_str_b);
 
         return strcmp_ptr(fields_str_a, fields_str_b);
 }
@@ -166,12 +171,12 @@ static bool metric_startswith_prefix(const char *metric_name, const char *prefix
 }
 
 typedef enum {
-        VERDICT_INVALID,
+        VERDICT_INVALID = 0,
         VERDICT_MATCH,
         VERDICT_MISMATCH,
 } Verdict;
 
-static Verdict metrics_verdict(LinkInfo *li, sd_json_variant *metric) {
+static int metrics_verdict(LinkInfo *li, sd_json_variant *metric) {
         int r;
 
         assert(li);
@@ -184,17 +189,13 @@ static Verdict metrics_verdict(LinkInfo *li, sd_json_variant *metric) {
 
         const char *metric_name = NULL;
         r = sd_json_dispatch(metric, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &metric_name);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to get metric name, assuming name is not valid: %m");
-                return VERDICT_INVALID;
-        }
+        if (r < 0)
+                return log_debug_errno(r, "Failed to get metric name: %m");
 
         /* Validate metric name is generally valid */
         r = metrics_name_valid(metric_name);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to determine if '%s' is a valid metric name: %m", metric_name);
-                return VERDICT_INVALID;
-        }
+        if (r < 0)
+                return log_debug_errno(r, "Failed to determine if '%s' is a valid metric name: %m", metric_name);
         if (!r) {
                 log_debug("Metric name '%s' is not valid, skipping.", metric_name);
                 return VERDICT_INVALID;
@@ -241,6 +242,7 @@ static int on_query_reply(
 
         LinkInfo *li = ASSERT_PTR(userdata);
         Context *context = ASSERT_PTR(li->context);
+        int r = 0;
 
         if (error_id) {
                 if (STR_IN_SET(error_id, SD_VARLINK_ERROR_METHOD_NOT_FOUND,
@@ -269,30 +271,41 @@ static int on_query_reply(
                 goto finish;
         }
 
-        Verdict v = metrics_verdict(li, parameters);
-        if (v == VERDICT_INVALID) {
+        r = metrics_verdict(li, parameters);
+        if (r < 0)
+                goto finish;
+        if (r == VERDICT_INVALID) {
                 context->n_invalid_metrics++;
                 goto finish;
         }
-        if (v == VERDICT_MISMATCH)
+        if (r == VERDICT_MISMATCH)
                 goto finish;
 
         /* Collect metrics for later sorting */
-        if (!GREEDY_REALLOC(context->metrics, context->n_metrics + 1))
-                return log_oom();
+        if (!GREEDY_REALLOC(context->metrics, context->n_metrics + 1)) {
+                r = log_oom_debug();
+                goto finish;
+        }
 
         context->metrics[context->n_metrics++] = sd_json_variant_ref(parameters);
         li->n_metrics++;
 
 finish:
-        if (!FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES)) {
+        if (r < 0 || !FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES)) {
+                /* Either this was the final reply or we failed. Either way this call is over: drop the
+                 * connection, so that no further replies are dispatched to us. */
                 assert_se(set_remove(context->link_infos, li) == li);
                 link_info_free(li);
-                if (set_isempty(context->link_infos))
+
+                /* sd-varlink logs and ignores errors returned by reply callbacks, hence propagate
+                 * failures via the exit code of the event loop. */
+                if (r < 0)
+                        (void) sd_event_exit(context->event, r);
+                else if (set_isempty(context->link_infos))
                         (void) sd_event_exit(context->event, EXIT_SUCCESS);
         }
 
-        return 0;
+        return r;
 }
 
 static int call_collect(Context *context, const char *name, const char *path) {
@@ -646,7 +659,9 @@ static int context_collect_metrics(Context *context) {
                 if (!p)
                         return log_oom();
 
-                (void) call_collect(context, d->d_name, p);
+                r = call_collect(context, d->d_name, p);
+                if (r == -ENOMEM)
+                        return r;
         }
 
         context->n_contacted_sources = set_size(context->link_infos);
@@ -684,6 +699,7 @@ static int verb_metrics(int argc, char *argv[], uintptr_t data, void *userdata) 
 
         _cleanup_(context_done) Context context = {
                 .action = action,
+                .nonce = iovec_unset_nullify(&arg_nonce),
         };
 
         r = parse_metrics_matches(argv + 1, &context.matches);
@@ -817,10 +833,12 @@ static JSON_DISPATCH_ENUM_DEFINE(json_dispatch_report_sign_varlink_mode, ReportS
 typedef struct GenerateParameters {
         char **matches;
         ReportSignMode sign_mode;
+        struct iovec nonce;
 } GenerateParameters;
 
 static void generate_parameters_done(GenerateParameters *p) {
         strv_free(p->matches);
+        iovec_done(&p->nonce);
 }
 
 static int vl_method_generate_internal(
@@ -844,6 +862,7 @@ static int vl_method_generate_internal(
         static const sd_json_dispatch_field dispatch_table_signed[] = {
                 { "matches", SD_JSON_VARIANT_ARRAY,  sd_json_dispatch_strv,                  voffsetof(p, matches),   SD_JSON_NULLABLE },
                 { "mode",    SD_JSON_VARIANT_STRING, json_dispatch_report_sign_varlink_mode, voffsetof(p, sign_mode), SD_JSON_NULLABLE },
+                { "nonce",   SD_JSON_VARIANT_STRING, json_dispatch_unbase64_iovec,           voffsetof(p, nonce),     SD_JSON_NULLABLE },
                 {}
         };
 
@@ -853,6 +872,7 @@ static int vl_method_generate_internal(
 
         _cleanup_(context_done) Context context = {
                 .action = ACTION_GENERATE,
+                .nonce = iovec_unset_nullify(&p.nonce),
         };
 
         r = parse_metrics_matches(p.matches, &context.matches);
@@ -1036,6 +1056,23 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         if (arg_sign_mode < 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse --sign= mode '%s'.", opts.arg);
                         break;
+
+                OPTION_LONG("nonce", "NONCE",
+                            "Provide a nonce to include in the report, in Base64"): {
+
+                        _cleanup_(iovec_done) struct iovec nonce = {};
+
+                        r = unbase64mem(opts.arg, &nonce.iov_base, &nonce.iov_len);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to decode nonce: %m");
+
+                        iovec_done(&arg_nonce);
+
+                        if (iovec_is_set(&nonce))
+                                arg_nonce = TAKE_STRUCT(nonce);
+
+                        break;
+                }
 
                 OPTION_COMMON_INTROSPECT_CLI:
                         return introspect_cli(arg_json_format_flags);
