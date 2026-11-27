@@ -32,11 +32,9 @@ size_t iovec_total_size(const struct iovec *iovec, size_t n) {
 
         assert(iovec || n == 0);
 
-        FOREACH_ARRAY(j, iovec, n) {
-                if (j->iov_len > SIZE_MAX - sum)
+        FOREACH_ARRAY(j, iovec, n)
+                if (!INC_SAFE(&sum, j->iov_len))
                         return SIZE_MAX; /* Indicate overflow. */
-                sum += j->iov_len;
-        }
 
         return sum;
 }
@@ -95,21 +93,13 @@ char* set_iovec_string_field(struct iovec *iovec, size_t *n_iovec, const char *f
 
         assert(iovec);
         assert(n_iovec);
+        assert(*n_iovec < SIZE_MAX);
 
         x = strjoin(field, value);
-        if (x)
-                iovec[(*n_iovec)++] = IOVEC_MAKE_STRING(x);
-        return x;
-}
+        if (!x)
+                return NULL;
 
-char* set_iovec_string_field_free(struct iovec *iovec, size_t *n_iovec, const char *field, char *value) {
-        char *x;
-
-        assert(iovec);
-        assert(n_iovec);
-
-        x = set_iovec_string_field(iovec, n_iovec, field, value);
-        free(value);
+        iovec[(*n_iovec)++] = IOVEC_MAKE_STRING(x);
         return x;
 }
 
@@ -173,5 +163,26 @@ struct iovec* iovec_append(struct iovec *iovec, const struct iovec *append) {
         if (!greedy_realloc_append(&iovec->iov_base, &iovec->iov_len, append->iov_base, append->iov_len, 1))
                 return NULL;
 
+        return iovec;
+}
+
+struct iovec* iovec_consume(struct iovec *iovec, size_t n) {
+
+        /* Similar to iovec_inc(), but instead of moving the pointer ahead we copy the data via memmove() and
+         * thus the pointer stays fixed, but the data moves */
+
+        if (!iovec)
+                return NULL;
+
+        if (n > iovec->iov_len)
+                return NULL;
+
+        if (n == 0) /* NOP — note that this is fine on an empty (or even unset) iovec, so that consuming an
+                     * iovec we already fully drained continues to be a valid (if pointless) operation. */
+                return iovec;
+
+        iovec->iov_len -= n;
+
+        memmove(ASSERT_PTR(iovec->iov_base), (uint8_t*) iovec->iov_base + n, iovec->iov_len);
         return iovec;
 }

@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "devicetree.h"
+#include "efi-log.h"
+#include "measure.h"
 #include "proto/dt-fixup.h"
+#include "tpm2-pcr.h"
 #include "util.h"
 
 #define FDT_V1_SIZE (7*4)
@@ -65,6 +68,7 @@ static EFI_STATUS devicetree_fixup(struct devicetree_state *state, size_t len) {
 EFI_STATUS devicetree_install(struct devicetree_state *state, EFI_FILE *root_dir, char16_t *name) {
         _cleanup_file_close_ EFI_FILE *handle = NULL;
         _cleanup_free_ EFI_FILE_INFO *info = NULL;
+        _cleanup_free_ char *dtb = NULL;
         size_t len;
         EFI_STATUS err;
 
@@ -72,42 +76,46 @@ EFI_STATUS devicetree_install(struct devicetree_state *state, EFI_FILE *root_dir
         assert(root_dir);
         assert(name);
 
-        /* Capture the original value for the devicetree table. NULL is not an error in this case so we don't
-         * need to check the return value. NULL simply means the system fw had no devicetree initially (and
-         * is the correct value to use to return to the initial state if needed). */
-        state->orig = find_configuration_table(MAKE_GUID_PTR(EFI_DTB_TABLE));
-
         err = root_dir->Open(root_dir, &handle, name, EFI_FILE_MODE_READ, EFI_FILE_READ_ONLY);
         if (err != EFI_SUCCESS)
                 return err;
 
-        err = get_file_info(handle, &info, NULL);
+        err = get_file_info(handle, &info, /* ret_size= */ NULL);
         if (err != EFI_SUCCESS)
                 return err;
         if (info->FileSize < FDT_V1_SIZE || info->FileSize > 32 * 1024 * 1024)
                 /* 32MB device tree blob doesn't seem right */
                 return EFI_INVALID_PARAMETER;
 
-        len = info->FileSize;
-
-        err = devicetree_allocate(state, len);
+        err = file_handle_read(handle, /* offset= */ 0, info->FileSize, &dtb, &len);
         if (err != EFI_SUCCESS)
                 return err;
+        if (len != info->FileSize)
+                return EFI_INVALID_PARAMETER;
 
-        err = handle->Read(handle, &len, PHYSICAL_ADDRESS_TO_POINTER(state->addr));
+        /* DeviceTrees referenced by Type #1 entries are not authenticated, hence measure them before
+         * installing them, and refuse to install them if that fails. Note that this measures the DeviceTree
+         * as read from disk, i.e. before any firmware fixups are applied. */
+        err = tpm_log_tagged_event(
+                        TPM2_PCR_KERNEL_CONFIG,
+                        POINTER_TO_PHYSICAL_ADDRESS(dtb),
+                        len,
+                        TYPE1_DEVICETREE_EVENT_TAG_ID,
+                        name,
+                        /* ret_measured= */ NULL);
         if (err != EFI_SUCCESS)
-                return err;
+                return log_error_status(
+                                err,
+                                "Unable to extend PCR %i with DTB '%ls': %m",
+                                TPM2_PCR_KERNEL_CONFIG,
+                                name);
 
-        err = devicetree_fixup(state, len);
-        if (err != EFI_SUCCESS)
-                return err;
-
-        return BS->InstallConfigurationTable(
-                        MAKE_GUID_PTR(EFI_DTB_TABLE), PHYSICAL_ADDRESS_TO_POINTER(state->addr));
+        return devicetree_install_from_memory(state, dtb, len);
 }
 
-static const char* devicetree_get_compatible(const void *dtb) {
-        if ((uintptr_t) dtb % alignof(FdtHeader) != 0)
+static const char* devicetree_get_compatible(const void *dtb, size_t dtb_size) {
+        if ((uintptr_t) dtb % alignof(FdtHeader) != 0 ||
+            dtb_size < sizeof(FdtHeader))
                 return NULL;
 
         const FdtHeader *dt_header = ASSERT_PTR(dtb);
@@ -122,7 +130,8 @@ static const char* devicetree_get_compatible(const void *dtb) {
         uint32_t strings_size = be32toh(dt_header->size_dt_strings);
         uint32_t end;
 
-        if (PTR_TO_SIZE(dtb) > SIZE_MAX - dt_size)
+        if (dt_size < sizeof(FdtHeader) || dt_size > dtb_size ||
+            PTR_TO_SIZE(dtb) > SIZE_MAX - dt_size)
                 return NULL;
 
         if (!ADD_SAFE(&end, strings_off, strings_size) || end > dt_size)
@@ -157,8 +166,9 @@ static const char* devicetree_get_compatible(const void *dtb) {
                         name_off = be32toh(cursor[++i]);
                         len_words = DIV_ROUND_UP(len, sizeof(uint32_t));
 
-                        if (ADD_SAFE(&s, name_off, STRLEN("compatible")) &&
-                            s < strings_size && streq8(strings_block + name_off, "compatible")) {
+                        if (ADD_SAFE(&s, name_off, sizeof("compatible")) &&
+                            s <= strings_size &&
+                            memcmp(strings_block + name_off, "compatible", sizeof("compatible")) == 0) {
                                 const char *c = (const char *) &cursor[++i];
                                 if (len == 0 || i + len_words > size_words || c[len - 1] != '\0')
                                         c = NULL;
@@ -202,7 +212,8 @@ EFI_STATUS devicetree_match(const void *uki_dtb, size_t uki_dtb_length) {
         if (!fw_dtb)
                 return EFI_UNSUPPORTED;
 
-        const char *fw_compat = devicetree_get_compatible(fw_dtb);
+        /* The firmware DTB table has no externally known length. */
+        const char *fw_compat = devicetree_get_compatible(fw_dtb, SIZE_MAX);
         if (!fw_compat)
                 return EFI_UNSUPPORTED;
 
@@ -222,7 +233,7 @@ EFI_STATUS devicetree_match_by_compatible(const void *uki_dtb, size_t uki_dtb_le
         if (!compat)
                 return EFI_INVALID_PARAMETER;
 
-        const char *dt_compat = devicetree_get_compatible(uki_dtb);
+        const char *dt_compat = devicetree_get_compatible(uki_dtb, uki_dtb_length);
         if (!dt_compat)
                 return EFI_INVALID_PARAMETER;
 

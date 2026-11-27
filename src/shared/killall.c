@@ -15,6 +15,7 @@
 #include "log.h"
 #include "pidref.h"
 #include "process-util.h"
+#include "runtime-scope.h"
 #include "set.h"
 #include "string-util.h"
 #include "terminal-util.h"
@@ -68,8 +69,16 @@ static bool is_in_survivor_cgroup(const PidRef *pid) {
                 log_debug_errno(r,
                                 "Failed to get survive_final_kill_signal xattr of %s, ignoring: %m",
                                 cgroup_path);
+        if (r <= 0)
+                return false;
 
-        return r > 0;
+        RuntimeScope scope = cg_path_runtime_scope(cgroup_path);
+        if (scope == RUNTIME_SCOPE_USER) {
+                log_warning("Process " PID_FMT " sets exclusion xattr but originates from a user session, killing anyway.", pid->pid);
+                return false;
+        }
+
+        return true;
 }
 
 static bool ignore_proc(PidRef *pid, bool warn_rootfs) {
@@ -256,7 +265,7 @@ static int killall(int sig, Set *pids, bool send_sighup) {
                 r = pidref_kill(&pidref, sig);
                 if (r < 0) {
                         if (r != -ESRCH)
-                                log_warning_errno(errno, "Could not kill " PID_FMT ", ignoring: %m", pidref.pid);
+                                log_warning_errno(r, "Could not kill " PID_FMT ", ignoring: %m", pidref.pid);
                 } else {
                         n_killed++;
                         if (pids) {
@@ -273,7 +282,7 @@ static int killall(int sig, Set *pids, bool send_sighup) {
                          * don't want to trigger reloads of daemon processes. Also we make sure to only send
                          * this after SIGTERM so that SIGTERM is always first in the queue. */
 
-                        if (get_ctty_devnr(pidref.pid, NULL) >= 0)
+                        if (get_ctty_devnr(pidref.pid, /* ret= */ NULL) >= 0)
                                 /* it's OK if the process is gone, just ignore the result */
                                 (void) pidref_kill(&pidref, SIGHUP);
                 }
@@ -294,7 +303,7 @@ int broadcast_signal(int sig, bool wait_for_exit, bool send_sighup, usec_t timeo
          *  - Otherwise, the number of processes to which the specified signal was sent */
 
         if (wait_for_exit)
-                pids = set_new(NULL);
+                pids = set_new(/* hash_ops= */ NULL);
 
         assert_se(sigemptyset(&mask) == 0);
         assert_se(sigaddset(&mask, SIGCHLD) == 0);

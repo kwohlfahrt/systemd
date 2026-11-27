@@ -15,6 +15,7 @@
 #include "journald-client.h"
 #include "journald-console.h"
 #include "journald-context.h"
+#include "journald-counters.h"
 #include "journald-kmsg.h"
 #include "journald-manager.h"
 #include "journald-syslog.h"
@@ -57,10 +58,9 @@ static void forward_syslog_iovec(
 
         j = strjoina(m->runtime_directory, "/syslog");
         r = sockaddr_un_set_path(&sa.un, j);
-        if (r < 0) {
-                log_debug_errno(r, "Forwarding socket path %s too long for AF_UNIX, not forwarding: %m", j);
-                return;
-        }
+        if (r < 0)
+                return (void) log_debug_errno(r, "Forwarding socket path %s too long for AF_UNIX, not forwarding: %m",
+                                              j);
 
         msghdr.msg_name = &sa.sa;
         msghdr.msg_namelen = r;
@@ -384,10 +384,8 @@ void manager_process_syslog_message(
                 msg = buf + leading_ws;
         else {
                 msg = dummy = new(char, i - leading_ws + 1);
-                if (!dummy) {
-                        log_oom();
-                        return;
-                }
+                if (!dummy)
+                        return (void) log_oom();
 
                 memcpy(dummy, buf + leading_ws, i - leading_ws);
                 dummy[i - leading_ws] = 0;
@@ -397,7 +395,10 @@ void manager_process_syslog_message(
          * _or_ if the input message contained NUL bytes. */
         store_raw = msg != buf || strlen(msg) != raw_len;
 
-        syslog_parse_priority(&msg, &priority, true);
+        syslog_parse_priority(&msg, &priority, /* with_facility= */ true);
+
+        /* Count before any filtering or rate limiting */
+        manager_count_message(m, JOURNAL_TRANSPORT_SYSLOG, priority);
 
         if (!client_context_test_priority(context, priority))
                 return;
@@ -462,20 +463,17 @@ void manager_process_syslog_message(
         }
 
         msg_msg = strjoin("MESSAGE=", msg);
-        if (!msg_msg) {
-                log_oom();
-                return;
-        }
+        if (!msg_msg)
+                return (void) log_oom();
+
         iovec[n++] = IOVEC_MAKE_STRING(msg_msg);
 
         if (store_raw) {
                 const size_t hlen = STRLEN("SYSLOG_RAW=");
 
                 msg_raw = new(char, hlen + raw_len);
-                if (!msg_raw) {
-                        log_oom();
-                        return;
-                }
+                if (!msg_raw)
+                        return (void) log_oom();
 
                 memcpy(msg_raw, "SYSLOG_RAW=", hlen);
                 memcpy(msg_raw + hlen, buf, raw_len);
@@ -483,7 +481,7 @@ void manager_process_syslog_message(
                 iovec[n++] = IOVEC_MAKE(msg_raw, hlen + raw_len);
         }
 
-        manager_dispatch_message(m, iovec, n, mm, context, tv, priority, 0);
+        manager_dispatch_message(m, iovec, n, mm, context, tv, priority, /* object_pid= */ 0);
 }
 
 int manager_open_syslog_socket(Manager *m, const char *syslog_socket) {
@@ -513,24 +511,24 @@ int manager_open_syslog_socket(Manager *m, const char *syslog_socket) {
 
                 (void) chmod(sa.un.sun_path, 0666);
         } else
-                (void) fd_nonblock(m->syslog_fd, true);
+                (void) fd_nonblock(m->syslog_fd, /* nonblock= */ true);
 
-        r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_PASSCRED, true);
+        r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_PASSCRED, /* value= */ true);
         if (r < 0)
                 return log_error_errno(r, "Failed to enable SO_PASSCRED: %m");
 
-        r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_PASSRIGHTS, false);
+        r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_PASSRIGHTS, /* value= */ false);
         if (r < 0)
                 log_debug_errno(r, "Failed to turn off SO_PASSRIGHTS, ignoring: %m");
 
         if (mac_selinux_use()) {
-                r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_PASSSEC, true);
+                r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_PASSSEC, /* value= */ true);
                 if (r < 0)
                         log_full_errno(ERRNO_IS_NEG_NOT_SUPPORTED(r) ? LOG_DEBUG : LOG_WARNING, r,
                                        "Failed to enable SO_PASSSEC, ignoring: %m");
         }
 
-        r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_TIMESTAMP, true);
+        r = setsockopt_int(m->syslog_fd, SOL_SOCKET, SO_TIMESTAMP, /* value= */ true);
         if (r < 0)
                 return log_error_errno(r, "Failed to enable SO_TIMESTAMP: %m");
 

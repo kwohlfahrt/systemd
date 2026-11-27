@@ -28,6 +28,9 @@ at_exit() {
     rm -rf /tmp/TEST-07-PID1-private-pids-root
     # Stop any test services
     systemctl kill --signal=KILL TEST-07-PID1-private-pid.service
+    systemctl stop TEST-07-PID1-private-pids-socket-no.socket TEST-07-PID1-private-pids-socket-yes.socket
+    rm -f /tmp/TEST-07-PID1-private-pids-socket-no /tmp/TEST-07-PID1-private-pids-socket-yes
+    systemctl stop TEST-07-PID1-private-pids-env-no.socket TEST-07-PID1-private-pids-env-yes.socket
     # Remove any failed transient units
     systemctl reset-failed
 }
@@ -50,17 +53,58 @@ testcase_basic() {
     systemd-run -p PrivatePIDs=yes --remain-after-exit --unit TEST-07-PID1-private-pid sleep infinity
     # Wait for ExecMainPID to be correctly populated as there might be a race between spawning service
     # and actual exec child process
-    # Note, Alpine/Nura build coreutils with --enable-single-binary=symlinks. In that case, coreutils
-    # calls prctl(PR_SET_NAME, argv[0]), hence the comm will be the path to the symlink. If the sleep file is
-    # a dedicated binary (like most other distributions do), the comm will be the filename, i.e. "sleep". So,
-    # here we need to cut the directory part.
-    timeout 10s bash -xec 'until [[ "$(cat /proc/$(systemctl show TEST-07-PID1-private-pid.service -p ExecMainPID --value)/comm | sed -e "s|.*/||")" == sleep ]]; do sleep .5; done'
+    timeout 10s bash -xec 'until [[ "$(cat /proc/$(systemctl show TEST-07-PID1-private-pid.service -p ExecMainPID --value)/comm)" == sleep ]]; do sleep .5; done'
     pid=$(systemctl show TEST-07-PID1-private-pid.service -p ExecMainPID --value)
     kill -9 "$pid"
     timeout 10s bash -xec 'while [[ "$(systemctl show -P SubState TEST-07-PID1-private-pid.service)" != "failed" ]]; do sleep .5; done'
     assert_eq "$(systemctl show -P Result TEST-07-PID1-private-pid.service)" "signal"
     assert_eq "$(systemctl show -P ExecMainStatus TEST-07-PID1-private-pid.service)" "9"
     systemctl reset-failed
+}
+
+testcase_socket_activation() {
+    # https://github.com/systemd/systemd/issues/44953
+    local unit="TEST-07-PID1-private-pids-socket"
+    local fdstore=/usr/lib/systemd/tests/unit-tests/manual/test-fdstore
+    local private_pids
+
+    # sd_listen_fds() must accept the fds, i.e. $LISTEN_PID and $LISTEN_PIDFDID must refer to the payload.
+    # test-fdstore fails if $LISTEN_PIDFDID is set to another process's pidfd ID, but not if it is unset,
+    # so the payload also records it. It is only set if the kernel supports pidfd IDs.
+    for private_pids in no yes; do
+        systemd-run --unit="$unit-$private_pids" \
+                    --socket-property=ListenStream="/run/$unit-$private_pids.sock" \
+                    -p Type=oneshot \
+                    -p PrivatePIDs="$private_pids" \
+                    bash -c 'echo "$${LISTEN_PIDFDID-unset}" >"$$0" && exec "$$1" listen exit' \
+                    "/tmp/$unit-$private_pids" "$fdstore"
+        systemctl start "$unit-$private_pids.service"
+        systemctl stop "$unit-$private_pids.socket"
+    done
+
+    # With PrivatePIDs=yes, $LISTEN_PIDFDID must be set whenever it is set without it
+    if [[ "$(cat "/tmp/$unit-no")" != unset ]]; then
+        assert_neq "$(cat "/tmp/$unit-yes")" unset
+    fi
+    rm -f "/tmp/$unit-no" "/tmp/$unit-yes"
+}
+
+testcase_pid_environment() {
+    # https://github.com/systemd/systemd/issues/44960
+    local unit="TEST-07-PID1-private-pids-env"
+    local private_pids
+
+    # $LISTEN_PID, $WATCHDOG_PID and $SYSTEMD_EXEC_PID must refer to the payload
+    for private_pids in no yes; do
+        systemd-run --unit="$unit-$private_pids" \
+                    --socket-property=ListenStream="/run/$unit-$private_pids.sock" \
+                    -p Type=oneshot \
+                    -p WatchdogSec=1h \
+                    -p PrivatePIDs="$private_pids" \
+                    bash -xec 'test "$$LISTEN_PID" = "$$$$"; test "$$WATCHDOG_PID" = "$$$$"; test "$$SYSTEMD_EXEC_PID" = "$$$$"'
+        systemctl start "$unit-$private_pids.service"
+        systemctl stop "$unit-$private_pids.socket"
+    done
 }
 
 testcase_analyze() {

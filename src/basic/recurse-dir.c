@@ -12,6 +12,7 @@
 #include "path-util.h"
 #include "recurse-dir.h"
 #include "sort-util.h"
+#include "string-util.h"
 
 #define DEFAULT_RECURSION_MAX 100
 
@@ -63,10 +64,22 @@ static bool ignore_dirent(const struct dirent *de, RecurseDirFlags flags) {
 
 int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
         _cleanup_free_ DirectoryEntries *de = NULL;
+        _cleanup_close_ int reopened_fd = -EBADF;
         DirectoryEntries *nde;
         int r;
 
-        assert(dir_fd >= 0);
+        assert(dir_fd >= 0 || (dir_fd == AT_FDCWD && FLAGS_SET(flags, RECURSE_DIR_REOPEN)));
+
+        /* If requested, operate on a new fd for the same directory instead of the one passed in. This allows
+         * passing O_PATH fds, and leaves the file offset of the original fd untouched, i.e. the directory is
+         * always enumerated from the beginning. */
+        if (FLAGS_SET(flags, RECURSE_DIR_REOPEN)) {
+                reopened_fd = fd_reopen(dir_fd, O_DIRECTORY|O_RDONLY|O_CLOEXEC);
+                if (reopened_fd < 0)
+                        return reopened_fd;
+
+                dir_fd = reopened_fd;
+        }
 
         if ((flags & _RECURSE_DIR_MUST_BE_MASK) != 0) /* We need the type to validate it */
                 flags |= RECURSE_DIR_ENSURE_TYPE;
@@ -175,11 +188,16 @@ int readdir_all_at(int fd, const char *path, RecurseDirFlags flags, DirectoryEnt
 
         assert(fd >= 0 || fd == AT_FDCWD);
 
-        dir_fd = xopenat(fd, path, O_DIRECTORY|O_CLOEXEC);
+        /* With RECURSE_DIR_REOPEN an empty path refers to the fd itself, which readdir_all() reopens */
+        if (isempty(path) && FLAGS_SET(flags, RECURSE_DIR_REOPEN))
+                return readdir_all(fd, flags, ret);
+
+        dir_fd = xopenat(fd, path, O_DIRECTORY);
         if (dir_fd < 0)
                 return dir_fd;
 
-        return readdir_all(dir_fd, flags, ret);
+        /* We just opened a new fd, no need to reopen it again */
+        return readdir_all(dir_fd, flags & ~RECURSE_DIR_REOPEN, ret);
 }
 
 int recurse_dir(
@@ -258,18 +276,18 @@ int recurse_dir(
                         p = i->d_name;
 
                 if (IN_SET(i->d_type, DT_UNKNOWN, DT_DIR)) {
-                        subdir_fd = openat(dir_fd, i->d_name, O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+                        subdir_fd = xopenat(dir_fd, i->d_name, O_DIRECTORY|O_NOFOLLOW);
                         if (subdir_fd < 0) {
-                                if (errno == ENOENT) /* Vanished by now, go for next file immediately */
+                                if (subdir_fd == -ENOENT) /* Vanished by now, go for next file immediately */
                                         continue;
 
                                 /* If it is a subdir but we failed to open it, then fail */
-                                if (!IN_SET(errno, ENOTDIR, ELOOP)) {
-                                        log_debug_errno(errno, "Failed to open directory '%s': %m", p);
+                                if (!IN_SET(subdir_fd, -ENOTDIR, -ELOOP)) {
+                                        log_debug_errno(subdir_fd, "Failed to open directory '%s': %m", p);
 
-                                        assert(errno <= RECURSE_DIR_SKIP_OPEN_DIR_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE);
+                                        assert(-subdir_fd <= RECURSE_DIR_SKIP_OPEN_DIR_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE);
 
-                                        r = func(RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE + errno,
+                                        r = func(RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE - subdir_fd,
                                                  p,
                                                  dir_fd,
                                                  /* inode_fd= */ -EBADF,
@@ -304,16 +322,16 @@ int recurse_dir(
 
                         if (flags & RECURSE_DIR_INODE_FD) {
 
-                                inode_fd = openat(dir_fd, i->d_name, O_PATH|O_NOFOLLOW|O_CLOEXEC);
+                                inode_fd = xopenat(dir_fd, i->d_name, O_PATH|O_NOFOLLOW);
                                 if (inode_fd < 0) {
-                                        if (errno == ENOENT) /* Vanished by now, go for next file immediately */
+                                        if (inode_fd == -ENOENT) /* Vanished by now, go for next file immediately */
                                                 continue;
 
-                                        log_debug_errno(errno, "Failed to open directory entry '%s': %m", p);
+                                        log_debug_errno(inode_fd, "Failed to open directory entry '%s': %m", p);
 
-                                        assert(errno <= RECURSE_DIR_SKIP_OPEN_INODE_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE);
+                                        assert(-inode_fd <= RECURSE_DIR_SKIP_OPEN_INODE_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE);
 
-                                        r = func(RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE + errno,
+                                        r = func(RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE - inode_fd,
                                                  p,
                                                  dir_fd,
                                                  /* inode_fd= */ -EBADF,
@@ -344,7 +362,7 @@ int recurse_dir(
                                          * directory fd — which should be riskless now that we pinned the
                                          * inode. */
 
-                                        subdir_fd = fd_reopen(inode_fd, O_DIRECTORY|O_CLOEXEC);
+                                        subdir_fd = fd_reopen(inode_fd, O_DIRECTORY);
                                         if (subdir_fd < 0)
                                                 return subdir_fd;
 
@@ -554,9 +572,9 @@ int recurse_dir_at(
         assert(atfd >= 0 || atfd == AT_FDCWD);
         assert(func);
 
-        fd = openat(atfd, path ?: ".", O_DIRECTORY|O_CLOEXEC);
+        fd = xopenat(atfd, path ?: ".", O_DIRECTORY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return recurse_dir(fd, path, statx_mask, n_depth_max, flags, func, userdata);
 }

@@ -15,6 +15,7 @@
 
 #include "vmlinux.h"
 
+#include <asm/ioctl.h>
 #include <errno.h>                      /* IWYU pragma: keep */
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
@@ -34,8 +35,7 @@ void* bpf_rdonly_cast(const void *, __u32) __ksym;
  * nsfs) from leaving objects owned by their transient UID/GID range behind on file systems that outlive the
  * namespace. Transient ranges are recycled, so any such object would later be owned by an unrelated client.
  *
- * This hooks into the various path-based LSM entrypoints that control inode creation as well as chown(), and
- * for each asks the only two questions that matter:
+ * The inode and path variants check inode creation and ownership changes against two conditions:
  *
  *   a) Does the file system die together with the user namespace? Superblocks record the user namespace they
  *      were mounted in, so this is simply whether sb->s_user_ns sits at or below the provisioned namespace.
@@ -66,8 +66,34 @@ void* bpf_rdonly_cast(const void *, __u32) __ksym;
 #define UID_GID_INVALID ((uid_t) -1)
 
 /* From include/uapi/linux/magic.h, which vmlinux.h does not provide. */
-#define OVERLAYFS_SUPER_MAGIC 0x794c7630
+#define BTRFS_SUPER_MAGIC 0x9123683E
 #define CGROUP2_SUPER_MAGIC 0x63677270
+#define EROFS_SUPER_MAGIC_V1 0xE0F5E1E2
+#define EXT4_SUPER_MAGIC 0xEF53
+#define F2FS_SUPER_MAGIC 0xF2F52010
+#define MSDOS_SUPER_MAGIC 0x4d44
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
+#define PIPEFS_MAGIC 0x50495045
+#define SOCKFS_MAGIC 0x534F434B
+#define SQUASHFS_MAGIC 0x73717368
+#define TMPFS_MAGIC 0x01021994
+#define XFS_SUPER_MAGIC 0x58465342
+
+/* The kernel defines MQUEUE_MAGIC in ipc/mqueue.c rather than a UAPI header. */
+#define MQUEUE_MAGIC 0x19800202
+
+#define ATTR_UID (1U << 1)
+#define ATTR_GID (1U << 2)
+
+/* RENAME_WHITEOUT comes from include/uapi/linux/fs.h, which vmlinux.h does not provide either. */
+#define RENAME_WHITEOUT (1U << 2)
+
+/* From include/uapi/asm-generic/fcntl.h. Only archs without BPF trampolines (no LSM programs) deviate. */
+#define __O_TMPFILE (1U << 22) /* O_TMPFILE without O_DIRECTORY */
+
+/* The Btrfs UAPI header conflicts with vmlinux.h, so define the subvolume creation commands here. */
+#define BTRFS_IOC_SUBVOL_CREATE _IOC(_IOC_WRITE, 0x94, 14, 4096)
+#define BTRFS_IOC_SUBVOL_CREATE_V2 _IOC(_IOC_WRITE, 0x94, 24, 4096)
 
 struct {
         __uint(type, BPF_MAP_TYPE_HASH);
@@ -161,8 +187,8 @@ static int userns_is_below(struct user_namespace *ancestor, struct user_namespac
  * already accepts (a register that is a BTF pointer on one branch and a scalar on the other). Returns NULL
  * for an empty map or on a read failure. */
 static inline __attribute__((always_inline))
-struct uid_gid_extent *uid_gid_map_extents(struct uid_gid_map *map, bool up) {
-        struct uid_gid_extent *array;
+const struct uid_gid_extent* uid_gid_map_extents(const struct uid_gid_map *map, bool up) {
+        const struct uid_gid_extent *array;
 
         if (map->nr_extents == 0)
                 return NULL;
@@ -187,8 +213,8 @@ struct uid_gid_extent *uid_gid_map_extents(struct uid_gid_map *map, bool up) {
  * through the map, where the up flag selects which end of the extents is searched. Stores UID_GID_INVALID if
  * the ID is not mapped, and returns negative if the map could not be read, which callers must keep apart: an
  * unmapped ID records nothing on disk, whereas a map we failed to read tells us nothing at all. */
-static int uid_gid_map_translate(struct uid_gid_map *map, uid_t id, bool up, uid_t *ret) {
-        struct uid_gid_extent *array;
+static int uid_gid_map_translate(const struct uid_gid_map *map, uid_t id, bool up, uid_t *ret) {
+        const struct uid_gid_extent *array;
         unsigned n;
 
         /* All callers pass a valid pointer; the guard just satisfies the pointer-deref checker. */
@@ -232,16 +258,14 @@ static int uid_gid_map_translate(struct uid_gid_map *map, uid_t id, bool up, uid
  * the passed ID creates an object on the given mount. The gid flag selects the GID maps over the UID maps.
  * Stores UID_GID_INVALID if the ID does not map, in which case the kernel refuses the operation with
  * EOVERFLOW anyway, see fsuidgid_has_mapping(). Returns negative if a map could not be read. */
-static int mount_map_id(struct vfsmount *mnt, struct user_namespace *fs_userns, uid_t id, bool gid, uid_t *ret) {
-        struct mnt_idmap *idmap;
-        struct uid_gid_map *m;
+static int mount_map_id(const struct mnt_idmap *idmap, struct user_namespace *fs_userns, uid_t id, bool gid, uid_t *ret) {
+        const struct uid_gid_map *m;
         int r;
 
         /* All callers pass a valid pointer; the guard just satisfies the pointer-deref checker. */
         if (!ret)
                 return -EINVAL;
 
-        idmap = mnt->mnt_idmap;
         if (!idmap) {
                 *ret = id;
                 return 0;
@@ -249,17 +273,18 @@ static int mount_map_id(struct vfsmount *mnt, struct user_namespace *fs_userns, 
 
         m = gid ? &idmap->gid_map : &idmap->uid_map;
 
-        /* Both nop_mnt_idmap and invalid_mnt_idmap carry empty maps. For the former that is an identity
-         * mapping; for the latter the operation fails later on regardless, so treating it as identity only
-         * ever makes us stricter. */
-        if (m->nr_extents > 0) {
-                r = uid_gid_map_translate(m, id, /* up= */ true, &id);
-                if (r < 0)
-                        return r;
-                if (id == UID_GID_INVALID) {
-                        *ret = UID_GID_INVALID;
-                        return 0;
-                }
+        /* nop_mnt_idmap bypasses the filesystem idmap in from_vfsuid()/from_vfsgid(). */
+        if (m->nr_extents == 0) {
+                *ret = id;
+                return 0;
+        }
+
+        r = uid_gid_map_translate(m, id, /* up= */ true, &id);
+        if (r < 0)
+                return r;
+        if (id == UID_GID_INVALID) {
+                *ret = UID_GID_INVALID;
+                return 0;
         }
 
         /* initial_idmapping(): the initial user namespace is the only one without a parent. */
@@ -275,59 +300,121 @@ static int mount_map_id(struct vfsmount *mnt, struct user_namespace *fs_userns, 
  * namespace (every mount of it shares that one), and it cannot be idmapped. That's fine: DAC makes sure a
  * transient range only ever owns the cgroup delegated to it via AddControlGroupToUserNamespace(), which we
  * remove along with the client, best-effort (a cgroup that refuses to go away outlives its range). */
-static bool mount_is_exempt(struct vfsmount *v) {
-        return v->mnt_sb->s_magic == CGROUP2_SUPER_MAGIC;
+static bool superblock_is_cgroupfs(struct super_block *sb) {
+        return sb->s_magic == CGROUP2_SUPER_MAGIC;
+}
+
+/* sockfs and pipefs are exempt from this policy too: their inodes are internal to the kernel, have no names
+ * and go away with the last reference to the socket or pipe, hence there's nothing that could persist
+ * there. */
+static bool superblock_is_sockfs_or_pipefs(struct super_block *sb) {
+        return sb->s_magic == SOCKFS_MAGIC || sb->s_magic == PIPEFS_MAGIC;
+}
+
+/* A POSIX message queue retains its creator's ucounts, which hold a reference to the creator's user
+ * namespace until the queue is evicted. Its IDs cannot be recycled while the queue exists, hence creating
+ * one is fine. This only covers creation though: ownership changes of an existing queue are subject to the
+ * ID checks like on any other file system. */
+static bool superblock_is_mqueue(struct super_block *sb) {
+        return sb->s_magic == MQUEUE_MAGIC;
+}
+
+/* The policy relies on the file system to route every inode creation and ownership change through the LSM
+ * hooks above, and to record exactly the IDs the mount idmapping yields. That's something we can only vouch
+ * for after looking at a file system's implementation: Btrfs subvolume creation for example bypasses the
+ * regular hooks (see validate_ioctl() below), and overlayfs needs special treatment as well (see
+ * userns_restrict_sb_kern_mount() below). Hence, writes to a file system that outlives the user namespace
+ * are only permitted if it is of a type we vetted, everything else is refused, whatever the IDs involved.
+ * This covers what systemd-mountfsd mounts from disk images (see allowed_fstypes() in dissect-image.c),
+ * plus tmpfs. Note that ext2/ext3 share the ext4 magic.
+ *
+ * Keep this in sync with userns_restrict_fs_type_is_vetted() in userns-restrict.c! */
+static bool superblock_is_vetted(struct super_block *sb) {
+        switch (sb->s_magic) {
+        case BTRFS_SUPER_MAGIC:
+        case EROFS_SUPER_MAGIC_V1:
+        case EXT4_SUPER_MAGIC:
+        case F2FS_SUPER_MAGIC:
+        case MSDOS_SUPER_MAGIC:
+        case SQUASHFS_MAGIC:
+        case TMPFS_MAGIC:
+        case XFS_SUPER_MAGIC:
+                return true;
+        default:
+                return false;
+        }
+}
+
+/* Returns 1 if the calling task belongs to a user namespace provisioned by nsresourced and the file system
+ * outlives that namespace (in which case the caller has to check the IDs involved), 0 if the policy doesn't
+ * apply, and negative if the operation shall be refused: either because the file system is of a type the
+ * policy does not support (-EPERM), or because we failed to determine whether the policy applies. */
+static int task_writes_outlive_userns(struct super_block *sb, const struct cred **ret_cred) {
+        struct user_namespace *managed;
+        const struct cred *cred;
+        struct task_struct *task;
+        int r;
+
+        task = (struct task_struct*) bpf_get_current_task_btf();
+        cred = task->cred;
+        if (!cred)
+                return -EPERM;
+
+        /* User namespaces that were not provisioned by nsresourced can still write to the transient ranges
+         * so that we don't break use cases like systemd-nspawn's --private-users=pick switch. */
+        r = find_managed_userns(cred->user_ns, &managed);
+        if (r <= 0)
+                return r;
+
+        if (superblock_is_cgroupfs(sb) || superblock_is_sockfs_or_pipefs(sb))
+                return 0;
+
+        /* Does the file system die together with the user namespace? Then nothing it carries can outlive
+         * the transient range, and we can allow this. */
+        r = userns_is_below(managed, sb->s_user_ns);
+        if (r < 0)
+                return r;
+        if (r > 0)
+                return 0;
+
+        /* The file system outlives the user namespace. Refuse outright unless we know it plays by the rules
+         * the remaining checks depend on. mqueue routes ownership changes through the hooks too, and its
+         * creations are dealt with in validate_creation(). */
+        if (!superblock_is_vetted(sb) && !superblock_is_mqueue(sb))
+                return -EPERM;
+
+        if (ret_cred)
+                *ret_cred = cred;
+
+        return 1;
 }
 
 /* Common tail of the inode creation hooks: would the object the calling task is about to create end up
  * owned by a transient ID on a file system that outlives the user namespace that ID was handed to? */
-static int validate_mount(struct vfsmount *v, int ret) {
-        struct user_namespace *managed, *fs_userns;
-        const struct cred *cred;
-        struct task_struct *task;
+static int validate_creation(const struct mnt_idmap *idmap, struct super_block *sb, int ret) {
+        const struct cred *cred = NULL;
         uid_t uid, gid;
         int r;
 
         if (ret != 0) /* propagate earlier error */
                 return ret;
 
-        /* Get user namespace from task */
-        task = (struct task_struct*) bpf_get_current_task_btf();
-        cred = task->cred;
+        if (superblock_is_mqueue(sb))
+                return 0;
+
+        r = task_writes_outlive_userns(sb, &cred);
+        if (r <= 0)
+                return r;
         if (!cred)
                 return -EPERM;
 
-        /* fsuid/fsgid are the UID/GID in the initial user namespace. Anything outside the transient ranges
-         * is never recycled by us, hence there's nothing to protect. */
-        if (!uid_is_transient(cred->fsuid.val) && !uid_is_transient((uid_t) cred->fsgid.val))
-                return 0;
-
-        r = find_managed_userns(cred->user_ns, &managed);
-        if (r < 0)
-                return r;
-        if (r == 0) /* Not provisioned by nsresourced? Then this is none of our business. */
-                return 0;
-
-        if (mount_is_exempt(v))
-                return 0;
-
-        fs_userns = v->mnt_sb->s_user_ns;
-
-        /* Does the file system die together with the user namespace? Then nothing it carries can outlive
-         * the transient range, and we can allow this. */
-        r = userns_is_below(managed, fs_userns);
-        if (r < 0)
-                return r;
-        if (r > 0)
-                return 0;
-
         /* Refuse if we cannot resolve where the IDs land: an ID we failed to translate is not an ID we know
          * to be harmless. */
-        r = mount_map_id(v, fs_userns, cred->fsuid.val, /* gid= */ false, &uid);
+        r = mount_map_id(idmap, sb->s_user_ns, cred->fsuid.val, /* gid= */ false, &uid);
         if (r < 0)
                 return r;
 
-        r = mount_map_id(v, fs_userns, (uid_t) cred->fsgid.val, /* gid= */ true, &gid);
+        r = mount_map_id(idmap, sb->s_user_ns, (uid_t) cred->fsgid.val, /* gid= */ true, &gid);
         if (r < 0)
                 return r;
 
@@ -339,68 +426,178 @@ static int validate_mount(struct vfsmount *v, int ret) {
         return -EPERM;
 }
 
-SEC("lsm/path_chown")
-int BPF_PROG(userns_restrict_path_chown, struct path *path, unsigned long long uid, unsigned long long gid, int ret) {
-        struct user_namespace *managed;
-        const struct cred *cred;
-        struct task_struct *task;
+static int validate_chown(struct super_block *sb, uid_t uid, uid_t gid, int ret) {
         int r;
 
         if (ret != 0) /* propagate earlier error */
                 return ret;
 
-        /* Get user namespace from task */
-        task = (struct task_struct*) bpf_get_current_task_btf();
-        cred = task->cred;
-        if (!cred)
-                return -EPERM;
-
-        /* User namespaces that were not provisioned by nsresourced can still write to the transient ranges
-         * so that we don't break use cases like systemd-nspawn's --private-users=pick switch. */
-        r = find_managed_userns(cred->user_ns, &managed);
-        if (r < 0)
+        r = task_writes_outlive_userns(sb, /* ret_cred= */ NULL);
+        if (r <= 0)
                 return r;
-        if (r == 0)
-                return 0;
 
-        if (mount_is_exempt(path->mnt))
-                return 0;
-
-        r = userns_is_below(managed, path->mnt->mnt_sb->s_user_ns);
-        if (r < 0)
-                return r;
-        if (r > 0)
-                return 0;
-
-        /* Unlike the creation hooks this one is handed the IDs with the mount's idmapping already applied,
-         * i.e. the ones that end up on disk, hence we can look at them directly. See chown_common() in the
-         * kernel sources. */
-        if (uid_is_transient((uid_t) uid) || uid_is_transient((uid_t) gid))
+        if (uid_is_transient(uid) || uid_is_transient(gid))
                 return -EPERM;
 
         return 0;
 }
 
-SEC("lsm/path_mkdir")
-int BPF_PROG(userns_restrict_path_mkdir, struct path *dir, struct dentry *dentry, umode_t mode, int ret) {
-        return validate_mount(dir->mnt, ret);
+/* A link adds a name for an existing inode, so we check the owner of that inode instead of the caller's
+ * fsuid. Otherwise a client could create an O_TMPFILE as its transient ID, switch its fsuid to another ID,
+ * and link the file onto a file system that outlives the user namespace. */
+static int validate_link(struct dentry *old_dentry, struct super_block *sb, int ret) {
+        struct inode *inode;
+
+        if (ret != 0) /* propagate earlier error */
+                return ret;
+
+        inode = old_dentry->d_inode;
+        if (!inode)
+                return -EPERM;
+
+        return validate_chown(sb, inode->i_uid.val, inode->i_gid.val, ret);
 }
 
-/* The mknod hook covers all file creations, including regular files, in case the reader is looking for a
- * missing hook for open(). */
+SEC("lsm/path_chown")
+int BPF_PROG(userns_restrict_path_chown, struct path *path, unsigned long long uid, unsigned long long gid, int ret) {
+        /* chown_common() applies the mount idmap before calling the path hook. */
+        return validate_chown(path->mnt->mnt_sb, (uid_t) uid, (uid_t) gid, ret);
+}
+
+SEC("lsm/path_mkdir")
+int BPF_PROG(userns_restrict_path_mkdir, struct path *dir, struct dentry *dentry, umode_t mode, int ret) {
+        return validate_creation(dir->mnt->mnt_idmap, dir->mnt->mnt_sb, ret);
+}
+
+/* The mknod hook covers all named file creations, including regular files, in case the reader is looking for
+ * a missing hook for open(). O_TMPFILE is handled by the file_open hook below. */
 SEC("lsm/path_mknod")
 int BPF_PROG(userns_restrict_path_mknod, const struct path *dir, struct dentry *dentry, umode_t mode, unsigned dev, int ret) {
-        return validate_mount(dir->mnt, ret);
+        return validate_creation(dir->mnt->mnt_idmap, dir->mnt->mnt_sb, ret);
 }
 
 SEC("lsm/path_symlink")
 int BPF_PROG(userns_restrict_path_symlink, const struct path *dir, struct dentry *dentry, const char *old_name, int ret) {
-        return validate_mount(dir->mnt, ret);
+        return validate_creation(dir->mnt->mnt_idmap, dir->mnt->mnt_sb, ret);
 }
 
 SEC("lsm/path_link")
 int BPF_PROG(userns_restrict_path_link, struct dentry *old_dentry, const struct path *new_dir, struct dentry *new_dentry, int ret) {
-        return validate_mount(new_dir->mnt, ret);
+        return validate_creation(new_dir->mnt->mnt_idmap, new_dir->mnt->mnt_sb, ret);
+}
+
+SEC("lsm/inode_create")
+int BPF_PROG(userns_restrict_inode_create, const struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, int ret) {
+        return validate_creation(idmap, dir->i_sb, ret);
+}
+
+SEC("lsm/inode_mkdir")
+int BPF_PROG(userns_restrict_inode_mkdir, const struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, int ret) {
+        return validate_creation(idmap, dir->i_sb, ret);
+}
+
+SEC("lsm/inode_mknod")
+int BPF_PROG(userns_restrict_inode_mknod, const struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev, int ret) {
+        return validate_creation(idmap, dir->i_sb, ret);
+}
+
+SEC("lsm/inode_symlink")
+int BPF_PROG(userns_restrict_inode_symlink, const struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, const char *old_name, int ret) {
+        return validate_creation(idmap, dir->i_sb, ret);
+}
+
+SEC("lsm/inode_link")
+int BPF_PROG(userns_restrict_inode_link, const struct mnt_idmap *idmap, struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry, int ret) {
+        return validate_link(old_dentry, dir->i_sb, ret);
+}
+
+/* A host process can reopen an O_TMPFILE through /proc/self/fd without keeping the creator's user
+ * namespace alive. The inode can then outlive its transient IDs, even when O_EXCL prevents linking it. */
+SEC("lsm/file_open")
+int BPF_PROG(userns_restrict_file_open, struct file *file, int ret) {
+        if (!(file->f_flags & __O_TMPFILE))
+                return ret;
+
+        return validate_creation(file->f_path.mnt->mnt_idmap, file->f_path.mnt->mnt_sb, ret);
+}
+
+/* The file system creates the whiteout of RENAME_WHITEOUT itself, owned by the caller's fsuid and fsgid,
+ * without calling inode_mknod(). The inode_rename hook gets neither the rename flags nor the mount idmap,
+ * so the inode policy uses the path_rename hook for whiteouts. */
+SEC("lsm/path_rename")
+int BPF_PROG(userns_restrict_path_rename, const struct path *old_dir, struct dentry *old_dentry,
+             const struct path *new_dir, struct dentry *new_dentry, unsigned flags, int ret) {
+        if (!(flags & RENAME_WHITEOUT))
+                return ret;
+
+        return validate_creation(old_dir->mnt->mnt_idmap, old_dir->mnt->mnt_sb, ret);
+}
+
+/* Older vmlinux.h files lack the VFS ID fields in struct iattr. */
+struct iattr___local {
+        unsigned ia_valid;
+        struct {
+                uid_t val;
+        } ia_vfsuid, ia_vfsgid;
+} __attribute__((preserve_access_index));
+
+SEC("lsm/inode_setattr")
+int BPF_PROG(userns_restrict_inode_setattr, const struct mnt_idmap *idmap, struct dentry *dentry, struct iattr___local *attr, int ret) {
+        struct super_block *sb;
+        uid_t uid = UID_GID_INVALID, gid = UID_GID_INVALID;
+        int r;
+
+        if (ret != 0)
+                return ret;
+
+        if (!(attr->ia_valid & (ATTR_UID|ATTR_GID)))
+                return 0;
+
+        sb = dentry->d_sb;
+
+        /* We translate the IDs only for managed tasks. Otherwise every chown() on the system walks the
+         * map extents, and a failed map read refuses chown() for tasks we don't manage. */
+        r = task_writes_outlive_userns(sb, /* ret_cred= */ NULL);
+        if (r <= 0)
+                return r;
+
+        if (attr->ia_valid & ATTR_UID) {
+                r = mount_map_id(idmap, sb->s_user_ns, attr->ia_vfsuid.val, /* gid= */ false, &uid);
+                if (r < 0)
+                        return r;
+        }
+
+        if (attr->ia_valid & ATTR_GID) {
+                r = mount_map_id(idmap, sb->s_user_ns, (uid_t) attr->ia_vfsgid.val, /* gid= */ true, &gid);
+                if (r < 0)
+                        return r;
+        }
+
+        if (uid_is_transient(uid) || uid_is_transient(gid))
+                return -EPERM;
+
+        return 0;
+}
+
+/* Btrfs creates subvolume root inodes without calling the path or inode creation hooks. */
+static int validate_ioctl(struct file *file, unsigned cmd, int ret) {
+        if (cmd != BTRFS_IOC_SUBVOL_CREATE && cmd != BTRFS_IOC_SUBVOL_CREATE_V2)
+                return ret;
+
+        if (file->f_path.mnt->mnt_sb->s_magic != BTRFS_SUPER_MAGIC)
+                return ret;
+
+        return validate_creation(file->f_path.mnt->mnt_idmap, file->f_path.mnt->mnt_sb, ret);
+}
+
+SEC("lsm/file_ioctl")
+int BPF_PROG(userns_restrict_file_ioctl, struct file *file, unsigned cmd, unsigned long arg, int ret) {
+        return validate_ioctl(file, cmd, ret);
+}
+
+SEC("lsm/file_ioctl_compat")
+int BPF_PROG(userns_restrict_file_ioctl_compat, struct file *file, unsigned cmd, unsigned long arg, int ret) {
+        return validate_ioctl(file, cmd, ret);
 }
 
 /* overlayfs' struct ovl_fs and struct ovl_layer are private to the module and hence absent from vmlinux.h
@@ -433,8 +630,8 @@ static bool range_hits_transient(uint64_t a, uint64_t b) {
  * any extent's on-disk range is transient, no matter which input reaches it. Ids no extent covers are left
  * unmapped, which fails the write with EOVERFLOW, so they are fine too. An empty map is the identity
  * mapping and hence neutralizes nothing. */
-static bool idmap_map_neutralizes_transient(struct uid_gid_map *map) {
-        struct uid_gid_extent *array;
+static bool idmap_map_neutralizes_transient(const struct uid_gid_map *map) {
+        const struct uid_gid_extent *array;
         unsigned n;
 
         n = map->nr_extents;
@@ -467,7 +664,7 @@ static bool idmap_map_neutralizes_transient(struct uid_gid_map *map) {
 /* True if the mount's idmapping maps the whole transient UID and GID ranges away, so a transient client
  * writing through it leaves nothing recyclable on disk. A non-idmapped mount maps them through unchanged. */
 static bool mount_neutralizes_transient(struct vfsmount *mnt) {
-        struct mnt_idmap *idmap;
+        const struct mnt_idmap *idmap;
 
         idmap = mnt->mnt_idmap;
         if (!idmap)
@@ -562,6 +759,12 @@ int BPF_PROG(userns_restrict_sb_kern_mount, struct super_block *sb, int ret) {
          * initial user namespace whose mount idmapping maps the transient ranges away. We refuse anything
          * we cannot prove this for, including any non-initial-namespace upper. */
         if (fs_userns->parent)
+                return -EPERM;
+
+        /* The writes to the upper happen with the mounter's credentials, i.e. they reach the inode hooks
+         * only, and only if the kernel supports them. Hence apply the file system type allowlist here too,
+         * rather than relying on the hooks to catch an upper of a type we never vetted. */
+        if (!superblock_is_vetted(upper->mnt_sb))
                 return -EPERM;
 
         if (mount_neutralizes_transient(upper))

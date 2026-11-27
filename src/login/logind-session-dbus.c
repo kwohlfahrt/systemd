@@ -194,21 +194,45 @@ static int property_get_locked_hint(
         return sd_bus_message_append(reply, "b", session_get_locked_hint(s) > 0);
 }
 
+static int session_verify_polkit_async(
+                Session *s,
+                sd_bus_message *message,
+                const char *action,
+                const char *verb,
+                sd_bus_error *error) {
+
+        assert(s);
+        assert(message);
+        assert(action);
+        assert(verb);
+
+        const char *details[] = {
+                "session", s->id,
+                "uid", FORMAT_UID(s->user->user_record->uid),
+                "username", s->user->user_record->user_name,
+                "verb", verb,
+                NULL
+        };
+
+        /* The session's owner may always manage it */
+        return bus_verify_polkit_async_full(
+                        message,
+                        action,
+                        details,
+                        s->user->user_record->uid,
+                        /* flags= */ 0,
+                        &s->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
+                        error);
+}
+
 int bus_session_method_terminate(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Session *s = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        "org.freedesktop.login1.manage",
-                        /* details= */ NULL,
-                        s->user->user_record->uid,
-                        /* flags= */ 0,
-                        &s->manager->polkit_registry,
-                        /* ret_admin= */ NULL,
-                        error);
+        r = session_verify_polkit_async(s, message, "org.freedesktop.login1.manage", "terminate", error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -218,7 +242,7 @@ int bus_session_method_terminate(sd_bus_message *message, void *userdata, sd_bus
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 int bus_session_method_activate(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -227,7 +251,13 @@ int bus_session_method_activate(sd_bus_message *message, void *userdata, sd_bus_
 
         assert(message);
 
-        r = check_polkit_chvt(message, s->manager, error);
+        /* Refuse early, before possibly prompting for authorization, since session_activate() would fail
+         * anyway. */
+        if (!s->seat)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                                         "Session %s is not on a seat, refusing activation.", s->id);
+
+        r = check_polkit_chvt(message, s->seat, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -237,36 +267,36 @@ int bus_session_method_activate(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 int bus_session_method_lock(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Session *s = ASSERT_PTR(userdata);
+        bool lock;
         int r;
 
         assert(message);
 
-        r = bus_verify_polkit_async_full(
+        lock = strstr(sd_bus_message_get_member(message), "Lock");
+
+        r = session_verify_polkit_async(
+                        s,
                         message,
                         "org.freedesktop.login1.lock-sessions",
-                        /* details= */ NULL,
-                        s->user->user_record->uid,
-                        /* flags= */ 0,
-                        &s->manager->polkit_registry,
-                        /* ret_admin= */ NULL,
+                        lock ? "lock" : "unlock",
                         error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = session_send_lock(s, /* lock= */ strstr(sd_bus_message_get_member(message), "Lock"));
+        r = session_send_lock(s, lock);
         if (r == -ENOTTY)
                 return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED, "Session does not support lock screen.");
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_set_idle_hint(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -298,7 +328,7 @@ static int method_set_idle_hint(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_set_locked_hint(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -330,7 +360,7 @@ static int method_set_locked_hint(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 int bus_session_method_kill(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -357,15 +387,7 @@ int bus_session_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
         if (!SIGNAL_VALID(signo))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid signal %i", signo);
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        "org.freedesktop.login1.manage",
-                        /* details= */ NULL,
-                        s->user->user_record->uid,
-                        /* flags= */ 0,
-                        &s->manager->polkit_registry,
-                        /* ret_admin= */ NULL,
-                        error);
+        r = session_verify_polkit_async(s, message, "org.freedesktop.login1.manage", "kill", error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -375,7 +397,7 @@ int bus_session_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_take_control(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -401,11 +423,11 @@ static int method_take_control(sd_bus_message *message, void *userdata, sd_bus_e
         if (uid != 0 && (force || uid != s->user->user_record->uid))
                 return sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED, "Only owner of session may take control");
 
-        r = session_set_controller(s, sd_bus_message_get_sender(message), force, true);
+        r = session_set_controller(s, sd_bus_message_get_sender(message), force, /* prepare= */ true);
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_release_control(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -418,7 +440,7 @@ static int method_release_control(sd_bus_message *message, void *userdata, sd_bu
 
         session_drop_controller(s);
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_set_type(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -446,7 +468,7 @@ static int method_set_type(sd_bus_message *message, void *userdata, sd_bus_error
 
         session_set_type(s, type);
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_set_class(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -474,7 +496,7 @@ static int method_set_class(sd_bus_message *message, void *userdata, sd_bus_erro
                                         "Class may only be set to 'user'");
 
         if (s->class == SESSION_USER) /* No change, shortcut */
-                return sd_bus_reply_method_return(message, NULL);
+                return sd_bus_reply_method_return(message, /* types= */ NULL);
         if (s->class != SESSION_USER_INCOMPLETE)
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
                                         "Only sessions with class 'user-incomplete' may change class");
@@ -526,7 +548,7 @@ static int method_set_display(sd_bus_message *message, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_set_tty(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -557,7 +579,7 @@ static int method_set_tty(sd_bus_message *message, void *userdata, sd_bus_error 
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_take_device(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -591,7 +613,7 @@ static int method_take_device(sd_bus_message *message, void *userdata, sd_bus_er
                  * equivalent). */
                 return sd_bus_error_set(error, BUS_ERROR_DEVICE_IS_TAKEN, "Device already taken");
 
-        r = session_device_new(s, dev, true, &sd);
+        r = session_device_new(s, dev, /* open_device= */ true, &sd);
         if (r < 0)
                 return r;
 
@@ -636,7 +658,7 @@ static int method_release_device(sd_bus_message *message, void *userdata, sd_bus
         session_device_free(sd);
         session_save(s);
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_pause_device_complete(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -665,7 +687,7 @@ static int method_pause_device_complete(sd_bus_message *message, void *userdata,
 
         session_device_complete_pause(sd);
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_set_brightness(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -885,7 +907,7 @@ int session_send_lock(Session *s, bool lock) {
                         p,
                         "org.freedesktop.login1.Session",
                         lock ? "Lock" : "Unlock",
-                        NULL);
+                        /* types= */ NULL);
 }
 
 int session_send_lock_all(Manager *m, bool lock) {
@@ -967,7 +989,7 @@ int session_send_upgrade_reply(Session *s, const sd_bus_error *error) {
 
         session_save(s);
 
-        return sd_bus_reply_method_return(c, NULL);
+        return sd_bus_reply_method_return(c, /* types= */ NULL);
 }
 
 static const sd_bus_vtable session_vtable[] = {

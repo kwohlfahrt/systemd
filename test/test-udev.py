@@ -312,11 +312,7 @@ RULES = [
             '/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda1',
             exp_links=[
                 'link1',
-                'link2/foo',
-                'link3/aaa/bbb',
                 'abs1',
-                'abs2/foo',
-                'abs3/aaa/bbb',
                 'default___replace_test/foo_aaa',
                 'string_escape___replace/foo_bbb',
                 'env_with_space',
@@ -324,6 +320,8 @@ RULES = [
                 'replace_env_harder_foo__hoge',
                 'match',
                 'unmatch',
+                'subdir/valid',
+                'not-removed',
             ],
             not_exp_links=[
                 'removed1',
@@ -331,15 +329,22 @@ RULES = [
                 'removed3',
                 'unsafe/../../path',
                 '/nondev/path/will/be/refused',
+                'link2/foo',
+                'link3/aaa/bbb',
+                'abs2/foo',
+                'abs3/aaa/bbb',
+                'subdir/dot-component',
             ],
         ),
         rules=r'''
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="removed1"
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK-="removed1"
-        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="/./dev///removed2"
+        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="/dev/removed2"
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK-="removed2"
-        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="././removed3"
-        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK-="/dev//./removed3/./"
+        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="removed3"
+        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK-="/dev/removed3"
+        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="not-removed"
+        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK-="not-removed/"
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="unsafe/../../path"
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="/nondev/path/will/be/refused"
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="link1 .///link2/././/foo//./ .///link3/aaa/bbb"
@@ -351,6 +356,47 @@ RULES = [
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", OPTIONS="string_escape=replace", ENV{.HOGE}="replace/env/harder?foo;;hoge", SYMLINK+="%E{.HOGE}"
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK=="link1", SYMLINK+="match"
         SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK!="removed1", SYMLINK+="unmatch"
+        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK+="subdir/valid subdir/. subdir/./dot-component"
+        ''',
+    ),
+    Rules.new(
+        'ignore SYMLINK assignments on remove event',
+        Device(
+            '/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda1',
+            exp_links=['dropped', 'replaced', 'final'],
+        ),
+        rules=r'''
+        SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", SYMLINK+="dropped replaced final"
+        # The ENV assignment is necessary to make the lines below not skipped on remove events, see udev(7).
+        ACTION=="remove", SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ENV{REMOVE_TEST}="1", SYMLINK-="dropped"
+        ACTION=="remove", SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ENV{REMOVE_TEST}="1", SYMLINK="replaced"
+        ACTION=="remove", SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ENV{REMOVE_TEST}="1", SYMLINK:="final"
+        ''',
+    ),
+    Rules.new(
+        'SYMLINK match against empty string',
+        Device(
+            '/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0',
+            exp_links=['empty-match', 'has-devlink'],
+            not_exp_links=['bad-nonempty', 'bad-empty-again'],
+        ),
+        rules=r'''
+        KERNEL=="ttyACM0", SYMLINK=="aaa", SYMLINK+="bad-nonempty"
+        KERNEL=="ttyACM0", SYMLINK=="", SYMLINK+="empty-match"
+        KERNEL=="ttyACM0", SYMLINK=="", SYMLINK+="bad-empty-again"
+        KERNEL=="ttyACM0", SYMLINK!="", SYMLINK+="has-devlink"
+        ''',
+    ),
+    Rules.new(
+        'SYMLINK match with empty alternative',
+        Device(
+            '/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0',
+            exp_links=['empty-alternative-match'],
+            not_exp_links=['bad-nonempty'],
+        ),
+        rules=r'''
+        KERNEL=="ttyACM0", SYMLINK!="", SYMLINK+="bad-nonempty"
+        KERNEL=="ttyACM0", SYMLINK=="aaa|", SYMLINK+="empty-alternative-match"
         ''',
     ),
     Rules.new(
@@ -1769,7 +1815,7 @@ SUBSYSTEMS=="scsi", PROGRAM=="/bin/bash -c \"printf %%s 'foo1 foo2' | grep 'foo1
         rules=r'''
         KERNEL=="sda", TAG="foo"
         TAGS=="|foo", SYMLINK+="found"
-        TAGS=="|aaa", SYMLINK+="bad"
+        TAGS=="aaa", SYMLINK+="bad"
         ''',
     ),
     Rules.new(
@@ -1795,7 +1841,7 @@ SUBSYSTEMS=="scsi", PROGRAM=="/bin/bash -c \"printf %%s 'foo1 foo2' | grep 'foo1
         rules=r'''
         KERNEL=="sda", TAG="foo"
         TAGS=="foo||bar", SYMLINK+="found"
-        TAGS=="aaa||bbb", SYMLINK+="bad"
+        TAGS=="aaa|bbb", SYMLINK+="bad"
         ''',
     ),
     Rules.new(
@@ -1821,7 +1867,7 @@ SUBSYSTEMS=="scsi", PROGRAM=="/bin/bash -c \"printf %%s 'foo1 foo2' | grep 'foo1
         rules=r'''
         KERNEL=="sda", TAG="foo"
         TAGS=="foo|", SYMLINK+="found"
-        TAGS=="aaa|", SYMLINK+="bad"
+        TAGS=="aaa", SYMLINK+="bad"
         KERNEL=="sda", TAGS!="hoge", SYMLINK+="found2"
         KERNEL=="sda", TAGS!="foo", SYMLINK+="bad2"
         ''',
@@ -1849,7 +1895,7 @@ SUBSYSTEMS=="scsi", PROGRAM=="/bin/bash -c \"printf %%s 'foo1 foo2' | grep 'foo1
         rules=r'''
         KERNEL=="sda", TAG="c"
         TAGS=="foo||bar||c", SYMLINK+="found"
-        TAGS=="aaa||bbb||ccc", SYMLINK+="bad"
+        TAGS=="aaa|bbb|ccc", SYMLINK+="bad"
         ''',
     ),
     Rules.new(
@@ -1861,13 +1907,31 @@ SUBSYSTEMS=="scsi", PROGRAM=="/bin/bash -c \"printf %%s 'foo1 foo2' | grep 'foo1
         ),
         rules=r'''
        KERNEL=="sda", TAG+="", TAG+="invalid.char", TAG+="path/is/also/invalid", TAG+="valid"
-       TAGS=="", SYMLINK+="empty"
+       TAGS=="aaa", SYMLINK+="empty"
        TAGS=="invalid.char", SYMLINK+="invalid_char"
        TAGS=="path/is/also/invalid", SYMLINK+="path"
        TAGS=="valid", SYMLINK+="valid"
        TAGS=="valid|", SYMLINK+="found"
-       TAGS=="aaa|", SYMLINK+="bad"
+       TAGS=="aaa", SYMLINK+="bad"
        TAGS=="aaa|bbb", SYMLINK+="bad2"
+        ''',
+    ),
+    Rules.new(
+        'TAG and TAGS match against empty string',
+        Device(
+            '/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda',
+            exp_links=['tag-empty', 'tags-empty', 'tags-alt', 'has-tag'],
+            not_exp_links=['tag-bad', 'tags-bad', 'tag-set-bad'],
+        ),
+        rules=r'''
+        KERNEL=="sda", TAG=="aaa", SYMLINK+="tag-bad"
+        KERNEL=="sda", TAGS=="aaa", SYMLINK+="tags-bad"
+        KERNEL=="sda", TAG=="", SYMLINK+="tag-empty"
+        KERNEL=="sda", TAGS=="", SYMLINK+="tags-empty"
+        KERNEL=="sda", TAGS=="aaa|", SYMLINK+="tags-alt"
+        KERNEL=="sda", TAG+="foo"
+        KERNEL=="sda", TAG=="", SYMLINK+="tag-set-bad"
+        KERNEL=="sda", TAGS!="", SYMLINK+="has-tag"
         ''',
     ),
     Rules.new(

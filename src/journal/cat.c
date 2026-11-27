@@ -14,6 +14,7 @@
 #include "log.h"
 #include "main-func.h"
 #include "parse-argument.h"
+#include "process-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "syslog-util.h"
@@ -29,7 +30,7 @@ COMMAND(
         "systemd-cat\0",
         "Execute process with stdout/stderr connected to the journal.",
         .argspec = "[COMMAND…]\0",
-        .man_pages = "systemd-cat(1)\0",
+        .man_page = "systemd-cat(1)",
 );
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
@@ -117,7 +118,7 @@ static int run(int argc, char *argv[]) {
                 return log_error_errno(r, "Failed to rearrange stdout/stderr: %m");
 
         if (strv_isempty(args))
-                (void) execlp("cat", "cat", NULL);
+                r = execvp_safe("cat", STRV_MAKE("cat"));
         else {
                 struct stat st;
 
@@ -130,9 +131,8 @@ static int run(int argc, char *argv[]) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to set environment variable JOURNAL_STREAM: %m");
 
-                (void) execvp(args[0], args);
+                r = execvp_safe(args[0], args);
         }
-        r = -errno;
 
         /* Let's try to restore a working stderr, so we can print the error message */
         if (saved_stderr >= 0)

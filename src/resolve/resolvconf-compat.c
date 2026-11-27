@@ -24,7 +24,7 @@ typedef enum LookupType  {
 COMMAND(
         "resolvconf\0",
         "Register DNS server and domain configuration with systemd-resolved.",
-        .man_pages = "resolvectl(1)\0",
+        .man_page = "resolvectl(1)",
         .argspec = "-a INTERFACE <FILE\0"
                    "-d INTERFACE\0",
         .footer =
@@ -46,7 +46,7 @@ static int parse_nameserver(const char *string) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&string, &word, NULL, 0);
+                r = extract_first_word(&string, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -69,7 +69,7 @@ static int parse_search_domain(const char *string) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&string, &word, NULL, EXTRACT_UNQUOTE);
+                r = extract_first_word(&string, &word, /* separators= */ NULL, EXTRACT_UNQUOTE);
                 if (r < 0)
                         return r;
                 if (r == 0)

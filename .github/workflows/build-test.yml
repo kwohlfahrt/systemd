@@ -7,20 +7,26 @@ on:
   pull_request:
     paths:
       - '**/meson.build'
-      - '.github/workflows/**'
+      - '.github/workflows/*.cross'
+      - '.github/workflows/build-test.*'
+      - '.github/workflows/requirements.txt'
       - 'meson_options.txt'
       - 'src/**'
       - 'test/fuzz/**'
+  pull_request_target:
+    types: [closed]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.event_name == 'pull_request'
     runs-on: ${{ matrix.runner }}
-    concurrency:
-      group: ${{ github.workflow }}-${{ toJSON(matrix.env) }}-${{ github.ref }}-${{ matrix.runner }}-${{ matrix.python-version }}
-      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +67,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Setup python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Build check

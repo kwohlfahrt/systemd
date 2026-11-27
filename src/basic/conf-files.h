@@ -16,6 +16,9 @@ typedef enum ConfFilesFlags {
         CONF_FILES_TRUNCATE_SUFFIX          = 1 << 6, /* truncate specified suffix from return filename or path */
         CONF_FILES_WARN                     = 1 << 7, /* warn on some errors */
         CONF_FILES_DONT_PREFIX_ROOT         = 1 << 8, /* don't prefix the specified root path to the resulting paths */
+        CONF_FILES_CHASE_SAFE               = 1 << 9, /* refuse unsafe ownership transitions while resolving */
+        CONF_FILES_CHASE_MAX_MODE           = 1 << 10, /* directories at most 0775, files at most 0664, hence
+                                                        * not for CONF_FILES_EXECUTABLE */
 } ConfFilesFlags;
 
 typedef struct ConfFile {
@@ -39,14 +42,10 @@ int conf_files_list_at(char ***ret, const char *suffix, int rfd, ConfFilesFlags 
 int conf_files_list_strv(char ***ret, const char *suffix, const char *root, ConfFilesFlags flags, const char* const* dirs);
 int conf_files_list_strv_at(char ***ret, const char *suffix, int rfd, ConfFilesFlags flags, const char * const *dirs);
 int conf_files_list_nulstr(char ***ret, const char *suffix, const char *root, ConfFilesFlags flags, const char *dirs);
-int conf_files_list_nulstr_at(char ***ret, const char *suffix, int rfd, ConfFilesFlags flags, const char *dirs);
 
 int conf_files_list_full(const char *suffix, const char *root, ConfFilesFlags flags, const char *dir, ConfFile ***ret_files, size_t *ret_n_files);
-int conf_files_list_at_full(const char *suffix, int rfd, ConfFilesFlags flags, const char *dir, ConfFile ***ret_files, size_t *ret_n_files);
 int conf_files_list_strv_full(const char *suffix, const char *root, ConfFilesFlags flags, const char * const *dirs, ConfFile ***ret_files, size_t *ret_n_files);
-int conf_files_list_strv_at_full(const char *suffix, int rfd, ConfFilesFlags flags, const char * const *dirs, ConfFile ***ret_files, size_t *ret_n_files);
 int conf_files_list_nulstr_full(const char *suffix, const char *root, ConfFilesFlags flags, const char *dirs, ConfFile ***ret_files, size_t *ret_n_files);
-int conf_files_list_nulstr_at_full(const char *suffix, int rfd, ConfFilesFlags flags, const char *dirs, ConfFile ***ret_files, size_t *ret_n_files);
 
 int conf_files_list_with_replacement(
                 const char *root,

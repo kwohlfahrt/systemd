@@ -7,8 +7,10 @@
 #include "confidential-virt.h"
 #include "copy.h"
 #include "creds-util.h"
+#include "efi-loader.h"
 #include "errno-util.h"
 #include "escape.h"
+#include "extract-word.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
@@ -70,6 +72,7 @@ typedef struct ImportCredentialsContext {
         int target_dir_fd;
         size_t size_sum;
         unsigned n_credentials;
+        char * const *filter; /* fnmatch() patterns from systemd.import_credentials_filter=, not owned */
 } ImportCredentialsContext;
 
 static void import_credentials_context_done(ImportCredentialsContext *c) {
@@ -92,7 +95,7 @@ static int acquire_credential_directory(ImportCredentialsContext *c, const char 
                 if (r != -ENOENT)
                         return log_error_errno(r, "Failed to determine if %s is a mount point: %m", path);
 
-                r = mkdir_safe_label(path, 0700, 0, 0, MKDIR_WARN_MODE);
+                r = mkdir_safe_label(path, 0700, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create %s mount point: %m", path);
 
@@ -100,14 +103,14 @@ static int acquire_credential_directory(ImportCredentialsContext *c, const char 
         }
         if (r > 0)
                 /* If already a mount point, then remount writable */
-                (void) mount_nofollow_verbose(LOG_WARNING, NULL, path, NULL, MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ false), NULL);
+                (void) mount_nofollow_verbose(LOG_WARNING, /* what= */ NULL, path, /* fstype= */ NULL, MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ false), /* options= */ NULL);
         else if (with_mount)
                 /* If not a mount point yet, and the credentials are not encrypted, then let's try to mount a no-swap fs there */
                 (void) mount_credentials_fs(path);
 
-        c->target_dir_fd = open(path, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+        c->target_dir_fd = xopenat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY);
         if (c->target_dir_fd < 0)
-                return log_error_errno(errno, "Failed to open %s: %m", path);
+                return log_error_errno(c->target_dir_fd, "Failed to open %s: %m", path);
 
         return c->target_dir_fd;
 }
@@ -119,12 +122,12 @@ static int open_credential_file_for_write(int target_dir_fd, const char *dir_nam
         assert(dir_name);
         assert(n);
 
-        fd = openat(target_dir_fd, n, O_WRONLY|O_CLOEXEC|O_CREAT|O_EXCL|O_NOFOLLOW, 0400);
+        fd = xopenat_full(target_dir_fd, n, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, /* xopen_flags= */ 0, 0400);
         if (fd < 0) {
-                if (errno == EEXIST) /* In case of EEXIST we'll only debug log! */
-                        return log_debug_errno(errno, "Credential '%s' set twice, ignoring.", n);
+                if (fd == -EEXIST) /* In case of EEXIST we'll only debug log! */
+                        return log_debug_errno(fd, "Credential '%s' set twice, ignoring.", n);
 
-                return log_error_errno(errno, "Failed to create %s/%s: %m", dir_name, n);
+                return log_error_errno(fd, "Failed to create %s/%s: %m", dir_name, n);
         }
 
         return fd;
@@ -148,6 +151,17 @@ static bool credential_size_ok(const ImportCredentialsContext *c, const char *na
         return true;
 }
 
+static bool credential_filter_ok(const ImportCredentialsContext *c, const char *name) {
+        assert(c);
+        assert(name);
+
+        if (strv_fnmatch_or_empty(c->filter, name, /* flags= */ 0))
+                return true;
+
+        log_debug("Credential '%s' does not match systemd.import_credentials_filter=, skipping.", name);
+        return false;
+}
+
 static int finalize_credentials_dir(const char *dir, const char *envvar) {
         int r;
 
@@ -160,7 +174,7 @@ static int finalize_credentials_dir(const char *dir, const char *envvar) {
         if (r < 0)
                 log_warning_errno(r, "Failed to make '%s' a mount point, ignoring: %m", dir);
         else
-                (void) mount_nofollow_verbose(LOG_WARNING, NULL, dir, NULL, MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ true), NULL);
+                (void) mount_nofollow_verbose(LOG_WARNING, /* what= */ NULL, dir, /* fstype= */ NULL, MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ true), /* options= */ NULL);
 
         if (setenv(envvar, dir, /* overwrite= */ true) < 0)
                 return log_error_errno(errno, "Failed to set $%s environment variable: %m", envvar);
@@ -178,14 +192,14 @@ static int import_credentials_from_initrd_path(
         _cleanup_close_ int source_dir_fd = -EBADF;
         int r;
 
-        source_dir_fd = open(source_path, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+        source_dir_fd = xopenat(AT_FDCWD, source_path, O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
         if (source_dir_fd < 0) {
-                if (errno == ENOENT) {
+                if (source_dir_fd == -ENOENT) {
                         log_debug("No credentials passed via %s.", source_path);
                         return 0;
                 }
 
-                log_warning_errno(errno, "Failed to open '%s', ignoring: %m", source_path);
+                log_warning_errno(source_dir_fd, "Failed to open '%s', ignoring: %m", source_path);
                 return 0;
         }
 
@@ -217,9 +231,12 @@ static int import_credentials_from_initrd_path(
                         continue;
                 }
 
-                cfd = openat(source_dir_fd, d->d_name, O_RDONLY|O_CLOEXEC);
+                if (!credential_filter_ok(c, n))
+                        continue;
+
+                cfd = xopenat(source_dir_fd, d->d_name, O_RDONLY);
                 if (cfd < 0) {
-                        log_warning_errno(errno, "Failed to open %s, ignoring: %m", d->d_name);
+                        log_warning_errno(cfd, "Failed to open %s, ignoring: %m", d->d_name);
                         continue;
                 }
 
@@ -247,7 +264,7 @@ static int import_credentials_from_initrd_path(
                 if (nfd < 0)
                         return nfd;
 
-                r = copy_bytes(cfd, nfd, st.st_size, 0);
+                r = copy_bytes(cfd, nfd, st.st_size, /* copy_flags= */ 0);
                 if (r < 0) {
                         (void) unlinkat(c->target_dir_fd, n, 0);
                         return log_error_errno(r, "Failed to create credential '%s': %m", n);
@@ -265,11 +282,10 @@ static int import_credentials_from_initrd_path(
 static int import_credentials_boot(ImportCredentialsContext *system_ctx) {
         _cleanup_(import_credentials_context_done) ImportCredentialsContext encrypted_ctx = {
                 .target_dir_fd = -EBADF,
+                .filter = ASSERT_PTR(system_ctx)->filter,
         };
         unsigned n_system_before;
         int r;
-
-        assert(system_ctx);
 
         /* The initrd may contain two flavours of credentials placed under /.extra/, copied
          * across the initrd → host transition before the initrd tmpfs is erased:
@@ -357,6 +373,13 @@ static int proc_cmdline_callback(const char *key, const char *value, void *data)
                 return 0;
         }
 
+        /* Note: credentials explicitly set on the kernel command line are not subject to
+         * systemd.import_credentials_filter=: whoever controls the kernel command line can also change the
+         * filter itself. Note that outside of confidential VMs systemd-stub appends SMBIOS
+         * io.systemd.stub.kernel-cmdline-extra= to the kernel command line, and sd-boot appends SMBIOS
+         * io.systemd.boot.kernel-cmdline-extra= for Type #1 Linux entries, i.e. in that case the SMBIOS
+         * supplier controls both too. */
+
         colon++;
 
         if (base64) {
@@ -404,10 +427,63 @@ static int import_credentials_proc_cmdline(ImportCredentialsContext *c) {
 
         assert(c);
 
-        r = proc_cmdline_parse(proc_cmdline_callback, c, 0);
+        r = proc_cmdline_parse(proc_cmdline_callback, c, /* flags= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse /proc/cmdline: %m");
 
+        return 0;
+}
+
+static int proc_cmdline_filter_callback(const char *key, const char *value, void *data) {
+        char ***filter = ASSERT_PTR(data);
+        int r;
+
+        assert(key);
+
+        if (proc_cmdline_key_streq(key, "rd.systemd.import_credentials_filter")) {
+                log_warning("rd.systemd.import_credentials_filter= is not supported, use systemd.import_credentials_filter= instead, ignoring.");
+                return 0;
+        }
+
+        if (!proc_cmdline_key_streq(key, "systemd.import_credentials_filter"))
+                return 0;
+
+        if (proc_cmdline_value_missing(key, value))
+                return 0;
+
+        /* An empty assignment resets the list, i.e. turns off filtering again */
+        if (isempty(value)) {
+                *filter = strv_free(*filter);
+                return 0;
+        }
+
+        /* Retain escapes, so that they are passed through to fnmatch(). Refuse import of credentials
+         * entirely on parse failure, rather than silently importing more than the filter would let pass. */
+        r = strv_split_and_extend_full(filter, value, ",", /* filter_duplicates= */ true, EXTRACT_RETAIN_ESCAPE);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse systemd.import_credentials_filter= value '%s': %m", value);
+
+        return 0;
+}
+
+static int parse_import_credentials_filter(char ***ret) {
+        _cleanup_strv_free_ char **filter = NULL;
+        int r;
+
+        assert(ret);
+
+        /* Credentials are imported only once per boot (either in the initrd or on the host), hence an
+         * "rd." prefixed version of this option makes no sense, and we do not strip the prefix. */
+        r = proc_cmdline_parse(proc_cmdline_filter_callback, &filter, /* flags= */ 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse systemd.import_credentials_filter= from kernel command line: %m");
+
+        if (filter) {
+                _cleanup_free_ char *j = strv_join(filter, ", ");
+                log_debug("Only importing credentials matching: %s", strnull(j));
+        }
+
+        *ret = TAKE_PTR(filter);
         return 0;
 }
 
@@ -426,14 +502,14 @@ static int import_credentials_qemu(ImportCredentialsContext *c) {
         if (detect_confidential_virtualization() > 0) /* don't trust firmware if confidential VMs */
                 return 0;
 
-        source_dir_fd = open(QEMU_FWCFG_PATH, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+        source_dir_fd = xopenat(AT_FDCWD, QEMU_FWCFG_PATH, O_RDONLY|O_DIRECTORY);
         if (source_dir_fd < 0) {
-                if (errno == ENOENT) {
+                if (source_dir_fd == -ENOENT) {
                         log_debug("No credentials passed via fw_cfg.");
                         return 0;
                 }
 
-                log_warning_errno(errno, "Failed to open '" QEMU_FWCFG_PATH "', ignoring: %m");
+                log_warning_errno(source_dir_fd, "Failed to open '" QEMU_FWCFG_PATH "', ignoring: %m");
                 return 0;
         }
 
@@ -454,13 +530,16 @@ static int import_credentials_qemu(ImportCredentialsContext *c) {
                         continue;
                 }
 
-                vfd = openat(source_dir_fd, d->d_name, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+                if (!credential_filter_ok(c, d->d_name))
+                        continue;
+
+                vfd = xopenat(source_dir_fd, d->d_name, O_RDONLY|O_DIRECTORY);
                 if (vfd < 0) {
-                        log_warning_errno(errno, "Failed to open '" QEMU_FWCFG_PATH "'/%s/, ignoring: %m", d->d_name);
+                        log_warning_errno(vfd, "Failed to open '" QEMU_FWCFG_PATH "'/%s/, ignoring: %m", d->d_name);
                         continue;
                 }
 
-                r = read_virtual_file_at(vfd, "size", LINE_MAX, &szs, NULL);
+                r = read_virtual_file_at(vfd, "size", LINE_MAX, &szs, /* ret_size= */ NULL);
                 if (r < 0) {
                         log_warning_errno(r, "Failed to read '" QEMU_FWCFG_PATH "'/%s/size, ignoring: %m", d->d_name);
                         continue;
@@ -479,9 +558,9 @@ static int import_credentials_qemu(ImportCredentialsContext *c) {
                  * having size zero, and we'd rather not have applications support such credential
                  * files. Let's hence copy the files to make them regular. */
 
-                rfd = openat(vfd, "raw", O_RDONLY|O_CLOEXEC);
+                rfd = xopenat(vfd, "raw", O_RDONLY);
                 if (rfd < 0) {
-                        log_warning_errno(errno, "Failed to open '" QEMU_FWCFG_PATH "'/%s/raw, ignoring: %m", d->d_name);
+                        log_warning_errno(rfd, "Failed to open '" QEMU_FWCFG_PATH "'/%s/raw, ignoring: %m", d->d_name);
                         continue;
                 }
 
@@ -495,7 +574,7 @@ static int import_credentials_qemu(ImportCredentialsContext *c) {
                 if (nfd < 0)
                         return nfd;
 
-                r = copy_bytes(rfd, nfd, sz, 0);
+                r = copy_bytes(rfd, nfd, sz, /* copy_flags= */ 0);
                 if (r < 0) {
                         (void) unlinkat(c->target_dir_fd, d->d_name, 0);
                         return log_error_errno(r, "Failed to create credential '%s': %m", d->d_name);
@@ -569,6 +648,9 @@ static int parse_smbios_strings(ImportCredentialsContext *c, const char *data, s
                         continue;
                 }
 
+                if (!credential_filter_ok(c, cn))
+                        continue;
+
                 /* Optionally base64 decode the data, if requested, to allow binary credentials */
                 if (unbase64) {
                         r = unbase64mem_full(eq + 1, nul - (eq + 1), /* secure= */ false, &buf, &buflen);
@@ -622,15 +704,25 @@ static int import_credentials_smbios(ImportCredentialsContext *c) {
         if (detect_container() > 0) /* don't access /sys/ in a container */
                 return 0;
 
-        /* SMBIOS OEM strings are host-controlled, so by default we don't trust them in a confidential VM.
-         * Exception: under Intel TDX the SMBIOS table (including Type 11) is measured into RTMR0 by the
-         * firmware (TDVF's SmbiosMeasurementDxe) on direct boot, and additionally by systemd-stub on UKI
-         * boot, so a remote verifier can detect host tampering with these credentials. As with the kernel
-         * command line (also host-influenced but measured), we can't and needn't locally verify the
-         * measurement actually happened; the verifier anchors the firmware's behaviour via MRTD. */
+        /* SMBIOS OEM strings are host-controlled. In a confidential VM we only accept them when the boot
+         * loader (sd-boot or sd-stub) measured the SMBIOS table including type 11, so that they are covered
+         * by the attestation evidence: under TDX the loader measures via the CC protocol into RTMR 0. The
+         * firmware's own SMBIOS measurement does not cover type 11, edk2's SmbiosMeasurementDxe filters it
+         * out before hashing. Direct kernel boots without a loader hence get no SMBIOS credential, vmspawn
+         * uses the initrd cpio there. Other CVM types have no measurement register for this. */
         ConfidentialVirtualization cv = detect_confidential_virtualization();
-        if (cv > 0 && cv != CONFIDENTIAL_VIRTUALIZATION_TDX)
-                return 0;
+        if (cv > 0) {
+                if (cv != CONFIDENTIAL_VIRTUALIZATION_TDX)
+                        return 0;
+
+                r = efi_measured_smbios(LOG_DEBUG);
+                if (r < 0) /* already logged */
+                        return 0;
+                if (r == 0) {
+                        log_debug("Boot loader did not measure the SMBIOS table, ignoring SMBIOS credentials in confidential VM.");
+                        return 0;
+                }
+        }
 
         for (unsigned i = 0;; i++) {
                 _cleanup_free_ char *data = NULL;
@@ -670,12 +762,12 @@ static int import_credentials_initrd(ImportCredentialsContext *c) {
         if (in_initrd())
                 return 0;
 
-        source_dir_fd = open("/run/credentials/@initrd", O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+        source_dir_fd = xopenat(AT_FDCWD, "/run/credentials/@initrd", O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
         if (source_dir_fd < 0) {
-                if (errno == ENOENT)
-                        log_debug_errno(errno, "No credentials passed from initrd.");
+                if (source_dir_fd == -ENOENT)
+                        log_debug_errno(source_dir_fd, "No credentials passed from initrd.");
                 else
-                        log_warning_errno(errno, "Failed to open '%s', ignoring: %m", "/run/credentials/@initrd");
+                        log_warning_errno(source_dir_fd, "Failed to open '%s', ignoring: %m", "/run/credentials/@initrd");
                 return 0;
         }
 
@@ -695,9 +787,9 @@ static int import_credentials_initrd(ImportCredentialsContext *c) {
                         continue;
                 }
 
-                cfd = openat(source_dir_fd, d->d_name, O_RDONLY|O_CLOEXEC);
+                cfd = xopenat(source_dir_fd, d->d_name, O_RDONLY);
                 if (cfd < 0) {
-                        log_warning_errno(errno, "Failed to open %s, ignoring: %m", d->d_name);
+                        log_warning_errno(cfd, "Failed to open %s, ignoring: %m", d->d_name);
                         continue;
                 }
 
@@ -725,7 +817,7 @@ static int import_credentials_initrd(ImportCredentialsContext *c) {
                 if (nfd < 0)
                         return nfd;
 
-                r = copy_bytes(cfd, nfd, st.st_size, 0);
+                r = copy_bytes(cfd, nfd, st.st_size, /* copy_flags= */ 0);
                 if (r < 0) {
                         (void) unlinkat(c->target_dir_fd, d->d_name, 0);
                         return log_error_errno(r, "Failed to create credential '%s': %m", d->d_name);
@@ -932,6 +1024,7 @@ int import_credentials(void) {
                 _cleanup_(import_credentials_context_done) ImportCredentialsContext system_ctx = {
                         .target_dir_fd = -EBADF,
                 };
+                _cleanup_strv_free_ char **filter = NULL;
                 bool import;
 
                 r = proc_cmdline_get_bool("systemd.import_credentials", PROC_CMDLINE_STRIP_RD_PREFIX|PROC_CMDLINE_TRUE_WHEN_MISSING, &import);
@@ -941,6 +1034,12 @@ int import_credentials(void) {
                         log_notice("systemd.import_credentials=no is set, skipping importing of credentials.");
                         return 0;
                 }
+
+                r = parse_import_credentials_filter(&filter);
+                if (r < 0)
+                        return r;
+
+                system_ctx.filter = filter;
 
                 /* System credential context is shared so a single CREDENTIALS_TOTAL_SIZE_MAX is enforced. */
                 r = import_credentials_boot(&system_ctx);

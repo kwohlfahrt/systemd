@@ -46,7 +46,7 @@ static int deserialize_markers(Unit *u, const char *value) {
         for (const char *p = value;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r <= 0)
                         return r;
 
@@ -131,6 +131,8 @@ int unit_serialize_state(Unit *u, FILE *f, FDSet *fds, bool switching_root) {
         (void) serialize_markers(f, u->markers);
 
         bus_track_serialize(u->bus_track, f, "ref");
+        STRV_FOREACH(i, u->deserialized_refs)
+                (void) serialize_item(f, "ref", *i);
 
         if (!switching_root) {
                 if (u->job) {
@@ -565,12 +567,15 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
                 }
         }
 
-        if (!sd_id128_is_null(u->invocation_id))
+        if (unit_has_invocation_id(u))
                 fprintf(f, "%s\tInvocation ID: " SD_ID128_FORMAT_STR "\n",
                         prefix, SD_ID128_FORMAT_VAL(u->invocation_id));
 
         STRV_FOREACH(j, u->documentation)
                 fprintf(f, "%s\tDocumentation: %s\n", prefix, *j);
+
+        STRV_FOREACH(j, u->tags)
+                fprintf(f, "%s\tTags: %s\n", prefix, *j);
 
         if (u->access_selinux_context)
                 fprintf(f, "%s\tAccess SELinux Context: %s\n", prefix, u->access_selinux_context);

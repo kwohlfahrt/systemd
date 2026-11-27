@@ -14,7 +14,6 @@ Checks: '
     bugprone-suspicious-semicolon,
     bugprone-suspicious-string-compare,
     bugprone-swapped-arguments,
-    bugprone-tautological-type-limits,
     bugprone-unsafe-functions,
     bugprone-unused-return-value,
     misc-header-include-cycle,
@@ -63,6 +62,9 @@ CheckOptions:
     ^ntohs$,be16toh(),is confusing;
     ^strerror$,STRERROR() or printf %m,is not thread-safe;
     ^accept$,accept4(),is not O_CLOEXEC-safe;
+    ^open$,xopenat(),does not set O_CLOEXEC by default;
+    ^openat$,xopenat(),does not set O_CLOEXEC by default;
+    ^creat$,xopenat(),is an obsolete relic that does not set O_CLOEXEC;
     ^dirname$,path_extract_directory(),is icky;
     ^basename$,path_extract_filename(),is icky;
     ^setmntent$,libmount_parse_fstab(),libmount parser should be used instead;

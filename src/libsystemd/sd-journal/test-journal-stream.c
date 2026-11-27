@@ -74,9 +74,9 @@ static void run_test(void) {
         ASSERT_OK_ERRNO(chdir(t));
         (void) chattr_path(t, FS_NOCOW_FL, FS_NOCOW_FL);
 
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "one.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, NULL, m, NULL, &one));
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "two.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, NULL, m, NULL, &two));
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "three.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, NULL, m, NULL, &three));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "one.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &one));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "two.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &two));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "three.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &three));
 
         for (i = 0; i < N_ENTRIES; i++) {
                 char *p, *q;
@@ -94,19 +94,28 @@ static void run_test(void) {
                 previous_ts = ts;
 
                 ASSERT_OK_ERRNO(asprintf(&p, "NUMBER=%u", i));
-                iovec[0] = IOVEC_MAKE(p, strlen(p));
+                iovec[0] = IOVEC_MAKE_STRING(p);
 
                 ASSERT_OK_ERRNO(asprintf(&q, "MAGIC=%s", i % 5 == 0 ? "quux" : "waldo"));
 
-                iovec[1] = IOVEC_MAKE(q, strlen(q));
+                iovec[1] = IOVEC_MAKE_STRING(q);
 
                 if (i % 10 == 0)
-                        ASSERT_OK_ZERO(journal_file_append_entry(three, &ts, NULL, iovec, 2, NULL, NULL, NULL, NULL));
+                        ASSERT_OK_ZERO(journal_file_append_entry(three, &ts, /* boot_id= */ NULL, iovec, 2, /* seqnum= */ NULL, /* seqnum_id= */ NULL, /* ret_object= */ NULL, /* ret_offset= */ NULL));
                 else {
                         if (i % 3 == 0)
-                                ASSERT_OK_ZERO(journal_file_append_entry(two, &ts, NULL, iovec, 2, NULL, NULL, NULL, NULL));
+                                ASSERT_OK_ZERO(journal_file_append_entry(
+                                                two,
+                                                &ts,
+                                                /* boot_id= */ NULL,
+                                                iovec,
+                                                2,
+                                                /* seqnum= */ NULL,
+                                                /* seqnum_id= */ NULL,
+                                                /* ret_object= */ NULL,
+                                                /* ret_offset= */ NULL));
 
-                        ASSERT_OK_ZERO(journal_file_append_entry(one, &ts, NULL, iovec, 2, NULL, NULL, NULL, NULL));
+                        ASSERT_OK_ZERO(journal_file_append_entry(one, &ts, /* boot_id= */ NULL, iovec, 2, /* seqnum= */ NULL, /* seqnum_id= */ NULL, /* ret_object= */ NULL, /* ret_offset= */ NULL));
                 }
 
                 free(p);
@@ -164,7 +173,7 @@ static void run_test(void) {
         printf("resulting match expression is: %s\n", z);
         free(z);
 
-        verify_contents(j, 0);
+        verify_contents(j, /* skip= */ 0);
 
         ASSERT_OK(sd_journal_query_unique(j, "NUMBER"));
         SD_JOURNAL_FOREACH_UNIQUE(j, data, l)
@@ -173,27 +182,32 @@ static void run_test(void) {
         ASSERT_OK(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL));
 }
 
-int main(int argc, char *argv[]) {
-
-        /* journal_file_open() requires a valid machine id */
-        if (access("/etc/machine-id", F_OK) != 0)
-                return log_tests_skipped("/etc/machine-id not found");
-
-        test_setup_logging(LOG_DEBUG);
-
-        /* Run this test multiple times with different configurations of features. */
-
+TEST(journal_stream_without_keyed_hash) {
         ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_KEYED_HASH", "0", 1));
         run_test();
+}
 
+TEST(journal_stream_with_keyed_hash) {
         ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_KEYED_HASH", "1", 1));
         run_test();
+}
 
+TEST(journal_stream_not_compact) {
         ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", "0", 1));
         run_test();
+}
 
+TEST(journal_stream_compact) {
         ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", "1", 1));
         run_test();
-
-        return 0;
 }
+
+static int intro(void) {
+        /* journal_file_open() requires a valid machine id */
+        if (access("/etc/machine-id", F_OK) != 0)
+                return log_tests_skipped_errno(errno, "/etc/machine-id not found");
+
+        return EXIT_SUCCESS;
+}
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

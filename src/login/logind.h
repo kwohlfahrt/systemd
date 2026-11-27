@@ -119,11 +119,6 @@ typedef struct Manager {
         usec_t holdoff_timeout_usec;
         sd_event_source *lid_switch_ignore_event_source;
 
-        sd_event_source *power_key_long_press_event_source;
-        sd_event_source *reboot_key_long_press_event_source;
-        sd_event_source *suspend_key_long_press_event_source;
-        sd_event_source *hibernate_key_long_press_event_source;
-
         uint64_t runtime_dir_size;
         uint64_t runtime_dir_inodes;
         uint64_t sessions_max;
@@ -140,6 +135,9 @@ typedef struct Manager {
         dual_timestamp init_ts;
 
         sd_varlink_server *varlink_server;
+        sd_varlink_server *metrics_varlink_server;
+
+        LoginCounters *counters;
 } Manager;
 
 void manager_reset_config(Manager *m);
@@ -167,8 +165,11 @@ int manager_get_user_by_pid(Manager *m, pid_t pid, User **ret);
 int manager_get_session_by_pidref(Manager *m, const PidRef *pid, Session **ret);
 int manager_get_session_by_leader(Manager *m, const PidRef *pid, Session **ret);
 
+bool drm_connector_is_external(const char *sysname);
+bool drm_connector_is_active(const char *status, const char *enabled);
+
 bool manager_is_lid_closed(Manager *m);
-bool manager_is_docked_or_external_displays(Manager *m);
+bool manager_is_docked(Manager *m);
 bool manager_is_on_external_power(void);
 bool manager_all_buttons_ignored(Manager *m);
 
@@ -178,6 +179,7 @@ const struct ConfigPerfItem* logind_gperf_lookup(const char *str, GPERF_LEN_TYPE
 int manager_set_lid_switch_ignore(Manager *m, usec_t until);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_n_autovts);
+CONFIG_PARSER_PROTOTYPE(config_parse_kill_exclude_users);
 CONFIG_PARSER_PROTOTYPE(config_parse_tmpfs_size);
 
 int manager_setup_wall_message_timer(Manager *m);

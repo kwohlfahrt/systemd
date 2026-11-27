@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11,6 +13,7 @@
 #include "hash-funcs.h"
 #include "id128-util.h"
 #include "io-util.h"
+#include "log.h"
 #include "namespace-util.h"
 #include "pidref.h"
 #include "process-util.h"
@@ -85,7 +88,7 @@ int id128_read_fd(int fd, Id128Flag f, sd_id128_t *ret) {
          *     -ENOPKG:    "uninitialized" or "uninitialized\n",
          *     -EUCLEAN:   other invalid strings. */
 
-        l = loop_read(fd, buffer, sizeof(buffer), false); /* we expect a short read of either 32/33 or 36/37 chars */
+        l = loop_read(fd, buffer, sizeof(buffer), /* do_poll= */ false); /* we expect a short read of either 32/33 or 36/37 chars */
         if (l < 0)
                 return (int) l;
         if (l == 0) /* empty? */
@@ -145,7 +148,7 @@ int id128_read_at(int dir_fd, const char *path, Id128Flag f, sd_id128_t *ret) {
         assert(wildcard_fd_is_valid(dir_fd));
         assert(path);
 
-        fd = xopenat(dir_fd, path, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        fd = xopenat(dir_fd, path, O_RDONLY|O_NOCTTY);
         if (fd < 0)
                 return fd;
 
@@ -191,7 +194,7 @@ int id128_write_at(int dir_fd, const char *path, Id128Flag f, sd_id128_t id) {
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
         assert(path);
 
-        fd = xopenat_full(dir_fd, path, O_WRONLY|O_CREAT|O_CLOEXEC|O_NOCTTY|O_TRUNC, /* xopen_flags= */ 0, 0444);
+        fd = xopenat_full(dir_fd, path, O_WRONLY|O_CREAT|O_NOCTTY|O_TRUNC, /* xopen_flags= */ 0, 0444);
         if (fd < 0)
                 return fd;
 
@@ -259,6 +262,74 @@ int id128_get_product(sd_id128_t *ret) {
         return 0;
 }
 
+int id128_get_fs_uuid_fd(int fd, sd_id128_t *ret) {
+        struct fsuuid2 u = {};
+
+        assert(fd >= 0);
+        assert(ret);
+
+        /* Reads the UUID of the file system backing the specified fd, via FS_IOC_GETFSUUID. Returns
+         * -EOPNOTSUPP if the file system (or kernel) does not support the ioctl or reports an identifier
+         * that is not a 128-bit UUID, and -EADDRNOTAVAIL if the reported UUID is all zeroes or all ones. */
+
+        if (ioctl(fd, FS_IOC_GETFSUUID, &u) < 0) {
+                if (ERRNO_IS_IOCTL_NOT_SUPPORTED(errno))
+                        return -EOPNOTSUPP;
+
+                return -errno;
+        }
+
+        sd_id128_t uuid;
+        if (u.len != sizeof(uuid.bytes))
+                /* The kernel permits file systems to report identifiers shorter than 16 bytes, which are not
+                 * UUIDs, hence refuse them. */
+                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                       "File system reports a %u byte identifier, which is not a UUID, refusing.",
+                                       (unsigned) u.len);
+
+        memcpy(uuid.bytes, u.uuid, sizeof(uuid.bytes));
+
+        if (sd_id128_is_null(uuid) || sd_id128_is_allf(uuid))
+                return -EADDRNOTAVAIL; /* Recognizable error, like in id128_get_product() */
+
+        *ret = uuid;
+        return 0;
+}
+
+int id128_get_fs_uuid(const char *path, sd_id128_t *ret) {
+        _cleanup_close_ int fd = -EBADF;
+
+        assert(path);
+        assert(ret);
+
+        /* Like id128_get_fs_uuid_fd(), but takes a path to a directory, e.g. "/var/". */
+
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY);
+        if (fd < 0)
+                return fd;
+
+        return id128_get_fs_uuid_fd(fd, ret);
+}
+
+int id128_get_var_fs_uuid(sd_id128_t *ret) {
+        int r;
+
+        assert(ret);
+
+        /* Returns the UUID of the file system backing /var/, i.e. the file system that carries the
+         * persistent, writable state of this installation, which may hence be used to identify it. */
+
+        r = detect_container();
+        if (r < 0)
+                return r;
+        if (r > 0) /* Refuse returning this in containers, as the file system is then typically owned by the
+                    * host (and might be shared between multiple containers), hence the UUID is not a
+                    * property of our system, and likely not unique. */
+                return -ENOENT;
+
+        return id128_get_fs_uuid("/var/", ret);
+}
+
 sd_id128_t id128_digest(const void *data, size_t size) {
         assert(data || size == 0);
 
@@ -299,7 +370,7 @@ int id128_get_boot_for_machine(const char *machine, sd_id128_t *ret) {
         if (r < 0)
                 return r;
 
-        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
+        if (socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, pair) < 0)
                 return -errno;
 
         r = namespace_fork("(sd-bootidns)", "(sd-bootid)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
@@ -322,7 +393,7 @@ int id128_get_boot_for_machine(const char *machine, sd_id128_t *ret) {
 
         pair[1] = safe_close(pair[1]);
 
-        r = pidref_wait_for_terminate_and_check("(sd-bootidns)", &child, 0);
+        r = pidref_wait_for_terminate_and_check("(sd-bootidns)", &child, /* flags= */ 0);
         if (r < 0)
                 return r;
         if (r != EXIT_SUCCESS)

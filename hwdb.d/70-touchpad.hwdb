@@ -45,8 +45,18 @@
 # removability, so 65-integration.rules classifies the touchpad as external
 # and libinput skips disable-while-typing.
 # The touchpad is physically integrated; mark it internal to enable DWT.
+touchpad:usb:v05acp027c:name:Apple Inc. Apple Internal Keyboard / Trackpad:*
 touchpad:usb:v05acp0280:name:Apple Inc. Apple Internal Keyboard / Trackpad:*
 touchpad:usb:v05acp0340:name:Apple Inc. Apple Internal Keyboard / Trackpad:*
+ ID_INPUT_TOUCHPAD_INTEGRATION=internal
+
+###########################################################
+# Apple MacBook Air 11" (2014)
+###########################################################
+# The touchpad is on a USB bus, so udev classifies it as external and libinput
+# skips disable-while-typing. The touchpad is physically integrated; mark it
+# internal to enable DWT.
+touchpad:usb:v05acp0290:name:bcm5974:*
  ID_INPUT_TOUCHPAD_INTEGRATION=internal
 
 ###########################################################

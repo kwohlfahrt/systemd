@@ -1,0 +1,2114 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+
+#include "sd-json.h"
+
+#include "alloc-util.h"
+#include "ask-password-api.h"
+#include "chattr-util.h"
+#include "crypto-util.h"
+#include "errno-util.h"
+#include "escape.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "format-util.h"
+#include "fs-util.h"
+#include "hexdecoct.h"
+#include "io-util.h"
+#include "iovec-util.h"
+#include "json-util.h"
+#include "manifest-util.h"
+#include "mkdir.h"
+#include "memstream-util.h"
+#include "path-util.h"
+#include "rm-rf.h"
+#include "sha256.h"
+#include "string-util.h"
+#include "strv.h"
+#include "tests.h"
+#include "time-util.h"
+#include "tmpfile-util.h"
+#include "uapi16-manifest.h"
+#include "user-util.h"
+#include "xattr-util.h"
+
+#define HASH_FOO "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"
+#define HASH_BAR "7d865e959b2466918c9863afca942d0fb89d7c9ac0c99bafc3749504ded97730"
+
+static void assert_digest(const struct iovec *digest, const char *hex) {
+        _cleanup_(iovec_done) struct iovec expected = {};
+
+        ASSERT_OK(unhexmem(hex, &expected.iov_base, &expected.iov_len));
+        ASSERT_IOVEC_EQ(digest, &expected);
+}
+
+TEST(manifest_parse_sums) {
+        static const char text[] =
+                HASH_FOO "  foo\n"
+                HASH_BAR " *bar/baz\n"
+                HASH_FOO "  with space\n"
+                HASH_FOO "  plain\\backslash\n"
+                "\\" HASH_BAR "  with\\nnewline\n"
+                "\\" HASH_FOO "  back\\\\slash\\rcr\n"
+                "B5BB9D8014A0F9B1D61E21E796D78DCCDF1352F23CD32812F4850B878AE4944C  upper\n"
+                HASH_BAR "  crlf\r\n"
+                HASH_FOO "  last"; /* no trailing newline */
+
+        static const struct {
+                const char *filename;
+                const char *hash;
+        } expected[] = {
+                { "foo",                  HASH_FOO },
+                { "bar/baz",              HASH_BAR },
+                { "with space",           HASH_FOO },
+                { "plain\\backslash",     HASH_FOO },
+                { "with\nnewline",        HASH_BAR },
+                { "back\\slash\rcr",      HASH_FOO },
+                { "upper",                HASH_FOO },
+                { "crlf",                 HASH_BAR },
+                { "last",                 HASH_FOO },
+        };
+
+        _cleanup_fclose_ FILE *f = fmemopen_unlocked((void*) text, strlen(text), "r");
+        ASSERT_NOT_NULL(f);
+        size_t line_nr = 0;
+
+        FOREACH_ELEMENT(e, expected) {
+                _cleanup_free_ char *fn = NULL;
+                _cleanup_(iovec_done) struct iovec digest = {};
+
+                ASSERT_OK_POSITIVE(manifest_parse_sums(f, &line_nr, &fn, &digest));
+                ASSERT_STREQ(fn, e->filename);
+                assert_digest(&digest, e->hash);
+                ASSERT_EQ(line_nr, (size_t) (e - expected + 1));
+        }
+
+        /* EOF, repeatedly */
+        for (unsigned i = 0; i < 2; i++) {
+                _cleanup_free_ char *fn = NULL;
+                struct iovec digest = { .iov_base = (void*) 0x1, .iov_len = 1 };
+
+                ASSERT_OK_ZERO(manifest_parse_sums(f, &line_nr, &fn, &digest));
+                ASSERT_NULL(fn);
+                ASSERT_FALSE(iovec_is_set(&digest));
+                ASSERT_EQ(line_nr, ELEMENTSOF(expected));
+        }
+}
+
+static int parse_one(const char *line) {
+        _cleanup_fclose_ FILE *f = fmemopen_unlocked((void*) line, strlen(line), "r");
+        ASSERT_NOT_NULL(f);
+        _cleanup_free_ char *fn = NULL;
+        _cleanup_(iovec_done) struct iovec digest = {};
+        size_t line_nr = 0;
+        int r;
+
+        r = manifest_parse_sums(f, &line_nr, &fn, &digest);
+        if (r < 0) {
+                ASSERT_NULL(fn);
+                ASSERT_FALSE(iovec_is_set(&digest));
+        }
+
+        return r;
+}
+
+TEST(manifest_parse_sums_invalid) {
+        FOREACH_STRING(line,
+                       /* too short */
+                       "foo",
+                       HASH_FOO,
+                       HASH_FOO " ",
+                       HASH_FOO "  ",
+                       HASH_FOO " *",
+                       "\\" HASH_FOO "  ",
+                       /* broken digests */
+                       "g5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c  foo",
+                       "b5bb9d8014a0f9b1 61e21e796d78dccdf1352f23cd32812f4850b878ae4944c  foo",
+                       "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae494  foo",
+                       /* missing separator or binary/text marker */
+                       HASH_FOO "x foo",
+                       HASH_FOO "\tfoo bar",
+                       HASH_FOO " xfoo",
+                       /* paths that are not relative and normalized */
+                       HASH_FOO "  /etc/passwd",
+                       HASH_FOO "  ..",
+                       HASH_FOO "  ../foo",
+                       HASH_FOO "  foo/../bar",
+                       HASH_FOO "  ./foo",
+                       HASH_FOO "  foo/.",
+                       "\\" HASH_FOO "  \\n/../foo",
+                       /* invalid escaping */
+                       "\\" HASH_FOO "  foo\\x",
+                       "\\" HASH_FOO "  foo\\",
+                       /* invalid UTF-8 */
+                       HASH_FOO "  \xff\xfe")
+                ASSERT_ERROR(parse_one(line), EINVAL);
+}
+
+static int make_tree(char **ret_path) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+
+        assert(ret_path);
+
+        /* Populates a temporary directory with one inode of each type we can create unprivileged, including
+         * a pair of hardlinks. */
+
+        ASSERT_OK(tfd = mkdtemp_open(/* template= */ NULL, O_DIRECTORY, &t));
+
+        ASSERT_OK(write_string_file_at(tfd, "regular.txt", "hello world", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        ASSERT_OK(write_string_file_at(tfd, "empty.txt", "", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        ASSERT_OK_ERRNO(mkdirat(tfd, "subdir", 0755));
+        ASSERT_OK(write_string_file_at(tfd, "subdir/nested.txt", "nested", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        ASSERT_OK_ERRNO(symlinkat("regular.txt", tfd, "symlink"));
+        ASSERT_OK_ERRNO(mkfifoat(tfd, "fifo", 0600));
+        ASSERT_OK(write_string_file_at(tfd, "hardlink_a", "hardlinked content", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        ASSERT_OK_ERRNO(linkat(tfd, "hardlink_a", tfd, "hardlink_b", 0));
+
+        ASSERT_OK_ERRNO(fchmodat(tfd, "regular.txt", 0644, 0));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "empty.txt", 0644, 0));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "subdir/nested.txt", 0644, 0));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "hardlink_a", 0644, 0));
+
+        *ret_path = TAKE_PTR(t);
+        return TAKE_FD(tfd);
+}
+
+static void context_init(ManifestContext *c, ManifestFormat format) {
+        assert(c);
+
+        *c = MANIFEST_CONTEXT_NULL;
+        c->format = format;
+}
+
+static int generate(ManifestContext *c, int dir_fd, char **ret, size_t *ret_size) {
+        _cleanup_(memstream_done) MemStream m = {};
+        int r;
+
+        assert(c);
+        assert(ret);
+        assert(ret_size);
+
+        ASSERT_NOT_NULL(c->output = memstream_init(&m));
+
+        /* manifest_make() enumerates the tree from the current position of the directory fd, like any
+         * readdir() style interface does, hence rewind it, since we reuse the fd for multiple runs. */
+        ASSERT_OK_ERRNO(lseek(dir_fd, 0, SEEK_SET));
+
+        r = manifest_make(c, dir_fd);
+        c->output = NULL;
+        if (r < 0)
+                return r;
+
+        ASSERT_OK(memstream_finalize(&m, ret, ret_size));
+        return 0;
+}
+
+static int verify_buffer(ManifestContext *c, int dir_fd, const char *buf, size_t size) {
+        _cleanup_fclose_ FILE *f = NULL;
+
+        assert(c);
+        assert(buf);
+
+        ASSERT_NOT_NULL(f = fmemopen_unlocked((void*) buf, size, "r"));
+
+        return manifest_verify(c, dir_fd, f);
+}
+
+static int verify_pipe(ManifestContext *c, int dir_fd, const char *buf, size_t size) {
+        _cleanup_close_pair_ int p[2] = EBADF_PAIR;
+        _cleanup_fclose_ FILE *f = NULL;
+
+        assert(c);
+        assert(buf);
+
+        /* Like verify_buffer(), but pass the data through a pipe, i.e. something that is not seekable, to
+         * validate we really operate in a streaming fashion. The manifests we generate here are small
+         * enough to fit into the pipe buffer. */
+
+        ASSERT_OK_ERRNO(pipe2(p, O_CLOEXEC));
+        ASSERT_OK(loop_write(p[1], buf, size));
+        p[1] = safe_close(p[1]);
+
+        ASSERT_OK(take_fdopen_unlocked(&p[0], "r", &f));
+
+        return manifest_verify(c, dir_fd, f);
+}
+
+TEST(manifest_fields_from_string) {
+        ManifestField f;
+
+        f = 0;
+        ASSERT_OK(manifest_fields_from_string("all", &f));
+        ASSERT_EQ(f, _MANIFEST_FIELD_FSTREE_ALL);
+
+        f = _MANIFEST_FIELD_ALL;
+        ASSERT_OK(manifest_fields_from_string("none", &f));
+        ASSERT_EQ(f, 0);
+
+        f = _MANIFEST_FIELD_ALL;
+        ASSERT_OK(manifest_fields_from_string("size,hash", &f));
+        ASSERT_EQ(f, MANIFEST_FIELD_SIZE|MANIFEST_FIELD_HASH);
+
+        f = _MANIFEST_FIELD_DEFAULT;
+        ASSERT_OK(manifest_fields_from_string("+mtime", &f));
+        ASSERT_EQ(f, _MANIFEST_FIELD_DEFAULT|MANIFEST_FIELD_MTIME);
+
+        /* User and group names and extended attributes are opt-in */
+        ASSERT_FALSE(_MANIFEST_FIELD_DEFAULT & (MANIFEST_FIELD_USER_NAME|MANIFEST_FIELD_GROUP_NAME|MANIFEST_FIELD_USER_XATTR));
+        f = _MANIFEST_FIELD_DEFAULT;
+        ASSERT_OK(manifest_fields_from_string("+user-xattr", &f));
+        ASSERT_EQ(f, _MANIFEST_FIELD_DEFAULT|MANIFEST_FIELD_USER_XATTR);
+        f = _MANIFEST_FIELD_DEFAULT;
+        ASSERT_OK(manifest_fields_from_string("+user-name,+group-name", &f));
+        ASSERT_EQ(f, _MANIFEST_FIELD_DEFAULT|MANIFEST_FIELD_USER_NAME|MANIFEST_FIELD_GROUP_NAME);
+
+        f = _MANIFEST_FIELD_DEFAULT;
+        ASSERT_OK(manifest_fields_from_string("-hash,-uid", &f));
+        ASSERT_EQ(f, _MANIFEST_FIELD_DEFAULT & ~(MANIFEST_FIELD_HASH|MANIFEST_FIELD_UID));
+
+        f = _MANIFEST_FIELD_DEFAULT;
+        ASSERT_OK(manifest_fields_from_string("mode,+gid", &f));
+        ASSERT_EQ(f, MANIFEST_FIELD_MODE|MANIFEST_FIELD_GID);
+
+        f = _MANIFEST_FIELD_DEFAULT;
+        ASSERT_ERROR(manifest_fields_from_string("foobar", &f), EINVAL);
+
+        _cleanup_free_ char *s = NULL;
+        ASSERT_OK(manifest_fields_to_string(MANIFEST_FIELD_SIZE|MANIFEST_FIELD_MTIME, &s));
+        ASSERT_STREQ(s, "size,mtime");
+        s = mfree(s);
+        ASSERT_OK(manifest_fields_to_string(0, &s));
+        ASSERT_STREQ(s, "none");
+
+        ASSERT_STREQ(manifest_field_to_string(MANIFEST_FIELD_HARDLINK), "hardlink");
+        ASSERT_EQ(manifest_field_from_string("device"), MANIFEST_FIELD_DEVICE);
+        ASSERT_EQ(manifest_field_from_string("nope"), _MANIFEST_FIELD_INVALID);
+
+        /* The GPT fields cannot be generated from directory trees, hence have no name of their own */
+        ASSERT_NULL(manifest_field_to_string(MANIFEST_FIELD_GPT_LABEL));
+        ASSERT_EQ(manifest_field_from_string("gpt-label"), _MANIFEST_FIELD_INVALID);
+        f = _MANIFEST_FIELD_DEFAULT;
+        ASSERT_ERROR(manifest_fields_from_string("+gpt-label", &f), EINVAL);
+        s = mfree(s);
+        ASSERT_OK(manifest_fields_to_string(MANIFEST_FIELD_SIZE|MANIFEST_FIELD_GPT_FLAGS, &s));
+        ASSERT_STREQ(s, "size");
+
+        /* The names of the UAPI.16 features only differ for the hash, and cover the GPT fields too */
+        ASSERT_STREQ(manifest_field_to_uapi16_feature(MANIFEST_FIELD_HASH), "sha256");
+        ASSERT_STREQ(manifest_field_to_uapi16_feature(MANIFEST_FIELD_READ_ONLY), "read-only");
+        ASSERT_STREQ(manifest_field_to_uapi16_feature(MANIFEST_FIELD_GPT_FLAG_GROWFS), "gpt-flag-grow-file-system");
+        ASSERT_EQ(manifest_field_from_uapi16_feature("sha256"), MANIFEST_FIELD_HASH);
+        ASSERT_EQ(manifest_field_from_uapi16_feature("hash"), _MANIFEST_FIELD_INVALID);
+        ASSERT_EQ(manifest_field_from_uapi16_feature("gpt-disk-uuid"), MANIFEST_FIELD_GPT_DISK_UUID);
+        ASSERT_EQ(manifest_field_from_uapi16_feature("fat-serial"), MANIFEST_FIELD_FAT_SERIAL);
+}
+
+TEST(manifest_list) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_LIST);
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+        ASSERT_STREQ(buf,
+                     "empty.txt\n"
+                     "fifo\n"
+                     "hardlink_a\n"
+                     "hardlink_b\n"
+                     "regular.txt\n"
+                     "subdir/\n"
+                     "subdir/nested.txt\n"
+                     "symlink\n");
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_LIST);
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+
+        /* Removing a file makes verification fail */
+        ASSERT_OK_ERRNO(unlinkat(tfd, "fifo", 0));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_LIST);
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 1U);
+
+        /* A directory listed as a file is a mismatch too */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_LIST);
+        ASSERT_ERROR(verify_buffer(&c, tfd, "subdir\n", strlen("subdir\n")), EBADMSG);
+}
+
+TEST(manifest_sums) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_SHA256SUMS);
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+        ASSERT_STREQ(buf,
+                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  empty.txt\n"
+                     "5f3c775a7618b56ac451fbb036042095744ab2c991f371c683c7cc5f704d19ee  hardlink_a\n"
+                     "5f3c775a7618b56ac451fbb036042095744ab2c991f371c683c7cc5f704d19ee  hardlink_b\n"
+                     "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9  regular.txt\n"
+                     "233562de1a0288b139c4fa40b7d189f806e906eeb048517aeb67f34ac0e2faf1  subdir/nested.txt\n");
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_SHA256SUMS);
+        ASSERT_OK(verify_pipe(&c, tfd, buf, size));
+
+        /* Without the hash field we cannot generate this format */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_SHA256SUMS);
+        c.fields &= ~MANIFEST_FIELD_HASH;
+        _cleanup_free_ char *nohash = NULL;
+        size_t nohash_size;
+        ASSERT_ERROR(generate(&c, tfd, &nohash, &nohash_size), EINVAL);
+
+        /* Changing a file's contents is detected */
+        ASSERT_OK(write_string_file_at(tfd, "regular.txt", "HELLO WORLD", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_SHA256SUMS);
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 1U);
+        ASSERT_OK(write_string_file_at(tfd, "regular.txt", "hello world", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+
+        /* File names with newlines and backslashes are escaped like coreutils does it */
+        ASSERT_OK(write_string_file_at(tfd, "a\nb", "x", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        ASSERT_OK(write_string_file_at(tfd, "back\\slash", "y", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        _cleanup_free_ char *escaped = NULL;
+        size_t escaped_size;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_SHA256SUMS);
+        ASSERT_OK(generate(&c, tfd, &escaped, &escaped_size));
+        ASSERT_NOT_NULL(strstr(escaped, "\\2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881  a\\nb\n"));
+        ASSERT_NOT_NULL(strstr(escaped, "  back\\\\slash\n"));
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_SHA256SUMS);
+        ASSERT_OK(verify_buffer(&c, tfd, escaped, escaped_size));
+
+        /* Absolute paths and non-normalized paths are refused */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_SHA256SUMS);
+        const char *bad = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /etc/passwd\n";
+        ASSERT_ERROR(verify_buffer(&c, tfd, bad, strlen(bad)), EINVAL);
+        bad = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ../empty.txt\n";
+        ASSERT_ERROR(verify_buffer(&c, tfd, bad, strlen(bad)), EINVAL);
+}
+
+TEST(manifest_mtree) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        /* Set special bits for testing */
+        ASSERT_OK_ERRNO(fchmodat(tfd, "regular.txt", 04644, 0));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "subdir", 01777, 0));
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+
+        ASSERT_TRUE(startswith(buf, "./ type=dir mode="));
+        ASSERT_NOT_NULL(strstr(buf, "./regular.txt type=file mode=4644 uid="));
+        ASSERT_NOT_NULL(strstr(buf, "./subdir/ type=dir mode=1777 uid="));
+        ASSERT_NOT_NULL(strstr(buf, " size=11 sha256sum=b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\n"));
+        ASSERT_NOT_NULL(strstr(buf, "./symlink type=link uid="));
+        ASSERT_NOT_NULL(strstr(buf, " link=regular.txt\n"));
+        ASSERT_NOT_NULL(strstr(buf, "./fifo type=fifo mode=0600"));
+        ASSERT_NULL(strstr(buf, "time="));
+
+        /* Dropping fields drops them from the output, adding mtime adds it */
+        _cleanup_free_ char *buf2 = NULL;
+        size_t size2;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        c.fields = MANIFEST_FIELD_MTIME;
+        ASSERT_OK(generate(&c, tfd, &buf2, &size2));
+        ASSERT_NULL(strstr(buf2, "mode="));
+        ASSERT_NULL(strstr(buf2, "uid="));
+        ASSERT_NULL(strstr(buf2, "size="));
+        ASSERT_NULL(strstr(buf2, "sha256sum="));
+        ASSERT_NULL(strstr(buf2, "link="));
+        ASSERT_NOT_NULL(strstr(buf2, "./regular.txt type=file time="));
+
+        /* Verification of mtree is not supported */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EOPNOTSUPP);
+}
+
+static void assert_mtree_keyword(const char *manifest, const char *line_prefix, const char *keyword, const char *value) {
+        _cleanup_free_ char *line = NULL, *escaped = NULL, *needle = NULL;
+        const char *p, *eol;
+
+        /* Checks that the line of the specified entry carries the keyword with the specified value, or does
+         * not carry the keyword at all if value is NULL. */
+
+        ASSERT_NOT_NULL(p = strstr(manifest, line_prefix));
+        ASSERT_NOT_NULL(eol = strchr(p, '\n'));
+        ASSERT_NOT_NULL(line = strndup(p, eol - p));
+
+        if (!value) {
+                ASSERT_NOT_NULL(needle = strjoin(" ", keyword, "="));
+                ASSERT_NULL(strstr(line, needle));
+                return;
+        }
+
+        ASSERT_NOT_NULL(escaped = xescape(value, WHITESPACE COMMENTS));
+        ASSERT_NOT_NULL(needle = strjoin(" ", keyword, "=", escaped));
+
+        /* Match the whole value, i.e. make sure it is followed by a separator or the end of the line */
+        ASSERT_NOT_NULL(p = strstr(line, needle));
+        ASSERT_TRUE(IN_SET(p[strlen(needle)], ' ', 0));
+}
+
+TEST(manifest_mtree_names) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        /* All inodes of the tree are owned by the calling user. uid_to_name()/gid_to_name() fall back to the
+         * numeric ID if it is unresolvable, in which case manifest-util omits the name instead. */
+        _cleanup_free_ char *user_name = NULL, *group_name = NULL;
+        ASSERT_NOT_NULL(user_name = uid_to_name(getuid()));
+        ASSERT_NOT_NULL(group_name = gid_to_name(getgid()));
+        const char *expected_user_name = parse_uid(user_name, /* ret_uid= */ NULL) < 0 ? user_name : NULL,
+                *expected_group_name = parse_gid(group_name, /* ret_gid= */ NULL) < 0 ? group_name : NULL;
+
+        /* Names are not included by default */
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+        assert_mtree_keyword(buf, "./regular.txt ", "uname", /* value= */ NULL);
+        assert_mtree_keyword(buf, "./regular.txt ", "gname", /* value= */ NULL);
+
+        /* Ask for the names only: they must be resolved even though the numeric IDs are not requested, and
+         * the latter must not be included. */
+        _cleanup_free_ char *buf2 = NULL;
+        size_t size2;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        c.fields = MANIFEST_FIELD_USER_NAME|MANIFEST_FIELD_GROUP_NAME;
+        ASSERT_OK(generate(&c, tfd, &buf2, &size2));
+        if (expected_user_name && expected_group_name)
+                ASSERT_EQ(c.n_metadata_omitted, 0U);
+        else
+                ASSERT_GT(c.n_metadata_omitted, 0U);
+
+        FOREACH_STRING(prefix, "./ ", "./regular.txt ", "./subdir/ ", "./subdir/nested.txt ", "./symlink ", "./fifo ", "./hardlink_b ") {
+                assert_mtree_keyword(buf2, prefix, "uname", expected_user_name);
+                assert_mtree_keyword(buf2, prefix, "gname", expected_group_name);
+                assert_mtree_keyword(buf2, prefix, "uid", /* value= */ NULL);
+                assert_mtree_keyword(buf2, prefix, "gid", /* value= */ NULL);
+        }
+
+        /* Each name may be requested individually, and is combined with the numeric ID if that is requested
+         * too */
+        _cleanup_free_ char *buf3 = NULL, *uid_str = NULL, *gid_str = NULL;
+        size_t size3;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        c.fields = MANIFEST_FIELD_UID|MANIFEST_FIELD_USER_NAME|MANIFEST_FIELD_GID;
+        ASSERT_OK(generate(&c, tfd, &buf3, &size3));
+        ASSERT_OK(asprintf(&uid_str, UID_FMT, getuid()));
+        ASSERT_OK(asprintf(&gid_str, GID_FMT, getgid()));
+        assert_mtree_keyword(buf3, "./regular.txt ", "uid", uid_str);
+        assert_mtree_keyword(buf3, "./regular.txt ", "gid", gid_str);
+        assert_mtree_keyword(buf3, "./regular.txt ", "uname", expected_user_name);
+        assert_mtree_keyword(buf3, "./regular.txt ", "gname", /* value= */ NULL);
+
+        _cleanup_free_ char *buf4 = NULL;
+        size_t size4;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        c.fields = MANIFEST_FIELD_GROUP_NAME;
+        ASSERT_OK(generate(&c, tfd, &buf4, &size4));
+        assert_mtree_keyword(buf4, "./regular.txt ", "uid", /* value= */ NULL);
+        assert_mtree_keyword(buf4, "./regular.txt ", "gid", /* value= */ NULL);
+        assert_mtree_keyword(buf4, "./regular.txt ", "uname", /* value= */ NULL);
+        assert_mtree_keyword(buf4, "./regular.txt ", "gname", expected_group_name);
+
+        /* Verification of mtree manifests is not supported, regardless of the fields */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        c.fields = MANIFEST_FIELD_USER_NAME|MANIFEST_FIELD_GROUP_NAME;
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf2, size2), EOPNOTSUPP);
+}
+
+static sd_json_variant* find_object(const char *manifest, const char *name) {
+        /* Parses a JSON-SEQ manifest from memory and returns the object with the specified name */
+
+        const char *p = manifest;
+        size_t left = strlen(manifest);
+
+        for (;;) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+                int r;
+
+                ASSERT_OK(r = json_seq_extract(&p, &left, SD_JSON_PARSE_MUST_BE_OBJECT, /* eol= */ true, &v));
+                if (r == 0)
+                        return NULL;
+
+                sd_json_variant *n = sd_json_variant_by_key(v, "name");
+                if (!name) {
+                        if (!n)
+                                return TAKE_PTR(v);
+                } else if (n && sd_json_variant_is_string(n) && streq(sd_json_variant_string(n), name))
+                        return TAKE_PTR(v);
+        }
+}
+
+TEST(manifest_uapi16) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+
+        /* Each record starts with an RS byte */
+        ASSERT_EQ(buf[0], 0x1e);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *root = find_object(buf, /* name= */ NULL);
+        ASSERT_NOT_NULL(root);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(root, "mediaType")), UAPI16_MANIFEST_MEDIA_TYPE);
+        ASSERT_NULL(sd_json_variant_by_key(root, "features")); /* The default set is not declared explicitly */
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(root, "order")), "codepoint");
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reg = find_object(buf, "regular.txt");
+        ASSERT_NOT_NULL(reg);
+        ASSERT_NULL(sd_json_variant_by_key(reg, "type"));
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(reg, "size")), 11U);
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(reg, "mode")), 0644U);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(reg, "sha256")), "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        ASSERT_NULL(sd_json_variant_by_key(reg, "inodeToken"));
+        ASSERT_NULL(sd_json_variant_by_key(reg, "mTimeNSec"));
+        ASSERT_NULL(sd_json_variant_by_key(reg, "extendedAttributes")); /* Not included by default */
+        ASSERT_NULL(sd_json_variant_by_key(reg, "userName"));
+        ASSERT_NULL(sd_json_variant_by_key(reg, "groupName"));
+        ASSERT_TRUE(sd_json_variant_is_normalized(reg)); /* Fields are sorted */
+
+        /* The hash of empty files is implied by their size, hence not included */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty = find_object(buf, "empty.txt");
+        ASSERT_NOT_NULL(empty);
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(empty, "size")), 0U);
+        ASSERT_NULL(sd_json_variant_by_key(empty, "sha256"));
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *lnk = find_object(buf, "symlink");
+        ASSERT_NOT_NULL(lnk);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(lnk, "type")), "lnk");
+        ASSERT_NULL(sd_json_variant_by_key(lnk, "mode"));
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ha = find_object(buf, "hardlink_a"), *hb = find_object(buf, "hardlink_b");
+        ASSERT_NOT_NULL(ha);
+        ASSERT_NOT_NULL(hb);
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(ha, "inodeToken")), 1U);
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(hb, "inodeToken")), 1U);
+
+        /* Verification succeeds, from a pipe too */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_OK(verify_pipe(&c, tfd, buf, size));
+
+        /* Restricting the fields restricts the output */
+        _cleanup_free_ char *buf2 = NULL;
+        size_t size2;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_SIZE|MANIFEST_FIELD_MTIME;
+        ASSERT_OK(generate(&c, tfd, &buf2, &size2));
+        /* … and is declared in the root object */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *root2 = find_object(buf2, /* name= */ NULL);
+        ASSERT_NOT_NULL(root2);
+        _cleanup_free_ char *features2 = NULL;
+        ASSERT_OK(sd_json_variant_format(sd_json_variant_by_key(root2, "features"), /* flags= */ 0, &features2));
+        ASSERT_STREQ(features2, "[\"mtime\",\"size\"]");
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reg2 = find_object(buf2, "regular.txt");
+        ASSERT_NOT_NULL(reg2);
+        ASSERT_NULL(sd_json_variant_by_key(reg2, "mode"));
+        ASSERT_NULL(sd_json_variant_by_key(reg2, "sha256"));
+        ASSERT_NULL(sd_json_variant_by_key(reg2, "uid"));
+        ASSERT_NOT_NULL(sd_json_variant_by_key(reg2, "size"));
+        ASSERT_NOT_NULL(sd_json_variant_by_key(reg2, "mTimeNSec"));
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *hb2 = find_object(buf2, "hardlink_b");
+        ASSERT_NOT_NULL(hb2);
+        ASSERT_NULL(sd_json_variant_by_key(hb2, "inodeToken"));
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_SIZE|MANIFEST_FIELD_MTIME;
+        ASSERT_OK(verify_buffer(&c, tfd, buf2, size2));
+
+        /* Without the size, the hash of empty files is included */
+        _cleanup_free_ char *buf_hash = NULL;
+        size_t size_hash;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_HASH;
+        ASSERT_OK(generate(&c, tfd, &buf_hash, &size_hash));
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty_hash = find_object(buf_hash, "empty.txt");
+        ASSERT_NOT_NULL(empty_hash);
+        ASSERT_NULL(sd_json_variant_by_key(empty_hash, "size"));
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(empty_hash, "sha256")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_HASH;
+        ASSERT_OK(verify_buffer(&c, tfd, buf_hash, size_hash));
+
+        /* User and group names are included if requested, as resolved on the host */
+        _cleanup_free_ char *user_name = uid_to_name(getuid()), *group_name = gid_to_name(getgid());
+        ASSERT_NOT_NULL(user_name);
+        ASSERT_NOT_NULL(group_name);
+        _cleanup_free_ char *buf3 = NULL;
+        size_t size3;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_USER_NAME|MANIFEST_FIELD_GROUP_NAME;
+        ASSERT_OK(generate(&c, tfd, &buf3, &size3));
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reg3 = find_object(buf3, "regular.txt");
+        ASSERT_NOT_NULL(reg3);
+        ASSERT_NULL(sd_json_variant_by_key(reg3, "uid"));
+        if (parse_uid(user_name, /* ret_uid= */ NULL) < 0) /* uid_to_name() falls back to the numeric UID if unresolvable */
+                ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(reg3, "userName")), user_name);
+        else
+                ASSERT_NULL(sd_json_variant_by_key(reg3, "userName"));
+        if (parse_gid(group_name, /* ret_gid= */ NULL) < 0)
+                ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(reg3, "groupName")), group_name);
+        else
+                ASSERT_NULL(sd_json_variant_by_key(reg3, "groupName"));
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_USER_NAME|MANIFEST_FIELD_GROUP_NAME;
+        ASSERT_OK(verify_buffer(&c, tfd, buf3, size3));
+
+        /* Now break things: mode change is detected, but not if we don't care about the mode */
+        ASSERT_OK_ERRNO(fchmodat(tfd, "subdir/nested.txt", 0600, 0));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 1U);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_SIZE|MANIFEST_FIELD_HASH;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "subdir/nested.txt", 0644, 0));
+
+        /* Replacing a hardlink by a separate file with identical contents is detected via the inode token */
+        ASSERT_OK_ERRNO(unlinkat(tfd, "hardlink_b", 0));
+        ASSERT_OK(write_string_file_at(tfd, "hardlink_b", "hardlinked content", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "hardlink_b", 0644, 0));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 1U);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields &= ~MANIFEST_FIELD_HARDLINK;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+
+        /* Symlink target changes are detected */
+        ASSERT_OK_ERRNO(unlinkat(tfd, "symlink", 0));
+        ASSERT_OK_ERRNO(symlinkat("empty.txt", tfd, "symlink"));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields &= ~MANIFEST_FIELD_HARDLINK;
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 1U);
+
+        /* Objects of unknown media type are ignored, garbage is not */
+        const char *trailer = strrchr(buf, 0x1e);
+        ASSERT_NOT_NULL(trailer);
+        const char *extra = "\x1e{\"mediaType\":\"application/vnd.example.unknown\",\"foo\":\"bar\"}\n";
+        _cleanup_free_ char *head = strndup(buf, trailer - buf);
+        ASSERT_NOT_NULL(head);
+        _cleanup_free_ char *buf4 = strjoin(head, extra, trailer);
+        ASSERT_NOT_NULL(buf4);
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_SIZE|MANIFEST_FIELD_HASH;
+        ASSERT_OK(verify_buffer(&c, tfd, buf4, strlen(buf4)));
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_ERROR(verify_buffer(&c, tfd, "garbage", strlen("garbage")), EBADMSG);
+
+        /* Names we cannot represent are skipped and counted, the caller decides what to make of that */
+        ASSERT_OK(write_string_file_at(tfd, "\xff\xfe", "invalid", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        _cleanup_free_ char *buf5 = NULL;
+        size_t size5;
+        ASSERT_OK(generate(&c, tfd, &buf5, &size5));
+        ASSERT_EQ(c.n_skipped, 1U);
+        ASSERT_EQ(c.n_metadata_omitted, 0U);
+}
+
+TEST(manifest_omitted) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        /* Inodes and metadata we cannot read are skipped or omitted and counted, the caller decides what to
+         * make of that */
+        ASSERT_OK_ERRNO(fchmodat(tfd, "regular.txt", 0000, 0));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "subdir", 0000, 0));
+        _cleanup_close_ int probe_fd = xopenat(tfd, "regular.txt", O_RDONLY);
+        if (probe_fd >= 0) {
+                ASSERT_OK_ERRNO(fchmodat(tfd, "subdir", 0755, 0));
+                return (void) log_tests_skipped("Privileged enough to read inaccessible files");
+        }
+        ASSERT_ERROR(probe_fd, EACCES);
+
+        static const struct {
+                ManifestFormat format;
+                uint64_t n_skipped;
+                uint64_t n_skipped_expected;
+                uint64_t n_metadata_omitted;
+        } table[] = {
+                /* The inaccessible directory is skipped in all formats */
+                { MANIFEST_FORMAT_LIST,       1, 0, 0 },
+                { MANIFEST_FORMAT_MTREE,      1, 0, 1 },
+                /* SHA256SUMS also skips files it cannot hash, as well as the symlink and the fifo (the
+                 * latter two are expected, as the format only lists regular files) */
+                { MANIFEST_FORMAT_SHA256SUMS, 4, 2, 0 },
+                { MANIFEST_FORMAT_UAPI16,     1, 0, 1 },
+        };
+
+        FOREACH_ELEMENT(i, table) {
+                _cleanup_(manifest_context_done) ManifestContext c;
+                _cleanup_free_ char *buf = NULL;
+                size_t size;
+
+                context_init(&c, i->format);
+                ASSERT_OK(generate(&c, tfd, &buf, &size));
+                ASSERT_EQ(c.n_skipped, i->n_skipped);
+                ASSERT_EQ(c.n_skipped_expected, i->n_skipped_expected);
+                ASSERT_EQ(c.n_metadata_omitted, i->n_metadata_omitted);
+        }
+
+        /* Make sure we can clean up */
+        ASSERT_OK_ERRNO(fchmodat(tfd, "subdir", 0755, 0));
+}
+
+static int dispatch_with_features(const char *json, size_t n, ManifestField features, Uapi16Object *ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+        ASSERT_OK(sd_json_parse(json, /* flags= */ 0, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL));
+
+        /* Objects other than the root object are dispatched below a root object listing the specified
+         * features */
+        Uapi16Object root = UAPI16_OBJECT_NULL;
+        root.features = features;
+
+        return dispatch_uapi16_object(v, n == 0 ? NULL : &root, SD_JSON_LOG, ret);
+}
+
+static int dispatch_one(const char *json, size_t n, Uapi16Object *ret) {
+        return dispatch_with_features(json, n, _MANIFEST_FIELD_ALL, ret);
+}
+
+TEST(uapi16_name_is_valid) {
+        ASSERT_TRUE(uapi16_name_is_valid("a"));
+        ASSERT_TRUE(uapi16_name_is_valid("a/b/c"));
+        ASSERT_TRUE(uapi16_name_is_valid("a/Uapi16Manifest"));
+        ASSERT_FALSE(uapi16_name_is_valid(NULL));
+        ASSERT_FALSE(uapi16_name_is_valid(""));
+        ASSERT_FALSE(uapi16_name_is_valid("/a"));
+        ASSERT_FALSE(uapi16_name_is_valid("a/"));
+        ASSERT_FALSE(uapi16_name_is_valid("a//b"));
+        ASSERT_FALSE(uapi16_name_is_valid("a/./b"));
+        ASSERT_FALSE(uapi16_name_is_valid("a/../b"));
+        ASSERT_FALSE(uapi16_name_is_valid("a\nb"));
+        ASSERT_FALSE(uapi16_name_is_valid("\xff"));
+        ASSERT_FALSE(uapi16_name_is_valid("Uapi16Manifest"));
+        ASSERT_FALSE(uapi16_name_is_valid("Uapi16Manifest.gz"));
+
+        /* The complete name is limited to 4095 bytes */
+        _cleanup_free_ char *n = NULL;
+        ASSERT_NOT_NULL(n = strrep("x/", UAPI16_NAME_MAX / 2));
+        ASSERT_NOT_NULL(strextend(&n, "x"));
+        ASSERT_EQ(strlen(n), UAPI16_NAME_MAX);
+        ASSERT_TRUE(uapi16_name_is_valid(n));
+        ASSERT_NOT_NULL(strextend(&n, "x"));
+        ASSERT_FALSE(uapi16_name_is_valid(n));
+        n = mfree(n);
+
+        /* The specification does not limit the components on their own, but we limit them to NAME_MAX */
+        ASSERT_NOT_NULL(n = strrep("x", NAME_MAX));
+        ASSERT_TRUE(uapi16_name_is_valid(n));
+        ASSERT_NOT_NULL(strextend(&n, "x"));
+        ASSERT_FALSE(uapi16_name_is_valid(n));
+}
+
+TEST(uapi16_dispatch) {
+        _cleanup_(uapi16_object_done) Uapi16Object o = UAPI16_OBJECT_NULL;
+
+        /* null is equivalent to an absent field */
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"type\":null,\"size\":null,\"mode\":null,\"sha256\":null,\"contents\":null,"
+                               "\"extendedAttributes\":null,\"validSinceUSec\":null,\"validity\":null}", 1, _MANIFEST_FIELD_DEFAULT, &o));
+        ASSERT_EQ(o.type, (mode_t) S_IFREG);
+        ASSERT_EQ(o.size, UINT64_MAX);
+        ASSERT_EQ(o.valid_since_usec, 0U);
+        ASSERT_FALSE(o.user_xattrs_set);
+        ASSERT_OK(uapi16_object_check_validity(&o));
+        uapi16_object_done(&o);
+
+        /* Validity window and enum */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"validity\":\"frobnicated\"}", 1, &o));
+        ASSERT_EQ(o.validity, UAPI16_GOOD); /* Unknown values are treated like "good" */
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"validity\":\"stepping-stone\"}", 1, &o));
+        ASSERT_EQ(o.validity, UAPI16_GOOD); /* Dropped from the specification, hence unknown now */
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"validity\":\"revoked\"}", 1, &o));
+        ASSERT_ERROR(uapi16_object_check_validity(&o), EHWPOISON);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"validSinceUSec\":1,\"validUntilUSec\":2}", 1, &o));
+        ASSERT_EQ(o.valid_since_usec, 1U);
+        ASSERT_EQ(o.valid_until_usec, 2U);
+        ASSERT_ERROR(uapi16_object_check_validity(&o), ESTALE);
+        uapi16_object_done(&o);
+        _cleanup_free_ char *future = asprintf_safe("{\"name\":\"a\",\"validSinceUSec\":" USEC_FMT "}", now(CLOCK_REALTIME) + USEC_PER_DAY);
+        ASSERT_NOT_NULL(future);
+        ASSERT_OK(dispatch_one(future, 1, &o));
+        ASSERT_ERROR(uapi16_object_check_validity(&o), ESTALE);
+        uapi16_object_done(&o);
+
+        /* User and group names are accepted liberally, but not if empty, numeric or with control characters */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"userName\":\"foo bar@example.com\",\"groupName\":\"wheel\"}", 1, &o));
+        ASSERT_STREQ(o.user_name, "foo bar@example.com");
+        ASSERT_STREQ(o.group_name, "wheel");
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"userName\":null,\"groupName\":null}", 1, &o));
+        ASSERT_NULL(o.user_name);
+        ASSERT_NULL(o.group_name);
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"userName\":\"\"}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"userName\":\"4711\"}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"groupName\":\"foo\\nbar\"}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"groupName\":4711}", 1, &o), EINVAL);
+
+        /* Fields not permitted on the inode type, or contradicting each other */
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"fifo\",\"size\":1}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"reg\",\"major\":1}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"lnk\",\"mode\":420}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"dir\",\"inodeToken\":1}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"sock\",\"contents\":[{\"file\":\"b\"}]}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"dir\",\"gptLabel\":\"foo\"}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"gptDiskUuid\":\"0fc63daf-8483-4772-8e79-3d69d8477de4\"}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"readOnly\":true,\"mode\":420}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"readOnly\":false,\"mode\":292}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"gptFlags\":0,\"gptFlagNoAuto\":true}", 1, &o), EBADMSG);
+
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"gpt-disk-uuid\"],\"gptDiskUuid\":\"0fc63daf-8483-4772-8e79-3d69d8477de4\"}", 0, &o));
+        ASSERT_TRUE(o.gpt_disk_uuid_set);
+        uapi16_object_done(&o);
+        /* Bits 63 and 60, i.e. no-auto and read-only */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"readOnly\":true,\"mode\":292,\"gptFlags\":10376293541461622784,\"gptFlagNoAuto\":true}", 1, &o));
+        ASSERT_EQ(o.gpt_growfs, 0); /* The feature is listed, hence cleared */
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"readOnly\":true,\"gptFlags\":9223372036854775808}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"readOnly\":false,\"gptFlags\":1152921504606846976}", 1, &o), EBADMSG);
+        /* If the features are listed, absent fields count as cleared when checking consistency */
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"gptFlags\":1152921504606846976}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"gptFlagNoAuto\":true}", 1, &o), EBADMSG);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"gptFlags\":1152921504606846976}", 1, MANIFEST_FIELD_GPT_FLAGS, &o));
+        ASSERT_EQ(o.read_only, -1);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"readOnly\":true}", 1, MANIFEST_FIELD_READ_ONLY|MANIFEST_FIELD_GPT_FLAG_NO_AUTO, &o));
+        ASSERT_FALSE(o.gpt_flags_set);
+        ASSERT_EQ(o.gpt_no_auto, 0);
+        uapi16_object_done(&o);
+
+        /* FAT attributes, Linux inode flags and the file system identity. The FAT read-only attribute is
+         * encoded in the generic "readOnly" field. The features of the null fields are not listed, as
+         * otherwise their absence would mean the flags are cleared. */
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"readOnly\":true,\"flagHidden\":false,\"flagSystem\":null,\"flagArchive\":true,"
+                                         "\"flagAppendOnly\":false,\"flagImmutable\":true,\"flagNoAtime\":null,\"flagNoCow\":true,\"flagNoDump\":false}",
+                                         1, _MANIFEST_FIELD_FSTREE_ALL & ~(MANIFEST_FIELD_FLAG_SYSTEM|MANIFEST_FIELD_FLAG_NO_ATIME), &o));
+        uint32_t fat_value, fat_mask;
+        uapi16_object_fat_attrs(&o, &fat_value, &fat_mask);
+        ASSERT_EQ(fat_value, UINT32_C(0x21));
+        ASSERT_EQ(fat_mask, UINT32_C(0x23));
+        unsigned inode_value, inode_mask;
+        uapi16_object_inode_flags(&o, &inode_value, &inode_mask);
+        ASSERT_EQ(inode_value, (unsigned) (FS_IMMUTABLE_FL|FS_NOCOW_FL));
+        ASSERT_EQ(inode_mask, (unsigned) (FS_APPEND_FL|FS_IMMUTABLE_FL|FS_NOCOW_FL|FS_NODUMP_FL));
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"type\":\"dir\",\"flagHidden\":true,\"flagNoCow\":true}", 1, &o));
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"lnk\",\"flagHidden\":true}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"type\":\"fifo\",\"flagNoDump\":true}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"flagHidden\":true}", 0, &o), EBADMSG);
+        /* The generic "readOnly" field is not restricted like the FAT specific ones */
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"read-only\"],\"readOnly\":true}", 0, &o));
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"type\":\"fifo\",\"readOnly\":false}", 1, &o));
+        uapi16_object_done(&o);
+        /* "flagReadOnly" and "fatLabel" are not part of the specification (anymore) */
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"flagReadOnly\":true}", 1, &o), EADDRNOTAVAIL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fatLabel\":\"ESP\"}", 0, &o), EADDRNOTAVAIL);
+
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"flag-no-dump\",\"fat-serial\",\"fs-uuid\",\"fs-label\"],\"flagNoDump\":true,\"fatSerial\":\"12ab-CD34\","
+                               "\"fsUUID\":\"0fc63daf-8483-4772-8e79-3d69d8477de4\",\"fsLabel\":\"root fs ä\"}", 0, &o));
+        ASSERT_TRUE(o.fat_serial_set);
+        ASSERT_EQ(o.fat_serial, UINT32_C(0x12ABCD34));
+        ASSERT_TRUE(o.fs_uuid_set);
+        ASSERT_TRUE(sd_id128_equal(o.fs_uuid, SD_ID128_MAKE(0f,c6,3d,af,84,83,47,72,8e,79,3d,69,d8,47,7d,e4)));
+        ASSERT_STREQ(o.fs_label, "root fs ä");
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"fatSerial\":\"1234-ABCD\"}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"fsUUID\":\"0fc63daf-8483-4772-8e79-3d69d8477de4\"}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"fsLabel\":\"foo\"}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fatSerial\":\"1234ABCD\"}", 0, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fatSerial\":\"123-ABCDE\"}", 0, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fatSerial\":\"1234-ABCG\"}", 0, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fsUUID\":\"0fc63daf848347728e793d69d8477de4\"}", 0, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fsLabel\":\"a\\u007fb\"}", 0, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fsLabel\":\"a\\nb\"}", 0, &o), EINVAL);
+        /* Length limits are file system specific, hence not enforced when parsing */
+        _cleanup_free_ char *longlabel = strjoin("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"fs-label\"],\"fsLabel\":\"", strrepa("a", 300), "\"}");
+        ASSERT_NOT_NULL(longlabel);
+        ASSERT_OK(dispatch_one(longlabel, 0, &o));
+        uapi16_object_done(&o);
+        /* If the feature is listed, an absent label means there is none */
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"fs-label\"]}", 0, &o));
+        ASSERT_STREQ(o.fs_label, "");
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\"}", 0, &o));
+        ASSERT_NULL(o.fs_label);
+        uapi16_object_done(&o);
+
+        /* The GPT label limit is in UTF-16 code units, not bytes */
+        _cleanup_free_ char *label36 = NULL, *label37 = NULL;
+        for (unsigned i = 0; i < 36; i++)
+                ASSERT_NOT_NULL(strextend(&label36, "\xc3\xa4"));
+        ASSERT_NOT_NULL(label37 = strjoin(label36, "x"));
+        _cleanup_free_ char *j36 = strjoin("{\"name\":\"a\",\"gptLabel\":\"", label36, "\"}"),
+                *j37 = strjoin("{\"name\":\"a\",\"gptLabel\":\"", label37, "\"}");
+        ASSERT_NOT_NULL(j36);
+        ASSERT_NOT_NULL(j37);
+        ASSERT_OK(dispatch_one(j36, 1, &o));
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one(j37, 1, &o), EINVAL);
+
+        /* The hash of empty files is implied by their size */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"size\":0}", 1, &o));
+        ASSERT_TRUE(iovec_equal(&o.sha256, &IOVEC_MAKE(SHA256_EMPTY, SHA256_DIGEST_SIZE)));
+        uapi16_object_done(&o);
+
+        /* An empty slice at the very end of the source is fine */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"size\":0,\"contents\":[{\"file\":\"b\",\"offset\":5,\"originalSize\":5}]}", 1, &o));
+        uapi16_object_done(&o);
+
+        /* Encodings are case-insensitive, and no encoding is expressed by leaving the field unset, hence
+         * HTTP's "identity" is refused */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"contents\":[{\"file\":\"b\",\"encoding\":\"GZip\"}]}", 1, &o));
+        ASSERT_EQ(o.n_contents, 1U);
+        ASSERT_STREQ(o.contents[0].encoding, "gzip");
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"contents\":[{\"file\":\"b\",\"encoding\":null}]}", 1, &o));
+        ASSERT_EQ(o.n_contents, 1U);
+        ASSERT_NULL(o.contents[0].encoding);
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"file\":\"b\",\"encoding\":\"identity\"}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"file\":\"b\",\"encoding\":\"Identity\"}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"file\":\"b\",\"encoding\":\"\"}]}", 1, &o), EINVAL);
+
+        /* Additional HTTP header fields, which are only permitted together with "url" */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":{\"Authorization\":\"Bearer foo\",\"X-Empty\":\"\"}}]}", 1, &o));
+        ASSERT_EQ(o.n_contents, 1U);
+        ASSERT_TRUE(strv_equal(o.contents[0].http_headers, STRV_MAKE("Authorization", "Bearer foo", "X-Empty", "")));
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":null}]}", 1, &o));
+        ASSERT_NULL(o.contents[0].http_headers);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":{}}]}", 1, &o));
+        ASSERT_TRUE(strv_isempty(o.contents[0].http_headers));
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"file\":\"b\",\"httpHeaders\":{\"X-Foo\":\"bar\"}}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"literal\":\"\",\"httpHeaders\":{\"X-Foo\":\"bar\"}}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"httpHeaders\":{\"X-Foo\":\"bar\"}}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":[\"X-Foo\"]}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":{\"X-Foo\":1}}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":{\"\":\"bar\"}}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":{\"X Foo\":\"bar\"}}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":{\"X-Foo\":\"bar\\r\\nX-Injected: baz\"}}]}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"contents\":[{\"url\":\"https://example.com/a\",\"httpHeaders\":{\"X-Foo\":\"a\",\"x-foo\":\"b\"}}]}", 1, &o), ENOTUNIQ);
+
+        /* Extended attributes: sorted, both encodings, unknown namespaces ignored */
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"extendedAttributes\":{\"security\":{\"selinux\":{\"text\":\"foo\"}},"
+                               "\"user\":{\"b\":{\"base64\":\"AAECAw==\"},\"a\":{\"text\":\"hello\"},\"e\":{\"text\":\"\"},\"u\":{\"base64\":\"-_8=\"}}}}", 1, &o));
+        ASSERT_TRUE(o.user_xattrs_set);
+        ASSERT_EQ(o.n_user_xattrs, 4U);
+        ASSERT_STREQ(o.user_xattrs[0].name, "a");
+        ASSERT_IOVEC_EQ(&o.user_xattrs[0].value, &IOVEC_MAKE_STRING("hello"));
+        ASSERT_STREQ(o.user_xattrs[1].name, "b");
+        ASSERT_IOVEC_EQ(&o.user_xattrs[1].value, &IOVEC_MAKE("\x00\x01\x02\x03", 4));
+        ASSERT_STREQ(o.user_xattrs[2].name, "e");
+        ASSERT_EQ(o.user_xattrs[2].value.iov_len, 0U);
+        ASSERT_STREQ(o.user_xattrs[3].name, "u");
+        ASSERT_IOVEC_EQ(&o.user_xattrs[3].value, &IOVEC_MAKE("\xfb\xff", 2));
+
+        /* … and they round-trip */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *x = NULL;
+        ASSERT_OK(uapi16_xattrs_build_json(o.user_xattrs, o.n_user_xattrs, &x));
+        _cleanup_free_ char *xs = NULL;
+        ASSERT_OK(sd_json_variant_format(x, /* flags= */ 0, &xs));
+        ASSERT_STREQ(xs, "{\"user\":{\"a\":{\"text\":\"hello\"},\"b\":{\"base64\":\"AAECAw==\"},\"e\":{\"text\":\"\"},\"u\":{\"base64\":\"+/8=\"}}}");
+        uapi16_object_done(&o);
+
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"extendedAttributes\":{\"user\":{}}}", 1, &o));
+        ASSERT_TRUE(o.user_xattrs_set);
+        ASSERT_EQ(o.n_user_xattrs, 0U);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"extendedAttributes\":{\"user\":null}}", 1, _MANIFEST_FIELD_DEFAULT, &o));
+        ASSERT_FALSE(o.user_xattrs_set);
+        uapi16_object_done(&o);
+
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"extendedAttributes\":{\"user\":{\"a\":{\"text\":\"x\",\"base64\":\"eA==\"}}}}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"extendedAttributes\":{\"user\":{\"a\":{}}}}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"extendedAttributes\":{\"user\":{\"\":{\"text\":\"x\"}}}}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"extendedAttributes\":{\"user\":{\"a\\u0001\":{\"text\":\"x\"}}}}", 1, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"extendedAttributes\":{\"user\":[]}}", 1, &o), EINVAL);
+}
+
+TEST(uapi16_dispatch_features) {
+        _cleanup_(uapi16_object_done) Uapi16Object o = UAPI16_OBJECT_NULL;
+
+        /* The root object declares the features, and if it doesn't the default set applies */
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\"}", 0, &o));
+        ASSERT_EQ(o.features, _MANIFEST_FIELD_DEFAULT);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":null}", 0, &o));
+        ASSERT_EQ(o.features, _MANIFEST_FIELD_DEFAULT);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[]}", 0, &o));
+        ASSERT_EQ(o.features, 0);
+        uapi16_object_done(&o);
+        /* Unknown values are ignored */
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"sha256\",\"frobnicate\",\"mtime\"]}", 0, &o));
+        ASSERT_EQ(o.features, MANIFEST_FIELD_HASH|MANIFEST_FIELD_MTIME);
+        uapi16_object_done(&o);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"mode\",\"mode\"]}", 0, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":\"mode\"}", 0, &o), EINVAL);
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[4711]}", 0, &o), EINVAL);
+        /* The root object is subject to its own features too */
+        ASSERT_ERROR(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[],\"mode\":493}", 0, &o), EBADMSG);
+
+        /* Only permitted on the root object */
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"features\":[\"mode\"]}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"order\":\"codepoint\"}", 1, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_one("{\"name\":\"a\",\"order\":\"frobnicate\"}", 1, &o), EBADMSG);
+        ASSERT_OK(dispatch_one("{\"name\":\"a\",\"order\":null}", 1, &o));
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"order\":\"codepoint\"}", 0, &o));
+        ASSERT_EQ(o.order, UAPI16_ORDER_CODEPOINT);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"order\":\"frobnicate\"}", 0, &o));
+        ASSERT_EQ(o.order, _UAPI16_ORDER_UNKNOWN);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_one("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\"}", 0, &o));
+        ASSERT_EQ(o.order, _UAPI16_ORDER_INVALID);
+        uapi16_object_done(&o);
+
+        /* Other objects inherit the features of the root object */
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\"}", 1, MANIFEST_FIELD_MTIME, &o));
+        ASSERT_EQ(o.features, MANIFEST_FIELD_MTIME);
+        uapi16_object_done(&o);
+
+        /* Fields of features not listed are refused, the default set lacks some */
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"mTimeNSec\":1}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"userName\":\"foo\"}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"extendedAttributes\":{\"user\":{}}}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"size\":1}", 1, MANIFEST_FIELD_HASH, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"inodeToken\":0}", 1, MANIFEST_FIELD_HASH, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"type\":\"blk\",\"major\":1}", 1, MANIFEST_FIELD_MODE, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"type\":\"lnk\",\"contents\":[{\"literal\":\"eA==\"}]}", 1, MANIFEST_FIELD_MODE, &o), EBADMSG);
+        /* The "contents" of other inode types are not covered by any feature */
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"contents\":[{\"file\":\"b\"}]}", 1, /* features= */ 0, &o));
+        uapi16_object_done(&o);
+        /* Extended attributes in other namespaces are not covered by "user-xattr" */
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"extendedAttributes\":{\"security\":{\"selinux\":{\"text\":\"foo\"}}}}", 1, /* features= */ 0, &o));
+        ASSERT_FALSE(o.user_xattrs_set);
+        uapi16_object_done(&o);
+
+        /* If the feature is listed, the absence of a field carries meaning */
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\"}", 1, MANIFEST_FIELD_HARDLINK|MANIFEST_FIELD_USER_XATTR, &o));
+        ASSERT_EQ(o.inode_token, 0U);
+        ASSERT_TRUE(o.user_xattrs_set);
+        ASSERT_EQ(o.n_user_xattrs, 0U);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\"}", 1, /* features= */ 0, &o));
+        ASSERT_EQ(o.inode_token, UINT64_MAX);
+        ASSERT_FALSE(o.user_xattrs_set);
+        uapi16_object_done(&o);
+
+        /* Same for the flag fields, but only where they are defined */
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"flagNoDump\":true}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"flagHidden\":false}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"flagNoDump\":true}", 1, MANIFEST_FIELD_FLAG_NO_DUMP|MANIFEST_FIELD_FLAG_HIDDEN, &o));
+        ASSERT_EQ(o.flag_no_dump, 1);
+        ASSERT_EQ(o.flag_hidden, 0);
+        ASSERT_EQ(o.flag_immutable, -1);
+        ASSERT_EQ(o.flag_system, -1);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"type\":\"lnk\"}", 1, MANIFEST_FIELD_FLAG_NO_DUMP|MANIFEST_FIELD_FLAG_HIDDEN, &o));
+        ASSERT_EQ(o.flag_no_dump, -1);
+        ASSERT_EQ(o.flag_hidden, -1);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"flag-no-dump\",\"flag-hidden\"]}", 0, /* features= */ 0, &o));
+        ASSERT_EQ(o.features, MANIFEST_FIELD_FLAG_NO_DUMP|MANIFEST_FIELD_FLAG_HIDDEN);
+        ASSERT_EQ(o.flag_no_dump, 0);
+        ASSERT_EQ(o.flag_hidden, -1); /* The FAT root directory has no attributes */
+        uapi16_object_done(&o);
+
+        /* "readOnly", the file system identity and the GPT fields are subject to features too */
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"readOnly\":true}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"gptLabel\":\"foo\"}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"gptFlags\":0}", 1, _MANIFEST_FIELD_DEFAULT, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"gptFlagGrowFileSystem\":false}", 1, MANIFEST_FIELD_GPT_FLAGS, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"fsLabel\":\"foo\"}", 0, /* features= */ 0, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"fs-label\"],\"fatSerial\":\"1234-ABCD\"}", 0, /* features= */ 0, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"gptDiskUuid\":\"0fc63daf-8483-4772-8e79-3d69d8477de4\"}", 0, /* features= */ 0, &o), EBADMSG);
+        ASSERT_OK(dispatch_with_features("{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\",\"features\":[\"fs-label\",\"fat-serial\"],\"fsLabel\":\"foo\",\"fatSerial\":\"1234-ABCD\"}", 0, /* features= */ 0, &o));
+        ASSERT_STREQ(o.fs_label, "foo");
+        ASSERT_TRUE(o.fat_serial_set);
+        uapi16_object_done(&o);
+
+        /* If the features are listed, an absent "readOnly" means not read-only (on any object), and absent
+         * partition attribute flags are cleared (only on regular files, where they are defined) */
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\"}", 1, _MANIFEST_FIELD_GPT_ALL, &o));
+        ASSERT_EQ(o.read_only, 0);
+        ASSERT_TRUE(o.gpt_flags_set);
+        ASSERT_EQ(o.gpt_flags, 0U);
+        ASSERT_EQ(o.gpt_no_auto, 0);
+        ASSERT_EQ(o.gpt_growfs, 0);
+        ASSERT_FALSE(o.gpt_uuid_set);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"type\":\"dir\"}", 1, _MANIFEST_FIELD_GPT_ALL, &o));
+        ASSERT_EQ(o.read_only, 0);
+        ASSERT_FALSE(o.gpt_flags_set);
+        ASSERT_EQ(o.gpt_no_auto, -1);
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\"}", 1, /* features= */ 0, &o));
+        ASSERT_EQ(o.read_only, -1);
+        ASSERT_FALSE(o.gpt_flags_set);
+        ASSERT_EQ(o.gpt_no_auto, -1);
+        uapi16_object_done(&o);
+
+        /* If "symlink" is listed, symlinks carry their target */
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"type\":\"lnk\"}", 1, MANIFEST_FIELD_SYMLINK, &o), EBADMSG);
+        ASSERT_ERROR(dispatch_with_features("{\"name\":\"a\",\"type\":\"lnk\",\"contents\":[{\"file\":\"b\"}]}", 1, MANIFEST_FIELD_SYMLINK, &o), EBADMSG);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"type\":\"lnk\",\"contents\":[{\"literal\":\"eA==\"}]}", 1, MANIFEST_FIELD_SYMLINK, &o));
+        uapi16_object_done(&o);
+        ASSERT_OK(dispatch_with_features("{\"name\":\"a\",\"type\":\"lnk\"}", 1, /* features= */ 0, &o));
+        uapi16_object_done(&o);
+
+        /* The features field round-trips, sorted */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        ASSERT_OK(uapi16_features_build_json(_MANIFEST_FIELD_DEFAULT, &j));
+        _cleanup_free_ char *s = NULL;
+        ASSERT_OK(sd_json_variant_format(j, /* flags= */ 0, &s));
+        ASSERT_STREQ(s, "[\"device\",\"gid\",\"hardlink\",\"mode\",\"sha256\",\"size\",\"symlink\",\"uid\"]");
+        j = sd_json_variant_unref(j);
+        s = mfree(s);
+        ASSERT_OK(uapi16_features_build_json(/* features= */ 0, &j));
+        ASSERT_OK(sd_json_variant_format(j, /* flags= */ 0, &s));
+        ASSERT_STREQ(s, "[]");
+}
+
+static int ignore_object(Uapi16Object *o, size_t index, void *userdata) {
+        return 0;
+}
+
+static int read_records(const char *root_fields, char * const *names) {
+        _cleanup_free_ char *buf = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
+
+        /* Builds a manifest of a root object with the specified extra fields and file objects with the
+         * specified names, where names with a trailing slash denote directories, and reads it */
+
+        ASSERT_NOT_NULL(buf = strjoin("\x1e{\"mediaType\":\"" UAPI16_MANIFEST_MEDIA_TYPE "\"", root_fields, "}\n"));
+
+        STRV_FOREACH(n, names) {
+                _cleanup_free_ char *name = NULL;
+                const char *e = endswith(*n, "/");
+                ASSERT_NOT_NULL(name = e ? strndup(*n, e - *n) : strdup(*n));
+                ASSERT_NOT_NULL(strextend(&buf, "\x1e{\"name\":\"", name, "\"", e ? ",\"type\":\"dir\"" : "", "}\n"));
+        }
+
+        ASSERT_NOT_NULL(strextend(&buf, "\x1e{\"mediaType\":\"" UAPI16_TRAILER_MEDIA_TYPE "\"}\n"));
+
+        ASSERT_NOT_NULL(f = fmemopen_unlocked(buf, strlen(buf), "r"));
+        return uapi16_manifest_read(f, /* certificates= */ NULL, /* n_certificates= */ 0, ignore_object, /* userdata= */ NULL);
+}
+
+TEST(uapi16_manifest_read_placement) {
+        /* Flat manifests in any order are fine */
+        ASSERT_OK(read_records("", STRV_MAKE("b", "a", "c")));
+        ASSERT_OK(read_records("", STRV_EMPTY));
+
+        /* Entries of directories must follow the directory immediately, in any order unless declared */
+        ASSERT_OK(read_records("", STRV_MAKE("a/", "a/y", "a/b/", "a/b/c", "a/x", "z")));
+        ASSERT_OK(read_records("", STRV_MAKE("z", "a/", "a/b/", "a/b/c")));
+        ASSERT_ERROR(read_records("", STRV_MAKE("a/x")), EBADMSG);
+        ASSERT_ERROR(read_records("", STRV_MAKE("a", "a/x")), EBADMSG); /* Not a directory */
+        ASSERT_ERROR(read_records("", STRV_MAKE("a/", "a/x", "b", "a/y")), EBADMSG);
+        ASSERT_ERROR(read_records("", STRV_MAKE("a/", "a/b/", "a/x", "a/b/c")), EBADMSG);
+        ASSERT_ERROR(read_records("", STRV_MAKE("a/", "b/", "a/x")), EBADMSG);
+
+        /* With the code point ordering declared, names must strictly increase */
+        ASSERT_OK(read_records(",\"order\":\"codepoint\"", STRV_MAKE("a/", "a/x", "a-b", "b")));
+        ASSERT_ERROR(read_records(",\"order\":\"codepoint\"", STRV_MAKE("a-b", "a/", "a/x")), EBADMSG);
+        ASSERT_ERROR(read_records(",\"order\":\"codepoint\"", STRV_MAKE("b", "a")), EBADMSG);
+        ASSERT_ERROR(read_records(",\"order\":\"codepoint\"", STRV_MAKE("a", "a")), EBADMSG);
+        /* … but not otherwise, and unknown orderings are treated as if not declared */
+        ASSERT_OK(read_records("", STRV_MAKE("a-b", "a/", "a/x")));
+        ASSERT_OK(read_records(",\"order\":\"frobnicate\"", STRV_MAKE("b", "a")));
+        ASSERT_OK(read_records(",\"order\":null", STRV_MAKE("b", "a")));
+        ASSERT_ERROR(read_records(",\"order\":4711", STRV_MAKE("b", "a")), EINVAL);
+}
+
+static bool try_set_special_xattr(int dir_fd, const char *name) {
+        int r;
+
+        /* Traditionally Linux only allows "user." attributes on regular files and directories, but recently
+         * gained support for them on sockets, and might extend this further. Hence try and see. */
+        r = xsetxattr(dir_fd, name, /* at_flags= */ 0, "user.special", "yes");
+        if (r == -EPERM || ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
+                log_info_errno(r, "Cannot set \"user.\" extended attribute on '%s', expecting none: %m", name);
+                return false;
+        }
+        ASSERT_OK(r);
+        return true;
+}
+
+static void assert_special_xattr(const char *buf, const char *name, bool have) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = find_object(buf, name);
+        _cleanup_free_ char *s = NULL;
+
+        ASSERT_NOT_NULL(v);
+        ASSERT_OK(sd_json_variant_format(sd_json_variant_by_key(v, "extendedAttributes"), /* flags= */ 0, &s));
+        ASSERT_STREQ(s, have ? "{\"user\":{\"special\":{\"text\":\"yes\"}}}" : "{\"user\":{}}");
+}
+
+TEST(manifest_uapi16_timestamp_accuracy) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        const nsec_t base = 1700000000 * NSEC_PER_SEC + 123456789;
+        ASSERT_OK_ERRNO(utimensat(tfd, "regular.txt", (struct timespec[2]) { *TIMESPEC_STORE_NSEC(base), *TIMESPEC_STORE_NSEC(base) }, 0));
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_MTIME;
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+
+        /* Deviations up to the accuracy are accepted (2s by default, as on FAT), larger ones are not */
+        static const struct {
+                nsec_t offset, accuracy;
+                bool good;
+        } tests[] = {
+                { 0,                     MANIFEST_TIMESTAMP_ACCURACY_DEFAULT_NSEC, true  },
+                { 2 * NSEC_PER_SEC,      MANIFEST_TIMESTAMP_ACCURACY_DEFAULT_NSEC, true  },
+                { 2 * NSEC_PER_SEC + 1,  MANIFEST_TIMESTAMP_ACCURACY_DEFAULT_NSEC, false },
+                { 0,                     0,                                        true  },
+                { 1,                     0,                                        false },
+                { 1,                     1,                                        true  },
+        };
+
+        nsec_t m;
+        FOREACH_ELEMENT(test, tests)
+                /* Also try deviations into the past */
+                FOREACH_ARGUMENT(m, base + test->offset, base - test->offset) {
+                        ASSERT_OK_ERRNO(utimensat(tfd, "regular.txt", (struct timespec[2]) { *TIMESPEC_STORE_NSEC(m), *TIMESPEC_STORE_NSEC(m) }, 0));
+
+                        manifest_context_done(&c);
+                        context_init(&c, MANIFEST_FORMAT_UAPI16);
+                        c.fields |= MANIFEST_FIELD_MTIME;
+                        c.timestamp_accuracy_nsec = test->accuracy;
+                        if (test->good)
+                                ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+                        else {
+                                ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+                                ASSERT_EQ(c.n_errors, 1U);
+                        }
+                }
+
+        /* Without the mtime field, modification times are not checked at all */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.timestamp_accuracy_nsec = 0;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+}
+
+TEST(manifest_uapi16_xattr) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+        int r;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        r = xsetxattr(tfd, "regular.txt", /* at_flags= */ 0, "user.mime_type", "text/plain");
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return (void) log_tests_skipped_errno(r, "File system does not support user extended attributes");
+        ASSERT_OK(r);
+        ASSERT_OK(xsetxattr_full(tfd, "regular.txt", /* at_flags= */ 0, "user.blob", "\x00\x01\x02\x03", 4, /* xattr_flags= */ 0));
+        ASSERT_OK(xsetxattr(tfd, "subdir", /* at_flags= */ 0, "user.dir", "yes"));
+
+        /* Also try special inodes, a device node only if we are privileged enough to create one */
+        ASSERT_OK_ERRNO(mknodat(tfd, "socket", S_IFSOCK|0600, 0));
+        r = RET_NERRNO(mknodat(tfd, "null", S_IFCHR|0600, makedev(1, 3)));
+        if (ERRNO_IS_NEG_PRIVILEGE(r))
+                log_info_errno(r, "Cannot create device node, skipping: %m");
+        else
+                ASSERT_OK(r);
+        bool have_devnode = r >= 0,
+                fifo_xattr = try_set_special_xattr(tfd, "fifo"),
+                socket_xattr = try_set_special_xattr(tfd, "socket"),
+                devnode_xattr = have_devnode && try_set_special_xattr(tfd, "null");
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_USER_XATTR;
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+        ASSERT_EQ(c.n_metadata_omitted, 0U);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reg = find_object(buf, "regular.txt");
+        ASSERT_NOT_NULL(reg);
+        ASSERT_TRUE(sd_json_variant_is_normalized(reg));
+        _cleanup_free_ char *s = NULL;
+        ASSERT_OK(sd_json_variant_format(sd_json_variant_by_key(reg, "extendedAttributes"), /* flags= */ 0, &s));
+        ASSERT_STREQ(s, "{\"user\":{\"blob\":{\"base64\":\"AAECAw==\"},\"mime_type\":{\"text\":\"text/plain\"}}}");
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *dir = find_object(buf, "subdir");
+        ASSERT_NOT_NULL(dir);
+        s = mfree(s);
+        ASSERT_OK(sd_json_variant_format(sd_json_variant_by_key(dir, "extendedAttributes"), /* flags= */ 0, &s));
+        ASSERT_STREQ(s, "{\"user\":{\"dir\":{\"text\":\"yes\"}}}");
+
+        /* Inodes without attributes are listed with an empty namespace object, symlinks without any, since
+         * they cannot carry "user." attributes */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty = find_object(buf, "empty.txt"),
+                *lnk = find_object(buf, "symlink");
+        ASSERT_NOT_NULL(empty);
+        s = mfree(s);
+        ASSERT_OK(sd_json_variant_format(sd_json_variant_by_key(empty, "extendedAttributes"), /* flags= */ 0, &s));
+        ASSERT_STREQ(s, "{\"user\":{}}");
+        ASSERT_NOT_NULL(lnk);
+        ASSERT_NULL(sd_json_variant_by_key(lnk, "extendedAttributes"));
+
+        assert_special_xattr(buf, "fifo", fifo_xattr);
+        assert_special_xattr(buf, "socket", socket_xattr);
+        if (have_devnode)
+                assert_special_xattr(buf, "null", devnode_xattr);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_USER_XATTR;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+
+        /* Changed, added and removed attributes are detected if enabled, but not by default */
+        ASSERT_OK(xsetxattr(tfd, "regular.txt", /* at_flags= */ 0, "user.mime_type", "text/x-c"));
+        ASSERT_OK(xsetxattr(tfd, "empty.txt", /* at_flags= */ 0, "user.new", "x"));
+        ASSERT_OK(xremovexattr(tfd, "subdir", /* at_flags= */ 0, "user.dir"));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_USER_XATTR;
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 3U);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+
+        /* Attribute names we cannot represent cause the attributes of the inode to be omitted */
+        ASSERT_OK(xsetxattr(tfd, "empty.txt", /* at_flags= */ 0, "user.\x01", "x"));
+        _cleanup_free_ char *buf2 = NULL;
+        size_t size2;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_USER_XATTR;
+        ASSERT_OK(generate(&c, tfd, &buf2, &size2));
+        ASSERT_EQ(c.n_metadata_omitted, 1U);
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty2 = find_object(buf2, "empty.txt");
+        ASSERT_NOT_NULL(empty2);
+        ASSERT_NULL(sd_json_variant_by_key(empty2, "extendedAttributes"));
+}
+
+TEST(uapi16_fat_serial) {
+        char buf[UAPI16_FAT_SERIAL_STRING_MAX];
+        uint32_t v;
+
+        ASSERT_STREQ(uapi16_fat_serial_to_string(/* serial= */ 0, buf), "0000-0000");
+        ASSERT_STREQ(uapi16_fat_serial_to_string(UINT32_C(0x1234abcd), buf), "1234-ABCD");
+        ASSERT_STREQ(uapi16_fat_serial_to_string(UINT32_MAX, buf), "FFFF-FFFF");
+
+        ASSERT_OK(uapi16_fat_serial_from_string("1234-abcd", &v));
+        ASSERT_EQ(v, UINT32_C(0x1234ABCD));
+        ASSERT_OK(uapi16_fat_serial_from_string("FFFF-0000", &v));
+        ASSERT_EQ(v, UINT32_C(0xFFFF0000));
+        ASSERT_ERROR(uapi16_fat_serial_from_string("", &v), EINVAL);
+        ASSERT_ERROR(uapi16_fat_serial_from_string("1234-ABCDE", &v), EINVAL);
+        ASSERT_ERROR(uapi16_fat_serial_from_string("1234:ABCD", &v), EINVAL);
+        ASSERT_ERROR(uapi16_fat_serial_from_string("-1234ABCD", &v), EINVAL);
+
+        ASSERT_TRUE(uapi16_fs_label_is_valid("ESP"));
+        ASSERT_TRUE(uapi16_fs_label_is_valid(""));
+        ASSERT_TRUE(uapi16_fs_label_is_valid("räksmörgås"));
+        ASSERT_FALSE(uapi16_fs_label_is_valid("E\tSP"));
+        ASSERT_FALSE(uapi16_fs_label_is_valid("\xff"));
+
+        ASSERT_STREQ(uapi16_inode_flag_to_field(FS_NOCOW_FL), "flagNoCow");
+        ASSERT_NULL(uapi16_inode_flag_to_field(FS_EXTENT_FL));
+        ASSERT_STREQ(uapi16_fat_attr_to_field(UINT32_C(0x20)), "flagArchive");
+        ASSERT_STREQ(uapi16_fat_attr_to_field(UINT32_C(0x01)), "readOnly");
+        ASSERT_NULL(uapi16_fat_attr_to_field(UINT32_C(0x08)));
+}
+
+TEST(manifest_uapi16_inode_flags) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+        int r;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        /* FS_NODUMP_FL may be set without privileges, on the file systems that support it */
+        r = chattr_at(tfd, "regular.txt", FS_NODUMP_FL, FS_NODUMP_FL);
+        if (ERRNO_IS_NEG_IOCTL_NOT_SUPPORTED(r))
+                return (void) log_tests_skipped_errno(r, "File system does not support FS_NODUMP_FL");
+        ASSERT_OK(r);
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FLAG_NO_DUMP|MANIFEST_FIELD_FLAG_NO_ATIME|MANIFEST_FIELD_FLAG_HIDDEN|MANIFEST_FIELD_FS_UUID|MANIFEST_FIELD_FS_LABEL|MANIFEST_FIELD_FAT_SERIAL;
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+        ASSERT_EQ(c.n_metadata_omitted, 0U);
+
+        /* Only the requested flags are included, and only on regular files and directories */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reg = find_object(buf, "regular.txt"),
+                *dir = find_object(buf, "subdir"),
+                *lnk = find_object(buf, "symlink");
+        ASSERT_NOT_NULL(reg);
+        ASSERT_TRUE(sd_json_variant_boolean(sd_json_variant_by_key(reg, "flagNoDump")));
+        ASSERT_TRUE(sd_json_variant_is_boolean(sd_json_variant_by_key(reg, "flagNoAtime")));
+        ASSERT_FALSE(sd_json_variant_boolean(sd_json_variant_by_key(reg, "flagNoAtime")));
+        ASSERT_NULL(sd_json_variant_by_key(reg, "flagImmutable"));
+        ASSERT_NOT_NULL(dir);
+        ASSERT_TRUE(sd_json_variant_is_boolean(sd_json_variant_by_key(dir, "flagNoDump")));
+        ASSERT_FALSE(sd_json_variant_boolean(sd_json_variant_by_key(dir, "flagNoDump")));
+        ASSERT_NOT_NULL(lnk);
+        ASSERT_NULL(sd_json_variant_by_key(lnk, "flagNoDump"));
+
+        /* Not on FAT, hence no FAT attributes and no FAT serial number. Whether the file system reports a
+         * UUID or label depends on the file system, but they are only ever recorded on the root object. */
+        ASSERT_NULL(sd_json_variant_by_key(reg, "flagHidden"));
+        ASSERT_NULL(strstr(buf, "fatSerial"));
+        ASSERT_NULL(sd_json_variant_by_key(reg, "fsUUID"));
+        ASSERT_NULL(sd_json_variant_by_key(dir, "fsLabel"));
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FLAG_NO_DUMP|MANIFEST_FIELD_FLAG_NO_ATIME;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+
+        /* A changed flag is detected, but only if the field is requested */
+        ASSERT_OK(chattr_at(tfd, "regular.txt", /* value= */ 0, FS_NODUMP_FL));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FLAG_NO_DUMP;
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 1U);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FLAG_NO_ATIME;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+        ASSERT_EQ(c.n_not_applicable, 0U);
+
+        /* The tree is not located on FAT, hence a FAT volume serial number and FAT attributes do not apply,
+         * and are counted, but only if the fields are requested */
+        const char *brace = ASSERT_NOT_NULL(memchr(buf, '{', size));
+        _cleanup_free_ char *fatbuf = NULL;
+        ASSERT_OK_ERRNO(asprintf(&fatbuf, "%.*s{\"fatSerial\":\"12AB-CD34\",%.*s",
+                                 (int) (brace - buf), buf,
+                                 (int) (size - (brace - buf) - 1), brace + 1));
+        _cleanup_free_ char *fatbuf2 = ASSERT_NOT_NULL(strreplace(fatbuf, "\"name\":\"regular.txt\"", "\"name\":\"regular.txt\",\"flagHidden\":true,\"flagSystem\":false"));
+        /* The manifest has to list the features of the fields we added */
+        _cleanup_free_ char *fatbuf3 = ASSERT_NOT_NULL(strreplace(fatbuf2, "\"flag-hidden\"", "\"flag-hidden\",\"flag-system\""));
+        ASSERT_NOT_STREQ(fatbuf2, fatbuf3);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FAT_SERIAL|MANIFEST_FIELD_FLAG_HIDDEN|MANIFEST_FIELD_FLAG_SYSTEM;
+        ASSERT_OK(verify_buffer(&c, tfd, fatbuf3, strlen(fatbuf3)));
+        ASSERT_EQ(c.n_errors, 0U);
+        /* As the features are listed, the six regular files and directories other than the root have the
+         * attributes cleared if they don't carry them, which cannot be verified either */
+        ASSERT_EQ(c.n_not_applicable, 1U + 6U * 2U);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FLAG_HIDDEN;
+        ASSERT_OK(verify_buffer(&c, tfd, fatbuf3, strlen(fatbuf3)));
+        ASSERT_EQ(c.n_not_applicable, 6U);
+}
+
+TEST(manifest_uapi16_read_only) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        ASSERT_OK(tfd = make_tree(&t));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "regular.txt", 0444, 0));
+        ASSERT_OK_ERRNO(fchmodat(tfd, "fifo", 0400, 0));
+
+        /* Outside of FAT the read-only state is derived from the access mode, on everything but symlinks,
+         * as the dispatcher refuses "readOnly" and "mode" contradicting each other */
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_READ_ONLY;
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+        ASSERT_EQ(c.n_metadata_omitted, 0U);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant
+                *reg = ASSERT_NOT_NULL(find_object(buf, "regular.txt")),
+                *fifo = ASSERT_NOT_NULL(find_object(buf, "fifo")),
+                *nested = ASSERT_NOT_NULL(find_object(buf, "subdir/nested.txt")),
+                *lnk = ASSERT_NOT_NULL(find_object(buf, "symlink"));
+        ASSERT_TRUE(sd_json_variant_boolean(sd_json_variant_by_key(reg, "readOnly")));
+        ASSERT_TRUE(sd_json_variant_boolean(sd_json_variant_by_key(fifo, "readOnly")));
+        /* "readOnly" defaults to false, hence is only included if set */
+        ASSERT_NULL(sd_json_variant_by_key(nested, "readOnly"));
+        ASSERT_NULL(sd_json_variant_by_key(lnk, "readOnly"));
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_READ_ONLY;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+        ASSERT_EQ(c.n_not_applicable, 0U);
+
+        /* A changed access mode is detected via the read-only state too */
+        ASSERT_OK_ERRNO(fchmodat(tfd, "regular.txt", 0644, 0));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields = MANIFEST_FIELD_READ_ONLY;
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+        ASSERT_EQ(c.n_errors, 1U);
+}
+
+TEST(manifest_uapi16_fs_identity_features) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FS_LABEL|MANIFEST_FIELD_FAT_SERIAL;
+        ASSERT_OK(generate(&c, tfd, &buf, &size));
+        ASSERT_EQ(c.n_metadata_omitted, 0U);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *root = ASSERT_NOT_NULL(find_object(buf, /* name= */ NULL));
+        _cleanup_free_ char *features = NULL;
+        ASSERT_OK(sd_json_variant_format(sd_json_variant_by_key(root, "features"), /* flags= */ 0, &features));
+
+        /* If the file system cannot report its label, it is not declared, as readers would otherwise
+         * conclude the file system has none. Other file systems than FAT have no FAT volume serial number,
+         * hence that one is declared, but not recorded. */
+        char label[FSLABEL_MAX] = {};
+        bool have_label = ioctl(tfd, FS_IOC_GETFSLABEL, label) >= 0;
+        if (!have_label)
+                ASSERT_TRUE(ERRNO_IS_IOCTL_NOT_SUPPORTED(errno));
+        log_info("File system label %s queryable, features: %s", have_label ? "is" : "is not", features);
+        ASSERT_EQ(!!strstr(features, "\"fs-label\""), have_label);
+        ASSERT_NOT_NULL(strstr(features, "\"fat-serial\""));
+        ASSERT_NULL(sd_json_variant_by_key(root, "fatSerial"));
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.fields |= MANIFEST_FIELD_FS_LABEL|MANIFEST_FIELD_FAT_SERIAL;
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+}
+
+#if HAVE_OPENSSL
+static const char test_ec_private_key[] =
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUHtgg+jYlSw1SGHP\n"
+        "9MZwkDvAeGK7C11MZqfDFEHu6PyhRANCAATAeBIb56cVcwPEpjmHtMgIP2emDuul\n"
+        "Uss0MAUahizNuwsdCUADqP0p2ZtnsYBYNW11arZ/uDDjeT3Qk6xTEdGq\n"
+        "-----END PRIVATE KEY-----\n";
+
+static const char test_ec_certificate[] =
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBoTCCAUegAwIBAgIUQCZpFz9fSaGCGZ0CXqkaWN5GKgswCgYIKoZIzj0EAwIw\n"
+        "JTEjMCEGA1UEAwwac3lzdGVtZCB0ZXN0LW1hbmlmZXN0LXV0aWwwIBcNMjYwOTE0\n"
+        "MTUwMzIzWhgPMjEyNjA4MjExNTAzMjNaMCUxIzAhBgNVBAMMGnN5c3RlbWQgdGVz\n"
+        "dC1tYW5pZmVzdC11dGlsMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEwHgSG+en\n"
+        "FXMDxKY5h7TICD9npg7rpVLLNDAFGoYszbsLHQlAA6j9KdmbZ7GAWDVtdWq2f7gw\n"
+        "43k90JOsUxHRqqNTMFEwHQYDVR0OBBYEFOS6qnXKagStyWcbtRVVw5qKsk7DMB8G\n"
+        "A1UdIwQYMBaAFOS6qnXKagStyWcbtRVVw5qKsk7DMA8GA1UdEwEB/wQFMAMBAf8w\n"
+        "CgYIKoZIzj0EAwIDSAAwRQIgPUHB6or3asS2dntLwGDoQ2/LZ47ciHFy6br2+bfq\n"
+        "e3MCIQCOsXGmxgfJQxkCVn1xvJIsw0o5uqgJSTmtQctPh+Du1Q==\n"
+        "-----END CERTIFICATE-----\n";
+
+/* Neither is acceptable for verifying artifacts: the first one is restricted to TLS server
+ * authentication, the second one to key agreement */
+static const char test_tls_server_certificate[] =
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBlTCCATugAwIBAgIUf4C3UWevWLcvwdNhWAksrkQ5z2MwCgYIKoZIzj0EAwIw\n"
+        "DjEMMAoGA1UEAwwDdGxzMCAXDTI2MTAzMTE2MDczMVoYDzIxMjYxMDA3MTYwNzMx\n"
+        "WjAOMQwwCgYDVQQDDAN0bHMwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAT2YUIu\n"
+        "Yz67h/8RrN3qrZrgJMnqeeYDETzJUMCGWScka/dUb3pE6cMDGD+wmyvLHks/LG0S\n"
+        "1nx7ugqlNQFqgsM7o3UwczAdBgNVHQ4EFgQUJ7bRfERuCwCIhTWZxON7TailfYgw\n"
+        "HwYDVR0jBBgwFoAUJ7bRfERuCwCIhTWZxON7TailfYgwDwYDVR0TAQH/BAUwAwEB\n"
+        "/zATBgNVHSUEDDAKBggrBgEFBQcDATALBgNVHQ8EBAMCB4AwCgYIKoZIzj0EAwID\n"
+        "SAAwRQIhAIPzF8xT0ltohwvp51J3pzW4IrqbkkgjxgHstSfMWOOsAiBsCmFOm5ql\n"
+        "iMfX+NuqGgRnd5OxsXVW6CD1D+ugbKoiSw==\n"
+        "-----END CERTIFICATE-----\n";
+
+static const char test_key_agreement_certificate[] =
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBqDCCAU2gAwIBAgIUcDhTZDI2CxtQpc+NsNR7Cbl+9JQwCgYIKoZIzj0EAwIw\n"
+        "FzEVMBMGA1UEAwwMa2V5YWdyZWVtZW50MCAXDTI2MTAzMTE2MDczOFoYDzIxMjYx\n"
+        "MDA3MTYwNzM4WjAXMRUwEwYDVQQDDAxrZXlhZ3JlZW1lbnQwWTATBgcqhkjOPQIB\n"
+        "BggqhkjOPQMBBwNCAARQKahkGrU81aRuSv+cLAfltaEPqTFNG+o9ebSgFqQwNrfR\n"
+        "wKu1HofbUOerrAa3Z92s3+c/gh1xSYrJBfuV8ZxZo3UwczAdBgNVHQ4EFgQUz6HV\n"
+        "EZhNuus/AcQm6/8khppvZwkwHwYDVR0jBBgwFoAUz6HVEZhNuus/AcQm6/8khppv\n"
+        "ZwkwDwYDVR0TAQH/BAUwAwEB/zATBgNVHSUEDDAKBggrBgEFBQcDAzALBgNVHQ8E\n"
+        "BAMCAwgwCgYIKoZIzj0EAwIDSQAwRgIhALcLZSj8ka7skgw6jWRem6PllU5NqaDd\n"
+        "jhXdFZ2MMoRMAiEAw9r2kec/hWkWaK8fP1ni9+iIIxlaCd0Gq6gilgYju7s=\n"
+        "-----END CERTIFICATE-----\n";
+
+/* This one is acceptable: it carries the code signing EKU and the digital signature KU */
+static const char test_code_signing_certificate[] =
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBqDCCAU6gAwIBAgIUAJcASXYsvtXUtNqzvF4ozHAU/1QwCgYIKoZIzj0EAwIw\n"
+        "FjEUMBIGA1UEAwwLY29kZXNpZ25pbmcwIBcNMjYxMDMxMTcwMjA5WhgPMjEyNjEw\n"
+        "MDcxNzAyMDlaMBYxFDASBgNVBAMMC2NvZGVzaWduaW5nMFkwEwYHKoZIzj0CAQYI\n"
+        "KoZIzj0DAQcDQgAEgjEsSC4ccpavd9cz0WI7FD9pLoZq2iJv5pZbCUDKytp2KJ8y\n"
+        "Sb0PUtLL4yNPufmJa5GIhD8NCjKYrE4BCjTMdaN4MHYwHQYDVR0OBBYEFE+v/oq6\n"
+        "7cjbltTEnicVBTY/E+W0MB8GA1UdIwQYMBaAFE+v/oq67cjbltTEnicVBTY/E+W0\n"
+        "MA8GA1UdEwEB/wQFMAMBAf8wEwYDVR0lBAwwCgYIKwYBBQUHAwMwDgYDVR0PAQH/\n"
+        "BAQDAgeAMAoGCCqGSM49BAMCA0gAMEUCIER/Mg3jovGZvukUuBdz1VmZ0dbCkaRW\n"
+        "g3cptbiTEUh3AiEAy4Ce+oXsq9tTlFpgMVXGo9tN8A4rwonfikMRJvBwxxU=\n"
+        "-----END CERTIFICATE-----\n";
+
+static const char test_ed25519_private_key[] =
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MC4CAQAwBQYDK2VwBCIEIGpz8IMVIuc/uA5D3DrtHeHjGit8aQ2+ef7nv0HNpp3a\n"
+        "-----END PRIVATE KEY-----\n";
+
+static const char test_ed25519_certificate[] =
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBcTCCASOgAwIBAgIUQ7Rh+pqym8TUwFBLeAEqGobICbQwBQYDK2VwMC0xKzAp\n"
+        "BgNVBAMMInN5c3RlbWQgdGVzdC1tYW5pZmVzdC11dGlsIGVkMjU1MTkwIBcNMjYw\n"
+        "OTIyMTIyODM3WhgPMjEyNjA4MjkxMjI4MzdaMC0xKzApBgNVBAMMInN5c3RlbWQg\n"
+        "dGVzdC1tYW5pZmVzdC11dGlsIGVkMjU1MTkwKjAFBgMrZXADIQC+4xo6+p15/YyR\n"
+        "7m2F4udaXRtX7pZawZuZ8lkf/AC67aNTMFEwHQYDVR0OBBYEFBwqhFuJLeDXDTFC\n"
+        "0eECXh1IAOouMB8GA1UdIwQYMBaAFBwqhFuJLeDXDTFC0eECXh1IAOouMA8GA1Ud\n"
+        "EwEB/wQFMAMBAf8wBQYDK2VwA0EALekT5ufk7cYnbL0rRqEPT4QSwI4d1PxAhClV\n"
+        "DRsBeyQmU7+JHOJyWB2zHtlOjq7EqJEvehJ5WTD5JQ3ZXVC5Bg==\n"
+        "-----END CERTIFICATE-----\n";
+
+static char* strip_ansi(const char *s) {
+        _cleanup_free_ char *buf = NULL;
+        size_t n = 0;
+
+        /* Removes CSI sequences (ESC [ … final byte) */
+
+        ASSERT_NOT_NULL(buf = new(char, strlen(s) + 1));
+
+        for (const char *p = s; *p; p++) {
+                if (p[0] == '\x1b' && p[1] == '[') {
+                        p += 2;
+                        while (*p && !(*p >= 0x40 && *p <= 0x7e))
+                                p++;
+                        if (!*p)
+                                break;
+                        continue;
+                }
+
+                buf[n++] = *p;
+        }
+
+        buf[n] = 0;
+        return TAKE_PTR(buf);
+}
+
+static void load_key_pair(
+                int tfd,
+                const char *t,
+                const char *private_key_pem,
+                const char *certificate_pem,
+                X509 **ret_certificate,
+                EVP_PKEY **ret_private_key,
+                OpenSSLAskPasswordUI **ret_ui) {
+
+        _cleanup_free_ char *key_path = NULL, *cert_path = NULL;
+        ASSERT_NOT_NULL(key_path = path_join(t, "key.pem"));
+        ASSERT_NOT_NULL(cert_path = path_join(t, "cert.pem"));
+        ASSERT_OK(write_string_file(key_path, private_key_pem, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MODE_0600));
+        ASSERT_OK(write_string_file(cert_path, certificate_pem, WRITE_STRING_FILE_CREATE));
+
+        ASSERT_OK(openssl_load_x509_certificate(OPENSSL_CERTIFICATE_SOURCE_FILE, /* certificate_source= */ NULL, cert_path, ret_certificate));
+        ASSERT_OK(openssl_load_private_key(
+                                  OPENSSL_KEY_SOURCE_FILE,
+                                  /* private_key_source= */ NULL,
+                                  key_path,
+                                  &(AskPasswordRequest) {
+                                          .tty_fd = -EBADF,
+                                          .until = USEC_INFINITY,
+                                          .hup_fd = -EBADF,
+                                  },
+                                  ret_private_key,
+                                  ret_ui));
+
+        /* The key and certificate files are not part of the manifest, hence remove them again */
+        ASSERT_OK_ERRNO(unlinkat(tfd, "key.pem", 0));
+        ASSERT_OK_ERRNO(unlinkat(tfd, "cert.pem", 0));
+}
+
+static int count_objects(Uapi16Object *o, size_t index, void *userdata) {
+        size_t *n = ASSERT_PTR(userdata);
+
+        ASSERT_NOT_NULL(o);
+        if (index == 0)
+                ASSERT_STREQ(o->media_type, UAPI16_MANIFEST_MEDIA_TYPE);
+
+        (*n)++;
+        return 0;
+}
+
+static int read_buffer(const char *buf, size_t size, X509 *const *certificates, size_t n_certificates, size_t *ret_n_objects) {
+        _cleanup_fclose_ FILE *f = NULL;
+
+        ASSERT_NOT_NULL(f = fmemopen_unlocked((void*) buf, size, "r"));
+
+        *ret_n_objects = 0;
+        return uapi16_manifest_read(f, certificates, n_certificates, count_objects, ret_n_objects);
+}
+
+static void test_signed_one(
+                int tfd,
+                X509 *certificate,
+                EVP_PKEY *private_key,
+                X509 *other_certificate) {
+
+        _cleanup_(manifest_context_done) ManifestContext c;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+        int r;
+
+        /* Sign with the specified key */
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificate = certificate;
+        c.private_key = private_key;
+        r = generate(&c, tfd, &buf, &size);
+        if (r == -EOPNOTSUPP)
+                return (void) log_notice("Key type not supported for signing by this OpenSSL version, skipping.");
+
+        ASSERT_OK(r);
+
+        /* The signature object is the second to last record, the trailer the last */
+        char *trailer = strrchr(buf, 0x1e);
+        ASSERT_NOT_NULL(trailer);
+        ASSERT_NOT_NULL(strstr(trailer, "\"mediaType\":\"" UAPI16_TRAILER_MEDIA_TYPE "\""));
+
+        _cleanup_free_ char *head = strndup(buf, trailer - buf);
+        ASSERT_NOT_NULL(head);
+        const char *signature = strrchr(head, 0x1e);
+        ASSERT_NOT_NULL(signature);
+        ASSERT_NOT_NULL(strstr(signature, "\"mediaType\":\"" UAPI16_SIGNATURE_MEDIA_TYPE "\""));
+        ASSERT_NOT_NULL(strstr(signature, "\"mechanism\":\"pkcs7\""));
+
+        uint8_t fp[X509_FINGERPRINT_SIZE];
+        ASSERT_OK(x509_fingerprint(certificate, fp));
+        _cleanup_free_ char *fp_hex = hexmem(fp, sizeof(fp));
+        ASSERT_NOT_NULL(fp_hex);
+        ASSERT_NOT_NULL(strstr(signature, fp_hex));
+
+        /* Verifies with the right certificate, from a pipe too */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_OK(verify_pipe(&c, tfd, buf, size));
+
+        /* Verifies without certificate, signature is simply ignored then */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_OK(verify_buffer(&c, tfd, buf, size));
+
+        /* Does not verify with a different certificate */
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &other_certificate;
+        c.n_certificates = 1;
+        ASSERT_ERROR(verify_buffer(&c, tfd, buf, size), EBADMSG);
+
+        /* The generic reader accepts the signature if any of the specified certificates matches, and
+         * reports all file objects (including the leading one) to the handler */
+        size_t n_objects;
+        ASSERT_OK(read_buffer(buf, size, (X509*[]) { other_certificate, certificate }, 2, &n_objects));
+        ASSERT_GT(n_objects, 1U);
+        size_t n_objects_unverified;
+        ASSERT_OK(read_buffer(buf, size, /* certificates= */ NULL, /* n_certificates= */ 0, &n_objects_unverified));
+        ASSERT_EQ(n_objects_unverified, n_objects);
+        ASSERT_ERROR(read_buffer(buf, size, &other_certificate, 1, &n_objects), EBADMSG);
+
+        /* An unsigned manifest does not verify if a certificate is specified */
+        _cleanup_free_ char *unsigned_buf = NULL;
+        size_t unsigned_size;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        ASSERT_OK(generate(&c, tfd, &unsigned_buf, &unsigned_size));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_ERROR(verify_buffer(&c, tfd, unsigned_buf, unsigned_size), EBADMSG);
+
+        /* Changing the payload breaks the signature. Use the generic reader here, which doesn't compare
+         * the manifest with the tree, so that only the signature check can catch the modification. */
+        _cleanup_free_ char *tampered = NULL;
+        ASSERT_NOT_NULL(tampered = strreplace(buf, "\"size\":11", "\"size\":12"));
+        ASSERT_OK(read_buffer(tampered, strlen(tampered), /* certificates= */ NULL, /* n_certificates= */ 0, &n_objects));
+        ASSERT_ERROR(read_buffer(tampered, strlen(tampered), &certificate, 1, &n_objects), EBADMSG);
+
+        /* Objects between the signature object and the trailer are not covered by the signature, and
+         * ignored if their media type is unknown */
+        _cleanup_free_ char *inserted = strjoin(head, "\x1e{\"mediaType\":\"application/x-test-extra\",\"name\":\"extra.txt\"}\n", trailer);
+        ASSERT_NOT_NULL(inserted);
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_OK(verify_buffer(&c, tfd, inserted, strlen(inserted)));
+
+        /* OpenPGP signatures are not supported and ignored: if there's a PKCS#7 signature too, before or
+         * after it, that one is used */
+#define OPENPGP_SIGNATURE "\x1e{\"mediaType\":\"" UAPI16_SIGNATURE_MEDIA_TYPE "\",\"mechanism\":\"openpgp\",\"data\":\"AAEC\"}\n"
+        _cleanup_free_ char *payload = strndup(head, signature - head);
+        ASSERT_NOT_NULL(payload);
+        _cleanup_free_ char *openpgp_after = strjoin(head, OPENPGP_SIGNATURE, trailer);
+        ASSERT_NOT_NULL(openpgp_after);
+        _cleanup_free_ char *openpgp_before = strjoin(payload, OPENPGP_SIGNATURE, signature, trailer);
+        ASSERT_NOT_NULL(openpgp_before);
+        _cleanup_free_ char *openpgp_only = strjoin(payload, OPENPGP_SIGNATURE, trailer);
+        ASSERT_NOT_NULL(openpgp_only);
+#undef OPENPGP_SIGNATURE
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_OK(verify_buffer(&c, tfd, openpgp_after, strlen(openpgp_after)));
+        ASSERT_OK(read_buffer(openpgp_before, strlen(openpgp_before), &certificate, 1, &n_objects));
+
+        /* … and if there's only an OpenPGP signature this is as if there was no signature at all */
+        ASSERT_ERROR(read_buffer(openpgp_only, strlen(openpgp_only), &certificate, 1, &n_objects), EBADMSG);
+        ASSERT_OK(read_buffer(openpgp_only, strlen(openpgp_only), /* certificates= */ NULL, /* n_certificates= */ 0, &n_objects));
+
+        /* A PKCS#7 signature made with the same key, but over a different payload, is skipped, and the
+         * next one is used. If there's no other one, verification fails. */
+        _cleanup_free_ char *stale_buf = NULL;
+        size_t stale_size;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificate = certificate;
+        c.private_key = private_key;
+        c.fields = MANIFEST_FIELD_SIZE;
+        ASSERT_OK(generate(&c, tfd, &stale_buf, &stale_size));
+        char *stale_trailer = strrchr(stale_buf, 0x1e);
+        ASSERT_NOT_NULL(stale_trailer);
+        *stale_trailer = 0;
+        const char *stale_signature = strrchr(stale_buf, 0x1e);
+        ASSERT_NOT_NULL(stale_signature);
+        ASSERT_NOT_NULL(strstr(stale_signature, "\"mechanism\":\"pkcs7\""));
+        ASSERT_NOT_NULL(strstr(stale_signature, fp_hex));
+        ASSERT_FALSE(streq(stale_signature, signature));
+
+        _cleanup_free_ char *stale_before = strjoin(payload, stale_signature, signature, trailer);
+        ASSERT_NOT_NULL(stale_before);
+        _cleanup_free_ char *stale_only = strjoin(payload, stale_signature, trailer);
+        ASSERT_NOT_NULL(stale_only);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_OK(verify_buffer(&c, tfd, stale_before, strlen(stale_before)));
+        ASSERT_OK(read_buffer(stale_before, strlen(stale_before), &certificate, 1, &n_objects));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_ERROR(verify_buffer(&c, tfd, stale_only, strlen(stale_only)), EBADMSG);
+        ASSERT_ERROR(read_buffer(stale_only, strlen(stale_only), &certificate, 1, &n_objects), EBADMSG);
+
+        /* But a file object after the signature is refused, and so is anything after the trailer */
+        _cleanup_free_ char *file_after = strjoin(head, "\x1e{\"name\":\"extra.txt\"}\n", trailer);
+        ASSERT_NOT_NULL(file_after);
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_ERROR(verify_buffer(&c, tfd, file_after, strlen(file_after)), EBADMSG);
+
+        _cleanup_free_ char *appended = strjoin(buf, "\x1e{\"name\":\"extra.txt\"}\n");
+        ASSERT_NOT_NULL(appended);
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_ERROR(verify_buffer(&c, tfd, appended, strlen(appended)), EBADMSG);
+
+        /* A colored rendering carries the same signature, which covers the color-free bytes */
+        _cleanup_free_ char *colored = NULL;
+        size_t colored_size;
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificate = certificate;
+        c.private_key = private_key;
+        c.color = true;
+        c.json_format_flags = SD_JSON_FORMAT_COLOR;
+        ASSERT_OK(generate(&c, tfd, &colored, &colored_size));
+        ASSERT_NOT_NULL(strchr(colored, '\x1b'));
+
+        _cleanup_free_ char *stripped = strip_ansi(colored);
+        ASSERT_NULL(strchr(stripped, '\x1b'));
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.certificates = &certificate;
+        c.n_certificates = 1;
+        ASSERT_OK(verify_buffer(&c, tfd, stripped, strlen(stripped)));
+}
+
+TEST(manifest_uapi16_signed) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+        _cleanup_free_ char *buf = NULL;
+        size_t size;
+
+        if (dlopen_libcrypto(LOG_INFO) < 0)
+                return (void) log_tests_skipped("OpenSSL not available");
+
+        ASSERT_OK(tfd = make_tree(&t));
+
+        _cleanup_(X509_freep) X509 *ec_certificate = NULL, *ed25519_certificate = NULL;
+        _cleanup_(EVP_PKEY_freep) EVP_PKEY *ec_private_key = NULL, *ed25519_private_key = NULL;
+        _cleanup_(openssl_ask_password_ui_freep) OpenSSLAskPasswordUI *ec_ui = NULL, *ed25519_ui = NULL;
+        load_key_pair(tfd, t, test_ec_private_key, test_ec_certificate, &ec_certificate, &ec_private_key, &ec_ui);
+        load_key_pair(tfd, t, test_ed25519_private_key, test_ed25519_certificate, &ed25519_certificate, &ed25519_private_key, &ed25519_ui);
+
+        /* Signing (which is done if a private key is set) requires a certificate, and only works for uapi16 */
+        _cleanup_(manifest_context_done) ManifestContext c;
+        context_init(&c, MANIFEST_FORMAT_UAPI16);
+        c.private_key = ec_private_key;
+        ASSERT_ERROR(generate(&c, tfd, &buf, &size), EINVAL);
+
+        manifest_context_done(&c);
+        context_init(&c, MANIFEST_FORMAT_MTREE);
+        c.certificate = ec_certificate;
+        c.private_key = ec_private_key;
+        ASSERT_ERROR(generate(&c, tfd, &buf, &size), EINVAL);
+
+        /* ECDSA signs directly over the data, Ed25519 needs signed attributes (RFC 8419), exercise both */
+        test_signed_one(tfd, ec_certificate, ec_private_key, ed25519_certificate);
+        test_signed_one(tfd, ed25519_certificate, ed25519_private_key, ec_certificate);
+}
+
+TEST(uapi16_load_voa_certificates) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int rfd = -EBADF;
+        X509 **certificates = NULL;
+        size_t n_certificates = 0;
+
+        CLEANUP_ARRAY(certificates, n_certificates, uapi16_certificates_free);
+
+        if (dlopen_libcrypto(LOG_INFO) < 0)
+                return (void) log_tests_skipped("OpenSSL not available");
+
+        ASSERT_OK(rfd = mkdtemp_open("/tmp/test-manifest-voa.XXXXXX", O_PATH, &t));
+        ASSERT_OK(write_string_file_at(rfd, "etc/os-release", "ID=foo\nVERSION_ID=47\n", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+
+        /* Nothing installed */
+        ASSERT_OK(uapi16_load_voa_certificates(rfd, "default", &certificates, &n_certificates));
+        ASSERT_EQ(n_certificates, 0U);
+
+        /* One certificate for the bare OS ID, one for the exact one, and one that is not a certificate */
+        ASSERT_OK(write_string_file_at(rfd, "usr/share/voa/foo/manifest/default/x509/a-certificate.pem", test_ec_certificate, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+        ASSERT_OK(write_string_file_at(rfd, "etc/voa/foo:47/manifest/default/x509/b-certificate.pem", test_ec_certificate, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+        ASSERT_OK(write_string_file_at(rfd, "usr/share/voa/foo/manifest/default/x509/c-certificate.pem", "garbage\n", WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+        ASSERT_OK(uapi16_load_voa_certificates(rfd, "default", &certificates, &n_certificates));
+        ASSERT_EQ(n_certificates, 2U);
+        uapi16_certificates_free(TAKE_PTR(certificates), TAKE_GENERIC(n_certificates, size_t, 0));
+
+        /* Other contexts are separate */
+        ASSERT_OK(uapi16_load_voa_certificates(rfd, "sysupdate", &certificates, &n_certificates));
+        ASSERT_EQ(n_certificates, 0U);
+
+        /* Certificates not suitable for code signing are ignored */
+        ASSERT_OK(write_string_file_at(rfd, "usr/share/voa/foo/manifest/default/x509/d-certificate.pem", test_tls_server_certificate, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+        ASSERT_OK(write_string_file_at(rfd, "usr/share/voa/foo/manifest/default/x509/e-certificate.pem", test_key_agreement_certificate, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+        ASSERT_OK(uapi16_load_voa_certificates(rfd, "default", &certificates, &n_certificates));
+        ASSERT_EQ(n_certificates, 2U);
+        uapi16_certificates_free(TAKE_PTR(certificates), TAKE_GENERIC(n_certificates, size_t, 0));
+
+        /* … but those carrying the code signing EKU and the digital signature KU are not */
+        ASSERT_OK(write_string_file_at(rfd, "usr/share/voa/foo/manifest/default/x509/f-certificate.pem", test_code_signing_certificate, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+        ASSERT_OK(uapi16_load_voa_certificates(rfd, "default", &certificates, &n_certificates));
+        ASSERT_EQ(n_certificates, 3U);
+        uapi16_certificates_free(TAKE_PTR(certificates), TAKE_GENERIC(n_certificates, size_t, 0));
+
+        /* A mask in any load path applies to all of them */
+        ASSERT_OK(mkdirat_parents(rfd, "run/voa/foo/manifest/default/x509/a-certificate.pem", 0755));
+        ASSERT_OK_ERRNO(symlinkat("/dev/null", rfd, "run/voa/foo/manifest/default/x509/a-certificate.pem"));
+        ASSERT_OK(uapi16_load_voa_certificates(rfd, "default", &certificates, &n_certificates));
+        ASSERT_EQ(n_certificates, 2U);
+}
+#endif
+
+DEFINE_TEST_MAIN(LOG_DEBUG);

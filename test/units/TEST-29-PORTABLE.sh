@@ -13,12 +13,35 @@ set -o pipefail
 
 install_extension_images
 
+# Create a copy of the minimal image with a signature that no trusted key validates.
+mkdir -p /tmp/untrusted
+cp /usr/share/minimal_0.raw /tmp/untrusted/minimal_9.raw
+cp /usr/share/minimal_0.verity /tmp/untrusted/minimal_9.verity
+cp /usr/share/minimal_0.roothash /tmp/untrusted/minimal_9.roothash
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=test-29-untrusted \
+            -keyout /tmp/untrusted/key.pem -out /tmp/untrusted/cert.pem
+openssl smime -sign -nocerts -noattr -binary \
+              -in /tmp/untrusted/minimal_9.roothash \
+              -inkey /tmp/untrusted/key.pem \
+              -signer /tmp/untrusted/cert.pem \
+              -outform der \
+              -out /tmp/untrusted/minimal_9.roothash.p7s
+
 # Set longer timeout for slower machines, e.g. non-KVM vm.
+manager_env="SYSTEMD_DISSECT_VERITY_TIMEOUT_SEC=30"
+# Nura uses Alpine's libdevmapper, which is built without udev support, so the device node of
+# a Verity device is deleted when deferred removal is armed. Reusing such a device while it is
+# still held open then times out waiting for the device node symlink. Let's disable sharing of
+# Verity devices there, so that each activation gets its own device.
+if os_release_id_like alpine; then
+    manager_env+=" SYSTEMD_VERITY_SHARING=0"
+fi
+
 mkdir -p /run/systemd/system.conf.d
 cat >/run/systemd/system.conf.d/10-timeout.conf <<EOF
 [Manager]
-DefaultEnvironment=SYSTEMD_DISSECT_VERITY_TIMEOUT_SEC=30
-ManagerEnvironment=SYSTEMD_DISSECT_VERITY_TIMEOUT_SEC=30
+DefaultEnvironment=$manager_env
+ManagerEnvironment=$manager_env
 EOF
 
 mkdir -p /run/systemd/system/systemd-portabled.service.d/

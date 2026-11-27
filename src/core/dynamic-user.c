@@ -13,7 +13,9 @@
 #include "fdset.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "fs-util.h"
 #include "hashmap.h"
+#include "io-util.h"
 #include "iovec-util.h"
 #include "lock-util.h"
 #include "manager.h"
@@ -120,7 +122,7 @@ static int dynamic_user_acquire(Manager *m, const char *name, DynamicUser** ret)
         if (d) {
                 if (ret) {
                         /* We already have a structure for the dynamic user, let's increase the ref count and reuse it */
-                        d->n_ref++;
+                        ref_counter_inc(&d->n_ref);
                         *ret = d;
                 }
                 return 0;
@@ -139,7 +141,7 @@ static int dynamic_user_acquire(Manager *m, const char *name, DynamicUser** ret)
         storage_socket[0] = storage_socket[1] = -EBADF;
 
         if (ret) {
-                d->n_ref++;
+                ref_counter_inc(&d->n_ref);
                 *ret = d;
         }
 
@@ -186,7 +188,7 @@ static int pick_uid(char **suggested_paths, const char *name, uid_t *ret_uid) {
                 char lock_path[STRLEN("/run/systemd/dynamic-uid/") + DECIMAL_STR_MAX(uid_t) + 1];
                 _cleanup_close_ int lock_fd = -EBADF;
                 uid_t candidate;
-                ssize_t l;
+                uint64_t written;
 
                 if (--n_tries <= 0) /* Give up retrying eventually */
                         return -EBUSY;
@@ -235,29 +237,15 @@ static int pick_uid(char **suggested_paths, const char *name, uid_t *ret_uid) {
 
                 xsprintf(lock_path, "/run/systemd/dynamic-uid/" UID_FMT, candidate);
 
-                for (;;) {
-                        lock_fd = open(lock_path, O_CREAT|O_RDWR|O_NOFOLLOW|O_CLOEXEC|O_NOCTTY, 0600);
-                        if (lock_fd < 0)
-                                return -errno;
-
-                        r = flock(lock_fd, LOCK_EX|LOCK_NB); /* Try to get a BSD file lock on the UID lock file */
-                        if (r < 0) {
-                                if (errno == EAGAIN)
-                                        goto next; /* already in use */
-
-                                return -errno;
-                        }
-
-                        r = fd_verify_linked(lock_fd);
-                        if (r >= 0)
-                                break;
-                        if (r != -EIDRM)
-                                return r;
-
-                        /* Oh, bummer, we got the lock, but the file was unlinked between the time we opened it and
-                         * got the lock. Close it, and try again. */
-                        lock_fd = safe_close(lock_fd);
-                }
+                /* Try to get a BSD file lock on the UID lock file */
+                lock_fd = xopenat_lock_full(
+                                AT_FDCWD, lock_path,
+                                O_CREAT|O_RDWR|O_NOFOLLOW|O_NOCTTY, /* xopen_flags= */ 0, 0600,
+                                LOCK_BSD, LOCK_EX|LOCK_NB);
+                if (lock_fd == -EAGAIN)
+                        continue; /* already in use */
+                if (lock_fd < 0)
+                        return lock_fd;
 
                 /* Some superficial check whether this UID/GID might already be taken by some static user */
                 if (getpwuid_malloc(candidate, /* ret= */ NULL) >= 0 ||
@@ -268,24 +256,20 @@ static int pick_uid(char **suggested_paths, const char *name, uid_t *ret_uid) {
                 }
 
                 /* Let's store the user name in the lock file, so that we can use it for looking up the username for a UID */
-                l = pwritev(lock_fd,
-                            (struct iovec[2]) {
-                                    IOVEC_MAKE_STRING(name),
-                                    IOVEC_MAKE((char[1]) { '\n' }, 1),
-                            }, 2, 0);
-                if (l < 0) {
-                        r = -errno;
+                r = pwritev_full(lock_fd,
+                                 (struct iovec[2]) {
+                                         IOVEC_MAKE_STRING(name),
+                                         IOVEC_MAKE_BYTE('\n'),
+                                 }, 2, /* offset= */ 0, &written);
+                if (r < 0) {
                         (void) unlink(lock_path);
                         return r;
                 }
 
-                (void) ftruncate(lock_fd, l);
+                (void) ftruncate(lock_fd, written);
 
                 *ret_uid = candidate;
                 return TAKE_FD(lock_fd);
-
-        next:
-                ;
         }
 }
 
@@ -375,7 +359,7 @@ static int dynamic_user_realize(
                 /* Let's see if a proper, static user or group by this name exists. Try to take the lock on
                  * /etc/passwd, if that fails with EROFS then /etc is read-only. In that case it's fine if we don't
                  * take the lock, given that users can't be added there anyway in this case. */
-                r = etc_passwd_lock_fd = take_etc_passwd_lock(NULL);
+                r = etc_passwd_lock_fd = take_etc_passwd_lock(/* root= */ NULL);
                 if (r < 0 && r != -EROFS)
                         return r;
 
@@ -504,8 +488,7 @@ static DynamicUser* dynamic_user_unref(DynamicUser *d) {
          * destroyed and its UID released, use dynamic_user_destroy() instead. NB: the dynamic user table may
          * contain entries with no references, which is commonly the case right before a daemon reload. */
 
-        assert(d->n_ref > 0);
-        d->n_ref--;
+        ref_counter_dec(&d->n_ref);
 
         return NULL;
 }
@@ -605,10 +588,8 @@ void dynamic_user_deserialize_one(Manager *m, const char *value, FDSet *fds, Dyn
         /* Parse the serialization again, after a daemon reload */
 
         r = extract_many_words(&value, NULL, 0, &name, &s0, &s1);
-        if (r != 3 || !isempty(value)) {
-                log_debug("Unable to parse dynamic user line.");
-                return;
-        }
+        if (r != 3 || !isempty(value))
+                return (void) log_debug("Unable to parse dynamic user line.");
 
         fd0 = deserialize_fd(fds, s0);
         if (fd0 < 0)
@@ -619,16 +600,14 @@ void dynamic_user_deserialize_one(Manager *m, const char *value, FDSet *fds, Dyn
                 return;
 
         r = dynamic_user_add(m, name, (int[]) { fd0, fd1 }, ret);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to add dynamic user: %m");
-                return;
-        }
+        if (r < 0)
+                return (void) log_debug_errno(r, "Failed to add dynamic user: %m");
 
         TAKE_FD(fd0);
         TAKE_FD(fd1);
 
         if (ret) /* If the caller uses it directly, increment the refcount */
-                (*ret)->n_ref++;
+                ref_counter_inc(&(*ret)->n_ref);
 }
 
 void dynamic_user_vacuum(Manager *m, bool close_user) {
@@ -764,13 +743,13 @@ int dynamic_creds_realize(DynamicCreds *creds, char **suggested_paths, uid_t *ui
         /* Realize both the referenced user and group */
 
         if (creds->user) {
-                r = dynamic_user_realize(creds->user, suggested_paths, &u, &g, true);
+                r = dynamic_user_realize(creds->user, suggested_paths, &u, &g, /* is_user= */ true);
                 if (r < 0)
                         return r;
         }
 
         if (creds->group && creds->group != creds->user) {
-                r = dynamic_user_realize(creds->group, suggested_paths, NULL, &g, false);
+                r = dynamic_user_realize(creds->group, suggested_paths, /* ret_uid= */ NULL, &g, /* is_user= */ false);
                 if (r < 0)
                         return r;
         }

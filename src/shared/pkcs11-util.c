@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "ask-password-api.h"
 #include "crypto-util.h"
@@ -7,6 +9,8 @@
 #include "env-util.h"
 #include "escape.h"
 #include "format-table.h"
+#include "iovec-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "memory-util.h"
 #include "pkcs11-util.h"
@@ -34,6 +38,45 @@ bool pkcs11_uri_valid(const char *uri) {
                 return false;
 
         return true;
+}
+
+void pkcs11_luks2_token_done(Pkcs11Luks2Token *t) {
+        assert(t);
+
+        t->uri = mfree(t->uri);
+        iovec_done(&t->key);
+}
+
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_pkcs11_rsa_padding, Pkcs11RsaPadding, pkcs11_rsa_padding_from_string);
+
+int pkcs11_luks2_token_parse(sd_json_variant *v, Pkcs11Luks2Token *ret) {
+        _cleanup_(pkcs11_luks2_token_done) Pkcs11Luks2Token t = {
+                /* Old tokens do not have the "pkcs11-padding" field. They use PKCS#1 v1.5. */
+                .rsa_padding = PKCS11_RSA_PADDING_PKCS1V15,
+        };
+        int r;
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "pkcs11-uri",     SD_JSON_VARIANT_STRING, sd_json_dispatch_string,      offsetof(Pkcs11Luks2Token, uri),         SD_JSON_MANDATORY },
+                { "pkcs11-key",     SD_JSON_VARIANT_STRING, json_dispatch_unbase64_iovec, offsetof(Pkcs11Luks2Token, key),         SD_JSON_MANDATORY },
+                { "pkcs11-padding", SD_JSON_VARIANT_STRING, dispatch_pkcs11_rsa_padding,  offsetof(Pkcs11Luks2Token, rsa_padding), 0                 },
+                {}
+        };
+
+        assert(v);
+        assert(ret);
+
+        /* Parses the JSON of a "systemd-pkcs11" LUKS2 token */
+
+        r = sd_json_dispatch(v, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &t);
+        if (r < 0)
+                return r;
+
+        if (!pkcs11_uri_valid(t.uri) || t.rsa_padding < 0)
+                return -EINVAL;
+
+        *ret = TAKE_STRUCT(t);
+        return 0;
 }
 
 static const char* const pkcs11_rsa_padding_table[_PKCS11_RSA_PADDING_MAX] = {
@@ -304,7 +347,7 @@ int pkcs11_token_login(
         if (uri_result != P11_KIT_URI_OK)
                 return log_warning_errno(SYNTHETIC_ERRNO(EAGAIN), "Failed to format slot URI: %s", sym_p11_kit_uri_message(uri_result));
 
-        r = pkcs11_token_login_by_pin(m, session, token_info, token_label, /* pin= */ NULL, 0);
+        r = pkcs11_token_login_by_pin(m, session, token_info, token_label, /* pin= */ NULL, /* pin_size= */ 0);
         if (r == 0 && ret_used_pin)
                 *ret_used_pin = NULL;
 
@@ -561,7 +604,7 @@ int pkcs11_token_read_public_key(
                 if (!os)
                         return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Unable to decode CKA_EC_POINT.");
 
-                _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = sym_EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+                _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = sym_EVP_PKEY_CTX_new_from_name(/* libctx= */ NULL, "EC", /* propquery= */ NULL);
                 if (!ctx)
                         return log_openssl_errors(LOG_DEBUG, "Failed to create an EVP_PKEY_CTX for EC.");
 
@@ -573,7 +616,7 @@ int pkcs11_token_read_public_key(
                          * modified below. But we'll not modify ec_params[0]. */
                         OSSL_PARAM_octet_string(OSSL_PKEY_PARAM_PUB_KEY,
                                                 (unsigned char *) sym_ASN1_STRING_get0_data(os),
-                                                sym_ASN1_STRING_length(os)),
+                                                sym_ASN1_STRING_get_length(os)),
                 };
 
                 _cleanup_free_ void *order = NULL, *p = NULL, *a = NULL, *b = NULL, *generator = NULL;
@@ -637,7 +680,7 @@ int pkcs11_token_read_public_key(
                                 return log_openssl_errors(LOG_DEBUG, "Failed to store EC parameters in native byte order.");
 
                         const EC_POINT *point_gen = sym_EC_GROUP_get0_generator(group);
-                        generator_size = sym_EC_POINT_point2oct(group, point_gen, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, bnctx);
+                        generator_size = sym_EC_POINT_point2oct(group, point_gen, POINT_CONVERSION_UNCOMPRESSED, /* buf= */ NULL, /* len= */ 0, bnctx);
                         if (generator_size == 0)
                                 return log_openssl_errors(LOG_DEBUG, "Failed to determine size of a EC generator.");
 
@@ -717,7 +760,7 @@ int pkcs11_token_read_x509_certificate(
         if (!name)
                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Failed to acquire X.509 subject name.");
 
-        _cleanup_free_ char *t = sym_X509_NAME_oneline(name, NULL, 0);
+        _cleanup_free_ char *t = sym_X509_NAME_oneline(name, /* buf= */ NULL, /* size= */ 0);
         if (!t)
                 return log_openssl_errors(LOG_DEBUG, "Failed to format X.509 subject name as string.");
 
@@ -1042,7 +1085,7 @@ static int ecc_convert_to_compressed(
         if (sym_EC_POINT_oct2point(group, point, uncompressed_point, uncompressed_point_size, bnctx) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unable to decode an uncompressed EC point");
 
-        compressed_point_size = sym_EC_POINT_point2oct(group, point, POINT_CONVERSION_COMPRESSED, NULL, 0, bnctx);
+        compressed_point_size = sym_EC_POINT_point2oct(group, point, POINT_CONVERSION_COMPRESSED, /* buf= */ NULL, /* len= */ 0, bnctx);
         if (compressed_point_size == 0)
                 return log_openssl_errors(LOG_ERR, "Failed to determine size of a compressed EC point");
 
@@ -1329,7 +1372,7 @@ int pkcs11_token_acquire_rng(
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
                                        "Failed to generate RNG data on security token: %s", sym_p11_kit_strerror(rv));
 
-        r = random_write_entropy(-1, buffer, rps, false);
+        r = random_write_entropy(-1, buffer, rps, /* credit= */ false);
         if (r < 0)
                 return log_debug_errno(r, "Failed to write PKCS#11 acquired random data to /dev/urandom: %m");
 
@@ -1553,7 +1596,7 @@ int pkcs11_find_token(
                         return log_error_errno(r, "Failed to parse PKCS#11 URI '%s': %m", pkcs11_uri);
         }
 
-        modules = sym_p11_kit_modules_load_and_initialize(0);
+        modules = sym_p11_kit_modules_load_and_initialize(/* flags= */ 0);
         if (!modules)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to initialize pkcs11 modules");
 
@@ -1997,7 +2040,7 @@ int pkcs11_list_tokens(void) {
         if (!t)
                 return log_oom();
 
-        r = pkcs11_find_token(NULL, list_callback, t);
+        r = pkcs11_find_token(/* pkcs11_uri= */ NULL, list_callback, t);
         if (r < 0 && r != -EAGAIN)
                 return r;
 
@@ -2057,7 +2100,7 @@ int pkcs11_find_token_auto(char **ret) {
 #if HAVE_P11KIT
         int r;
 
-        r = pkcs11_find_token(NULL, auto_callback, ret);
+        r = pkcs11_find_token(/* pkcs11_uri= */ NULL, auto_callback, ret);
         if (r == -EAGAIN)
                 return log_error_errno(SYNTHETIC_ERRNO(ENODEV), "No suitable PKCS#11 tokens found.");
         if (r < 0)
@@ -2109,7 +2152,7 @@ int pkcs11_crypt_device_callback(
                         data->askpw_credential,
                         data->until,
                         data->askpw_flags,
-                        NULL);
+                        /* ret_used_pin= */ NULL);
         if (r < 0)
                 return r;
 

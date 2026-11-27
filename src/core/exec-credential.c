@@ -37,6 +37,8 @@
 #include "unit.h"
 #include "user-util.h"
 
+#define CREDENTIALS_WORKSPACE_DIRECTORY "systemd/temporary-credentials"
+
 ExecSetCredential* exec_set_credential_free(ExecSetCredential *sc) {
         if (!sc)
                 return NULL;
@@ -279,6 +281,25 @@ static int get_credential_directory(
         return 1;
 }
 
+static int get_credential_workspace(
+                const char *runtime_prefix,
+                const char *unit,
+                char **ret) {
+
+        char *p;
+
+        assert(runtime_prefix);
+        assert(unit);
+        assert(ret);
+
+        p = path_join(runtime_prefix, CREDENTIALS_WORKSPACE_DIRECTORY, unit);
+        if (!p)
+                return -ENOMEM;
+
+        *ret = p;
+        return 0;
+}
+
 int exec_context_get_credential_directory(
                 const ExecContext *context,
                 const ExecParameters *params,
@@ -298,6 +319,17 @@ int exec_context_get_credential_directory(
         return get_credential_directory(params->prefix[EXEC_DIRECTORY_RUNTIME], unit, ret);
 }
 
+int exec_context_destroy_credentials_workspace(const char *runtime_prefix, const char *unit) {
+        _cleanup_free_ char *workspace = NULL;
+        int r;
+
+        r = get_credential_workspace(runtime_prefix, unit, &workspace);
+        if (r < 0)
+                return r;
+
+        return rm_rf(workspace, REMOVE_ROOT|REMOVE_CHMOD|REMOVE_MISSING_OK);
+}
+
 int exec_context_destroy_credentials(const ExecContext *c, const char *runtime_prefix, const char *unit) {
         _cleanup_free_ char *p = NULL;
         int r;
@@ -312,6 +344,9 @@ int exec_context_destroy_credentials(const ExecContext *c, const char *runtime_p
          * unmount it, and afterwards remove the mount point */
         (void) umount2(p, MNT_DETACH|UMOUNT_NOFOLLOW);
         (void) rm_rf(p, REMOVE_ROOT|REMOVE_CHMOD);
+
+        /* The preparing child's cleanup does not run if it is killed. */
+        (void) exec_context_destroy_credentials_workspace(runtime_prefix, unit);
 
         return 0;
 }
@@ -423,9 +458,9 @@ static int write_credential(
         assert(id);
         assert(data || size == 0);
 
-        fd = openat(dfd, id, O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC, 0600);
+        fd = xopenat_full(dfd, id, O_CREAT|O_EXCL|O_WRONLY, /* xopen_flags= */ 0, 0600);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         r = loop_write(fd, data, size);
         if (r < 0)
@@ -601,7 +636,7 @@ static int load_credential_glob(
                                         UINT64_MAX,
                                         args->encrypted ? CREDENTIAL_ENCRYPTED_SIZE_MAX : CREDENTIAL_SIZE_MAX,
                                         flags,
-                                        NULL,
+                                        /* bind_name= */ NULL,
                                         &data, &size);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to read credential '%s': %m", *p);
@@ -701,7 +736,7 @@ static int load_credential(
                                         UINT64_MAX,
                                         maxsz,
                                         flags,
-                                        NULL,
+                                        /* bind_name= */ NULL,
                                         &data, &size);
                         if (r != -ENOENT)
                                 break;
@@ -836,11 +871,11 @@ static int acquire_credentials(
                  * propagate a credential passed to us from further up. */
 
                 if (path_is_absolute(lc->path)) {
-                        sub_fd = open(lc->path, O_DIRECTORY|O_CLOEXEC);
-                        if (sub_fd < 0 && !IN_SET(errno,
-                                                  ENOTDIR,  /* Not a directory */
-                                                  ENOENT))  /* Doesn't exist? */
-                                return log_debug_errno(errno, "Failed to open credential source '%s': %m", lc->path);
+                        sub_fd = xopenat(AT_FDCWD, lc->path, O_DIRECTORY);
+                        if (sub_fd < 0 && !IN_SET(sub_fd,
+                                                  -ENOTDIR,  /* Not a directory */
+                                                  -ENOENT))  /* Doesn't exist? */
+                                return log_debug_errno(sub_fd, "Failed to open credential source '%s': %m", lc->path);
                 }
 
                 if (sub_fd < 0)
@@ -965,7 +1000,7 @@ static int setup_credentials_plain_dir(
 
         /* Temporary workspace, that remains inaccessible all the time. We prepare stuff there before moving
          * it into place, so that users can't access half-initialized credential stores. */
-        t = path_join(context->runtime_prefix, "systemd/temporary-credentials");
+        t = path_join(context->runtime_prefix, CREDENTIALS_WORKSPACE_DIRECTORY);
         if (!t)
                 return -ENOMEM;
 
@@ -973,11 +1008,11 @@ static int setup_credentials_plain_dir(
         if (r < 0 && r != -EEXIST)
                 return r;
 
-        workspace = path_join(t, context->unit);
-        if (!workspace)
-                return -ENOMEM;
+        r = get_credential_workspace(context->runtime_prefix, context->unit, &workspace);
+        if (r < 0)
+                return r;
 
-        dfd = open_mkdir(workspace, O_CLOEXEC|O_EXCL, 0700);
+        dfd = open_mkdir(workspace, O_EXCL, 0700);
         if (dfd < 0)
                 return log_debug_errno(dfd, "Failed to create workspace for credentials: %m");
         workspace_rm = workspace;
@@ -992,9 +1027,9 @@ static int setup_credentials_plain_dir(
         if (r >= 0)
                 workspace_rm = NULL;
         if (IN_SET(r, -ENOTEMPTY, -EEXIST)) {
-                _cleanup_close_ int old_dfd = open(cred_dir, O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+                _cleanup_close_ int old_dfd = xopenat(AT_FDCWD, cred_dir, O_DIRECTORY|O_NOFOLLOW);
                 if (old_dfd < 0)
-                        return log_debug_errno(errno, "Failed to open credentials dir '%s': %m", cred_dir);
+                        return log_debug_errno(old_dfd, "Failed to open credentials dir '%s': %m", cred_dir);
 
                 (void) fd_acl_make_writable(old_dfd);
 
@@ -1059,7 +1094,7 @@ static int setup_credentials_internal(
         if (mfd < 0)
                 return log_debug_errno(mfd, "Failed to mount credentials fs: %m");
 
-        dfd = fd_reopen(mfd, O_DIRECTORY|O_CLOEXEC);
+        dfd = fd_reopen(mfd, O_DIRECTORY);
         if (dfd < 0)
                 return dfd;
 
@@ -1076,12 +1111,12 @@ static int setup_credentials_internal(
         // Work around a kernel bug that results in tmpfs reconfiguration failure.
         // FIXME: drop this once https://lore.kernel.org/linux-fsdevel/20251108190930.440685-1-me@yhndnzj.com/
         // is merged and hits the distro kernels.
-        (void) fsconfig(fs_fd, FSCONFIG_SET_FLAG, "noswap", NULL, 0);
+        (void) fsconfig(fs_fd, FSCONFIG_SET_FLAG, "noswap", /* value= */ NULL, /* aux= */ 0);
 
-        if (fsconfig(fs_fd, FSCONFIG_SET_FLAG, "ro", NULL, 0) < 0)
+        if (fsconfig(fs_fd, FSCONFIG_SET_FLAG, "ro", /* value= */ NULL, /* aux= */ 0) < 0)
                 return -errno;
 
-        if (fsconfig(fs_fd, FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) < 0)
+        if (fsconfig(fs_fd, FSCONFIG_CMD_RECONFIGURE, /* key= */ NULL, /* value= */ NULL, /* aux= */ 0) < 0)
                 return -errno;
 
         log_debug("Successfully reconfigured credentials fs to be read only.");

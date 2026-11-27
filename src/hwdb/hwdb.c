@@ -17,7 +17,7 @@ static bool arg_strict = false;
 COMMAND(
         "systemd-hwdb\0",
         "Update or query the hardware database.",
-        .man_pages = "systemd-hwdb(8)\0",
+        .man_page = "systemd-hwdb(8)",
 );
 
 VERB(verb_query, "query", "MODALIAS\0", 2, 2, 0,
@@ -32,7 +32,7 @@ static int verb_update(int argc, char *argv[], uintptr_t _data, void *userdata) 
         if (hwdb_bypass())
                 return 0;
 
-        return hwdb_update(arg_root, arg_hwdb_bin_dir, arg_strict, false);
+        return hwdb_update(arg_root, arg_hwdb_bin_dir, arg_strict, /* compat= */ false);
 }
 
 VERB_COMMON_HELP_AUTO_HIDDEN();

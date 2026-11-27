@@ -98,6 +98,8 @@ typedef struct Machine {
         char *ssh_private_key_path;
         char *control_address;
 
+        sd_future *ssh_agent;
+
         LIST_HEAD(Operation, operations);
 
         LIST_FIELDS(Machine, gc_queue);
@@ -108,6 +110,7 @@ int machine_link(Manager *manager, Machine *machine);
 Machine* machine_free(Machine *m);
 bool machine_may_gc(Machine *m, bool drop_not_started);
 void machine_add_to_gc_queue(Machine *m);
+int machine_determine_unit(Machine *m);
 int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error);
 int machine_stop(Machine *m);
 int machine_finalize(Machine *m);

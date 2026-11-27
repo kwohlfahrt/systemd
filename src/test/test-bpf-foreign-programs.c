@@ -123,11 +123,11 @@ static const Test same_prog_multi_option_1[] = {
 static int bpf_foreign_test_to_string(enum bpf_attach_type attach_type, const char *bpffs_path, char **ret_str) {
         const char *s = NULL;
 
-        assert_se(bpffs_path);
-        assert_se(ret_str);
+        ASSERT_NOT_NULL(bpffs_path);
+        ASSERT_NOT_NULL(ret_str);
 
-        assert_se(s = bpf_cgroup_attach_type_to_string(attach_type));
-        assert_se(*ret_str = strjoin(s, ":", bpffs_path));
+        ASSERT_NOT_NULL(s = bpf_cgroup_attach_type_to_string(attach_type));
+        ASSERT_NOT_NULL(*ret_str = strjoin(s, ":", bpffs_path));
 
         return 0;
 }
@@ -150,7 +150,7 @@ static int pin_programs(Unit *u, CGroupContext *cc, const Test *test_suite, size
         char log_buf[0xffff];
         int r;
 
-        assert_se(paths_ret);
+        ASSERT_NOT_NULL(paths_ret);
 
         for (size_t i = 0; i < test_suite_size; i++) {
                 _cleanup_(bpf_program_freep) BPFProgram *prog = NULL;
@@ -194,9 +194,9 @@ static int test_bpf_cgroup_programs(Manager *m, const char *unit_name, const Tes
         CGroupContext *cc = NULL;
         int cld_code, r;
 
-        assert_se(u = unit_new(m, sizeof(Service)));
-        assert_se(unit_add_name(u, unit_name) == 0);
-        assert_se(cc = unit_get_cgroup_context(u));
+        ASSERT_NOT_NULL(u = unit_new(m, sizeof(Service)));
+        ASSERT_OK_ZERO(unit_add_name(u, unit_name));
+        ASSERT_NOT_NULL(cc = unit_get_cgroup_context(u));
 
         r = pin_programs(u, cc, test_suite, test_suite_size, &bpffs_paths);
         if (r < 0)
@@ -209,7 +209,7 @@ static int test_bpf_cgroup_programs(Manager *m, const char *unit_name, const Tes
                         if (r < 0)
                                 return log_error_errno(r, "Failed to compose option string: %m");
                         r = config_parse_bpf_foreign_program(
-                                        u->id, "filename", 1, "Service", 1, test_suite[i].option_name, 0, option, cc, u);
+                                        u->id, "filename", 1, "Service", 1, test_suite[i].option_name, /* ltype= */ 0, option, cc, u);
 
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse option string '%s': %m", option);
@@ -223,7 +223,7 @@ static int test_bpf_cgroup_programs(Manager *m, const char *unit_name, const Tes
                                 paths = &cc->ip_filters_egress;
 
                         r = config_parse_ip_filter_bpf_progs(
-                                        u->id, "filename", 1, "Service", 1, test_suite[i].option_name, 0, option, paths, u);
+                                        u->id, "filename", 1, "Service", 1, test_suite[i].option_name, /* ltype= */ 0, option, paths, u);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse option string '%s': %m", option);
                 }
@@ -247,7 +247,7 @@ static int test_bpf_cgroup_programs(Manager *m, const char *unit_name, const Tes
         u->load_state = UNIT_LOADED;
 
         ASSERT_OK(unit_patch_contexts(u));
-        r = unit_start(u, NULL);
+        r = unit_start(u, /* details= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Unit start failed: %m");
 
@@ -268,42 +268,17 @@ static int test_bpf_cgroup_programs(Manager *m, const char *unit_name, const Tes
         return r;
 }
 
-int main(int argc, char *argv[]) {
+TEST(bpf_foreign_programs) {
         _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
         _cleanup_free_ char *unit_dir = NULL;
-        struct rlimit rl;
-        int r;
-
-        test_setup_logging(LOG_DEBUG);
-
-        if (detect_container() > 0)
-                return log_tests_skipped("test-bpf fails inside LXC and Docker containers: https://github.com/systemd/systemd/issues/9666");
-
-        if (getuid() != 0)
-                return log_tests_skipped("not running as root");
-
-        r = bpf_program_supported();
-        if (r < 0)
-                return log_tests_skipped_errno(r, "BPF programs not supported");
-
-        ASSERT_OK(getrlimit(RLIMIT_MEMLOCK, &rl));
-        rl.rlim_cur = rl.rlim_max = MAX(rl.rlim_max, CAN_MEMLOCK_SIZE);
-        (void) setrlimit_closest(RLIMIT_MEMLOCK, &rl);
-
-        if (!can_memlock())
-                return log_tests_skipped("Can't use mlock()");
-
-        r = enter_cgroup_subroot(NULL);
-        if (r == -ENOMEDIUM)
-                return log_tests_skipped("cgroupfs not available");
 
         ASSERT_OK(get_testdata_dir("units", &unit_dir));
         ASSERT_OK(setenv_unit_path(unit_dir));
-        assert_se(runtime_dir = setup_fake_runtime_dir());
+        ASSERT_NOT_NULL(runtime_dir = setup_fake_runtime_dir());
 
         ASSERT_OK(manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &m));
-        ASSERT_OK(manager_startup(m, NULL, NULL, NULL, NULL));
+        ASSERT_OK(manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, /* root= */ NULL));
 
         ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "single_prog.service", single_prog, ELEMENTSOF(single_prog)));
@@ -327,5 +302,35 @@ int main(int argc, char *argv[]) {
                                 "path_split_test.service",
                                 path_split_test,
                                 ELEMENTSOF(path_split_test)));
-        return 0;
 }
+
+static int intro(void) {
+        struct rlimit rl;
+        int r;
+
+        if (detect_container() > 0)
+                return log_tests_skipped("test-bpf fails inside LXC and Docker containers: https://github.com/systemd/systemd/issues/9666");
+
+        if (getuid() != 0)
+                return log_tests_skipped("not running as root");
+
+        r = bpf_program_supported();
+        if (r < 0)
+                return log_tests_skipped_errno(r, "BPF programs not supported");
+
+        ASSERT_OK(getrlimit(RLIMIT_MEMLOCK, &rl));
+        rl.rlim_cur = rl.rlim_max = MAX(rl.rlim_max, CAN_MEMLOCK_SIZE);
+        (void) setrlimit_closest(RLIMIT_MEMLOCK, &rl);
+
+        if (!can_memlock())
+                return log_tests_skipped("Can't use mlock()");
+
+        r = enter_cgroup_subroot(/* ret_cgroup= */ NULL);
+        if (r == -ENOMEDIUM)
+                return log_tests_skipped("cgroupfs not available");
+        ASSERT_OK(r);
+
+        return EXIT_SUCCESS;
+}
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

@@ -13,6 +13,12 @@ on:
     paths:
       - .github/workflows/coverage.yml
       - test/integration-tests/integration-test-wrapper.py
+  pull_request_target:
+    types: [closed]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -20,13 +26,15 @@ permissions:
 jobs:
   coverage:
     runs-on: ubuntu-24.04
-    if: github.repository == 'systemd/systemd' || github.repository == 'systemd/systemd-stable'
+    if: >
+      github.event_name != 'pull_request_target' &&
+      (github.repository == 'systemd/systemd' || github.repository == 'systemd/systemd-stable')
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: systemd/mkosi@71d7b67e01dc47ab5c51f24866c3e2195b9701d2
+      - uses: systemd/mkosi@f068490aa466533dd22d41fbd594d46b211d4367
 
       # Freeing up disk space with rm -rf can take multiple minutes. Since we don't need the extra free space
       # immediately, we remove the files in the background. However, we first move them to a different location

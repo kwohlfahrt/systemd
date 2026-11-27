@@ -132,10 +132,16 @@ int bus_seat_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
 
         assert(message);
 
+        const char *details[] = {
+                "seat", s->id,
+                "verb", "terminate",
+                NULL
+        };
+
         r = bus_verify_polkit_async(
                         message,
                         "org.freedesktop.login1.manage",
-                        /* details= */ NULL,
+                        details,
                         &s->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -147,7 +153,7 @@ int bus_seat_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_activate_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -169,7 +175,7 @@ static int method_activate_session(sd_bus_message *message, void *userdata, sd_b
         if (session->seat != s)
                 return sd_bus_error_setf(error, BUS_ERROR_SESSION_NOT_ON_SEAT, "Session %s not on seat %s", name, s->id);
 
-        r = check_polkit_chvt(message, s->manager, error);
+        r = check_polkit_chvt(message, s, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -179,7 +185,7 @@ static int method_activate_session(sd_bus_message *message, void *userdata, sd_b
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_switch_to(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -196,7 +202,7 @@ static int method_switch_to(sd_bus_message *message, void *userdata, sd_bus_erro
         if (to <= 0)
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid virtual terminal");
 
-        r = check_polkit_chvt(message, s->manager, error);
+        r = check_polkit_chvt(message, s, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -206,7 +212,7 @@ static int method_switch_to(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_switch_to_next(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -215,7 +221,7 @@ static int method_switch_to_next(sd_bus_message *message, void *userdata, sd_bus
 
         assert(message);
 
-        r = check_polkit_chvt(message, s->manager, error);
+        r = check_polkit_chvt(message, s, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -225,7 +231,7 @@ static int method_switch_to_next(sd_bus_message *message, void *userdata, sd_bus
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_switch_to_previous(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -234,7 +240,7 @@ static int method_switch_to_previous(sd_bus_message *message, void *userdata, sd
 
         assert(message);
 
-        r = check_polkit_chvt(message, s->manager, error);
+        r = check_polkit_chvt(message, s, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -244,7 +250,7 @@ static int method_switch_to_previous(sd_bus_message *message, void *userdata, sd
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int seat_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {

@@ -5,7 +5,6 @@
 
 #include "sd-id128.h"
 
-#include "bitfield.h"
 #include "forward.h"
 #include "pkcs11-padding.h"
 #include "rlimit-util.h"
@@ -152,11 +151,6 @@ typedef enum UserRecordLoadFlags {
         /* Whether an empty record is OK */
         USER_RECORD_EMPTY_OK            = 1U << 30,
 } UserRecordLoadFlags;
-
-static inline UserRecordLoadFlags USER_RECORD_REQUIRE(UserRecordMask m) {
-        assert((m & ~_USER_RECORD_MASK_MAX) == 0);
-        return m << 7;
-}
 
 static inline UserRecordLoadFlags USER_RECORD_ALLOW(UserRecordMask m) {
         assert((m & ~_USER_RECORD_MASK_MAX) == 0);
@@ -507,7 +501,7 @@ int per_machine_match(sd_json_variant *entry, sd_json_dispatch_flags_t flags);
 int user_group_record_mangle(sd_json_variant *v, UserRecordLoadFlags load_flags, sd_json_variant **ret_variant, UserRecordMask *ret_mask);
 
 #define BLOB_DIR_MAX_SIZE (UINT64_C(64) * U64_MB)
-int suitable_blob_filename(const char *name);
+bool suitable_blob_filename(const char *name);
 
 typedef struct UserDBMatch {
         char **fuzzy_names;
@@ -532,15 +526,6 @@ typedef struct UserDBMatch {
                 .uid_max = UID_INVALID-1,                       \
                 .uuid = SD_ID128_NULL,                          \
        }
-
-/* Maybe useful when we want to resolve root and system user/group but want to refuse nobody user/group. */
-#define USERDB_MATCH_ROOT_AND_SYSTEM                            \
-        (const UserDBMatch) {                                   \
-                .disposition_mask =                             \
-                        INDEXES_TO_MASK(uint64_t, USER_INTRINSIC, USER_SYSTEM), \
-                .uid_min = 0,                                   \
-                .uid_max = UID_NOBODY - 1,                      \
-        }
 
 bool userdb_match_is_set(const UserDBMatch *match) _pure_;
 

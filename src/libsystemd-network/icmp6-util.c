@@ -56,7 +56,7 @@ int icmp6_bind(int ifindex, bool is_router) {
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, false);
+        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, /* value= */ false);
         if (r < 0)
                 return r;
 
@@ -68,7 +68,7 @@ int icmp6_bind(int ifindex, bool is_router) {
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, true);
+        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, /* value= */ true);
         if (r < 0)
                 return r;
 
@@ -76,7 +76,7 @@ int icmp6_bind(int ifindex, bool is_router) {
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(s, SOL_SOCKET, SO_TIMESTAMP, true);
+        r = setsockopt_int(s, SOL_SOCKET, SO_TIMESTAMP, /* value= */ true);
         if (r < 0)
                 return r;
 
@@ -132,7 +132,8 @@ int icmp6_receive(
         };
         ssize_t len;
 
-        len = recvmsg_safe(fd, &msg, MSG_DONTWAIT);
+        /* Raw ICMPv6 sockets have no ports, the kernel always reports the source port as 0 */
+        len = recvmsg_safe_full(fd, &msg, MSG_DONTWAIT, RECVMSG_SAFE_ALLOW_PORT_ZERO);
         if (len < 0)
                 return (int) len;
 

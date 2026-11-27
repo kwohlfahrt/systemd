@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fcntl.h>
 #include <linux/blkpg.h>
 #include <linux/fs.h>
 #include <sys/file.h>
@@ -21,11 +22,14 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "macro.h"
 #include "os-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "string-util.h"
+#include "strv.h"
+
+/* Chunk size to use when writing zeroes manually, see blockdev_zero_out() */
+#define ZERO_OUT_BUFFER_SIZE (64U*U64_KB)
 
 static int fd_get_devnum(int fd, BlockDeviceLookupFlags flags, dev_t *ret) {
         struct stat st;
@@ -236,9 +240,9 @@ int block_device_new_from_path(const char *path, BlockDeviceLookupFlags flags, s
         assert(path);
         assert(ret);
 
-        fd = open(path, O_CLOEXEC|O_PATH);
+        fd = xopenat(AT_FDCWD, path, O_PATH);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return block_device_new_from_fd(fd, flags, ret);
 }
@@ -319,9 +323,9 @@ int get_block_device(const char *path, dev_t *ret) {
         assert(path);
         assert(ret);
 
-        fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOFOLLOW);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return get_block_device_fd(fd, ret);
 }
@@ -369,9 +373,9 @@ int get_block_device_harder(const char *path, dev_t *ret) {
         assert(path);
         assert(ret);
 
-        fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOFOLLOW);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return get_block_device_harder_fd(fd, ret);
 }
@@ -391,7 +395,7 @@ int lock_whole_block_device(dev_t devt, int open_flags, int operation) {
         if (r < 0)
                 return r;
 
-        lock_fd = device_open_from_devnum(S_IFBLK, whole_devt, open_flags|O_CLOEXEC|O_NONBLOCK|O_NOCTTY, NULL);
+        lock_fd = device_open_from_devnum(S_IFBLK, whole_devt, open_flags|O_NONBLOCK|O_NOCTTY, /* ret_devname= */ NULL);
         if (lock_fd < 0)
                 return lock_fd;
 
@@ -513,14 +517,14 @@ int blockdev_partscan_enabled_fd(int fd) {
 
         assert(fd >= 0);
 
-        r = block_device_new_from_fd(fd, 0, &dev);
+        r = block_device_new_from_fd(fd, /* flags= */ 0, &dev);
         if (r < 0)
                 return r;
 
         return blockdev_partscan_enabled(dev);
 }
 
-static int blockdev_is_encrypted(const char *sysfs_path, unsigned depth_left) {
+static int blockdev_is_encrypted(const char *sysfs_path, BlockDeviceEncryptedFlags flags, unsigned depth_left) {
         _cleanup_free_ char *p = NULL, *uuids = NULL;
         _cleanup_closedir_ DIR *d = NULL;
         int r, found_encrypted = false;
@@ -539,12 +543,26 @@ static int blockdev_is_encrypted(const char *sysfs_path, unsigned depth_left) {
                 if (r < 0)
                         return r;
 
-                /* The DM device's uuid attribute is prefixed with "CRYPT-" if this is a dm-crypt device. */
-                if (startswith(uuids, "CRYPT-"))
-                        return true;
+                /* The DM device's uuid attribute is prefixed with "CRYPT-" if the device has been set up
+                 * by libcryptsetup, followed by the type of the device. Standalone dm-integrity devices
+                 * ("CRYPT-INTEGRITY-") do not encrypt (and are not dm-verity either), hence never count
+                 * them. The same applies to internal helper devices libcryptsetup sets up below the actual
+                 * dm-crypt device ("CRYPT-SUBDEV-"), for example the dm-integrity device used for LUKS2
+                 * authenticated encryption: if such a device is used directly, nothing is encrypted.
+                 * Everything else except dm-verity is dm-crypt (LUKS, plain, BitLocker, TrueCrypt, …). */
+                const char *e = startswith(uuids, "CRYPT-");
+                if (e) {
+                        if (startswith(e, "VERITY-")) {
+                                if (FLAGS_SET(flags, BLOCK_DEVICE_ENCRYPTED_DM_VERITY))
+                                        return true;
+                        } else if (!STARTSWITH_SET(e, "INTEGRITY-", "SUBDEV-")) {
+                                if (FLAGS_SET(flags, BLOCK_DEVICE_ENCRYPTED_DM_CRYPT))
+                                        return true;
+                        }
+                }
         }
 
-        /* Not a dm-crypt device itself. But maybe it is on top of one? Follow the links in the "slaves/"
+        /* Not a matching device itself. But maybe it is on top of one? Follow the links in the "slaves/"
          * subdir. */
 
         p = mfree(p);
@@ -577,7 +595,7 @@ static int blockdev_is_encrypted(const char *sysfs_path, unsigned depth_left) {
                 if (!q)
                         return -ENOMEM;
 
-                r = blockdev_is_encrypted(q, depth_left - 1);
+                r = blockdev_is_encrypted(q, flags, depth_left - 1);
                 if (r < 0)
                         return r;
                 if (r == 0) /* we found one that is not encrypted? then propagate that immediately */
@@ -589,10 +607,21 @@ static int blockdev_is_encrypted(const char *sysfs_path, unsigned depth_left) {
         return found_encrypted;
 }
 
-int fd_is_encrypted(int fd) {
+int fd_is_encrypted(int fd, BlockDeviceEncryptedFlags flags) {
         char p[SYS_BLOCK_PATH_MAX("")];
         dev_t devt;
         int r;
+
+        assert(fd >= 0);
+
+        /* Checks whether the block device backing the file system the specified fd is located on is
+         * protected by dm-crypt and/or dm-verity, as selected by the flags parameter. A device passes the
+         * check if it is protected itself (the devices it is stacked on are not checked then), or if it is
+         * stacked on top of other block devices that all pass the check (recursively).
+         *
+         * Note that despite the name of this function, dm-verity devices pass the check too if
+         * BLOCK_DEVICE_ENCRYPTED_DM_VERITY is set in flags, even though dm-verity only authenticates and
+         * does not encrypt. */
 
         r = get_block_device_fd(fd, &devt);
         if (r < 0)
@@ -602,23 +631,22 @@ int fd_is_encrypted(int fd) {
 
         xsprintf_sys_block_path(p, NULL, devt);
 
-        return blockdev_is_encrypted(p, 10 /* safety net: maximum recursion depth */);
+        return blockdev_is_encrypted(p, flags, 10 /* safety net: maximum recursion depth */);
 }
 
-int path_is_encrypted(const char *path) {
-        char p[SYS_BLOCK_PATH_MAX("")];
-        dev_t devt;
-        int r;
+int path_is_encrypted(const char *path, BlockDeviceEncryptedFlags flags) {
+        _cleanup_close_ int fd = -EBADF;
 
-        r = get_block_device(path, &devt);
-        if (r < 0)
-                return r;
-        if (r == 0) /* doesn't have a block device */
-                return false;
+        assert(path);
 
-        xsprintf_sys_block_path(p, NULL, devt);
+        /* Note that despite the name, this also checks for dm-verity if the flags say so, see
+         * fd_is_encrypted() for details. */
 
-        return blockdev_is_encrypted(p, 10 /* safety net: maximum recursion depth */);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOFOLLOW);
+        if (fd < 0)
+                return fd;
+
+        return fd_is_encrypted(fd, flags);
 }
 
 int fd_get_whole_disk(int fd, bool backing, dev_t *ret) {
@@ -638,9 +666,9 @@ int fd_get_whole_disk(int fd, bool backing, dev_t *ret) {
 int path_get_whole_disk(const char *path, bool backing, dev_t *ret) {
         _cleanup_close_ int fd = -EBADF;
 
-        fd = open(path, O_CLOEXEC|O_PATH);
+        fd = xopenat(AT_FDCWD, path, O_PATH);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return fd_get_whole_disk(fd, backing, ret);
 }
@@ -766,7 +794,7 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
         assert(dev || fd >= 0);
 
         if (!dev) {
-                r = block_device_new_from_fd(fd, 0, &dev_unref);
+                r = block_device_new_from_fd(fd, /* flags= */ 0, &dev_unref);
                 if (r < 0)
                         return r;
 
@@ -778,7 +806,7 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
                 return r;
 
         if (fd < 0) {
-                fd_close = sd_device_open(dev, O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_RDONLY);
+                fd_close = device_open(dev, O_NONBLOCK|O_NOCTTY|O_RDONLY);
                 if (fd_close < 0)
                         return fd_close;
 
@@ -854,6 +882,139 @@ int blockdev_get_device_size(int fd, uint64_t *ret) {
         return 0;
 }
 
+static int write_zeroes(int fd, uint64_t offset, uint64_t size) {
+        _cleanup_free_ uint8_t *buffer = NULL;
+        size_t bufsz;
+
+        assert(fd >= 0);
+
+        if (size == 0)
+                return 0;
+
+        bufsz = MIN(size, ZERO_OUT_BUFFER_SIZE);
+        buffer = malloc0(bufsz);
+        if (!buffer)
+                return -ENOMEM;
+
+        while (size > 0) {
+                ssize_t n;
+
+                n = pwrite(fd, buffer, MIN(size, (uint64_t) bufsz), offset);
+                if (n < 0) {
+                        if (errno == EINTR)
+                                continue;
+
+                        return -errno;
+                }
+                if (n == 0)
+                        return -EIO;
+
+                assert((uint64_t) n <= size);
+                offset += n;
+                size -= n;
+        }
+
+        return 0;
+}
+
+int blockdev_zero_out(int fd, uint64_t offset, uint64_t size) {
+        struct stat st;
+        uint32_t ssz;
+        int r;
+
+        assert(fd >= 0);
+
+        /* Overwrites the specified range of a block device (or regular file) with zeroes. On block devices
+         * we try to make the kernel do the work via BLKZEROOUT, which it might be able to offload to the
+         * device. That ioctl operates on whole sectors only however, hence any incomplete sectors at the
+         * beginning and the end of the range are filled with explicit zeroes, and the aligned middle part is
+         * then handed to the ioctl. If that fails explicit zeroes are written for it too. On regular files
+         * (e.g. disk images) we punch a hole instead, which reads back as zeroes and keeps the file sparse;
+         * if the file system doesn't support that explicit zeroes are written as well.
+         *
+         * Note that the explicit writes to incomplete sectors rely on buffered I/O: the kernel then takes
+         * care of the read-modify-write of the affected sectors via the page cache. Hence this must not be
+         * used on fds opened with O_DIRECT. */
+
+        if (offset > UINT64_MAX - size)
+                return -EOVERFLOW;
+
+        if (fstat(fd, &st) < 0)
+                return -errno;
+
+        if (!IN_SET(st.st_mode & S_IFMT, S_IFREG, S_IFBLK))
+                return -ENOTBLK;
+
+        if (size == 0) /* check the size *after* validating the fd via fstat() */
+                return 0;
+
+        uint64_t end = offset + size;
+
+        if (S_ISREG(st.st_mode)) {
+                uint64_t file_size = st.st_size;
+
+                /* Punch a hole into the part of the range that is within the file. FALLOC_FL_KEEP_SIZE
+                 * means the file is not grown, hence the part beyond the end of the file is handled
+                 * separately below, by extending the file, which implicitly reads back as zeroes too. */
+                if (offset < file_size &&
+                    fallocate(fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, offset, MIN(size, file_size - offset)) < 0) {
+                        if (!ERRNO_IS_NOT_SUPPORTED(errno))
+                                return -errno;
+
+                        log_debug_errno(errno, "Failed to punch hole into regular file, writing zeroes manually: %m");
+                        return write_zeroes(fd, offset, size);
+                }
+
+                if (end > file_size && ftruncate(fd, end) < 0)
+                        return -errno;
+
+                return 0;
+        }
+
+        r = blockdev_get_sector_size(fd, &ssz);
+        if (r < 0)
+                return r;
+
+        uint64_t aligned_start = ROUND_UP(offset, ssz),
+                aligned_end = ALIGN_DOWN_U64(end, ssz);
+
+        if (aligned_start >= aligned_end) /* Range doesn't cover a single full sector? Then write it all manually */
+                return write_zeroes(fd, offset, size);
+
+        /* Fill up the incomplete sector at the beginning */
+        r = write_zeroes(fd, offset, aligned_start - offset);
+        if (r < 0)
+                return r;
+
+        /* Now let the kernel zero out the aligned part in the middle, if it can */
+        uint64_t range[] = { aligned_start, aligned_end - aligned_start };
+        r = RET_NERRNO(ioctl(fd, BLKZEROOUT, range));
+        if (r == -EBUSY) {
+                /* If another partition is in use, our payload and incomplete-sector writes may prevent
+                 * the kernel from invalidating dirty pages. Synchronize them and retry once to retain
+                 * offloading before falling back to buffered writes. */
+                log_debug_errno(r, "Failed to zero out block device via BLKZEROOUT, synchronizing and retrying: %m");
+
+                if (fdatasync(fd) < 0)
+                        return log_debug_errno(errno, "Failed to synchronize block device before zeroing out: %m");
+
+                r = RET_NERRNO(ioctl(fd, BLKZEROOUT, range));
+        }
+        if (r < 0) {
+                if (!ERRNO_IS_NOT_SUPPORTED(r) && r != -EBUSY)
+                        return log_debug_errno(r, "Failed to zero out block device via BLKZEROOUT: %m");
+
+                log_debug_errno(r, "Failed to zero out block device via BLKZEROOUT, writing zeroes manually: %m");
+
+                r = write_zeroes(fd, aligned_start, aligned_end - aligned_start);
+                if (r < 0)
+                        return r;
+        }
+
+        /* And finally fill the incomplete sector at the end */
+        return write_zeroes(fd, aligned_end, end - aligned_end);
+}
+
 int blockdev_get_root(int level, dev_t *ret) {
         _cleanup_free_ char *p = NULL;
         dev_t devno;
@@ -880,9 +1041,7 @@ int blockdev_get_root(int level, dev_t *ret) {
                                 return log_full_errno(level, r, "Failed to determine block device of /usr/ file system: %m");
                         if (r == 0) { /* Not backed by a single block device, we might be looking at a sysext overlay */
                                 r = extension_overlay_block("/usr", IMAGE_SYSEXT, &devno);
-                                if (IN_SET(r, -ENOENT, -ENOTTY))
-                                        r = 0; /* no sysext overlay metadata */
-                                else if (r < 0)
+                                if (r < 0)
                                         return log_full_errno(level, r, "Failed to determine backing device of /usr/ extension overlay: %m");
                         }
                         if (r == 0) { /* /usr/ not backed by single block device, either. */

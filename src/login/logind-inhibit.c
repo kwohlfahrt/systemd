@@ -9,7 +9,6 @@
 
 #include "alloc-util.h"
 #include "env-file.h"
-#include "errno-util.h"
 #include "escape.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -96,13 +95,13 @@ static int inhibitor_save(Inhibitor *i) {
 
         assert(i);
 
-        r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, MKDIR_WARN_MODE);
+        r = mkdir_safe_label("/run/systemd/inhibit", 0755, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /run/systemd/inhibit/: %m");
 
         _cleanup_(unlink_and_freep) char *temp_path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        r = fopen_tmpfile_linkable(i->state_file, O_WRONLY|O_CLOEXEC, &temp_path, &f);
+        r = fopen_tmpfile_linkable(i->state_file, O_WRONLY, &temp_path, &f);
         if (r < 0)
                 return log_error_errno(r, "Failed to create state file '%s': %m", i->state_file);
 
@@ -128,12 +127,12 @@ static int inhibitor_save(Inhibitor *i) {
 
         /* For historical reasons there's double escaping applied here: once here via cescape(), and once by
          * env_file_fputs_assignment() */
-        _cleanup_free_ char *who_escaped = cescape(i->who);
+        _cleanup_free_ char *who_escaped = cescape(strempty(i->who));
         if (!who_escaped)
                 return log_oom();
         env_file_fputs_assignment(f, "WHO=", who_escaped);
 
-        _cleanup_free_ char *why_escaped = cescape(i->why);
+        _cleanup_free_ char *why_escaped = cescape(strempty(i->why));
         if (!why_escaped)
                 return log_oom();
         env_file_fputs_assignment(f, "WHY=", why_escaped);
@@ -253,7 +252,7 @@ int inhibitor_load(Inhibitor *i) {
         }
 
         if (who) {
-                l = cunescape(who, 0, &cc);
+                l = cunescape(who, /* flags= */ 0, &cc);
                 if (l < 0)
                         return log_debug_errno(l, "Failed to unescape \"who\" of inhibitor: %m");
 
@@ -261,7 +260,7 @@ int inhibitor_load(Inhibitor *i) {
         }
 
         if (why) {
-                l = cunescape(why, 0, &cc);
+                l = cunescape(why, /* flags= */ 0, &cc);
                 if (l < 0)
                         return log_debug_errno(l, "Failed to unescape \"why\" of inhibitor: %m");
 
@@ -299,7 +298,7 @@ int inhibitor_create_fifo(Inhibitor *i) {
 
         /* Create FIFO */
         if (!i->fifo_path) {
-                r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, MKDIR_WARN_MODE);
+                r = mkdir_safe_label("/run/systemd/inhibit", 0755, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
                 if (r < 0)
                         return r;
 
@@ -313,13 +312,13 @@ int inhibitor_create_fifo(Inhibitor *i) {
 
         /* Open reading side */
         if (i->fifo_fd < 0) {
-                i->fifo_fd = open(i->fifo_path, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
+                i->fifo_fd = xopenat(AT_FDCWD, i->fifo_path, O_RDONLY|O_NONBLOCK);
                 if (i->fifo_fd < 0)
-                        return -errno;
+                        return i->fifo_fd;
         }
 
         if (!i->event_source) {
-                r = sd_event_add_io(i->manager->event, &i->event_source, i->fifo_fd, 0, inhibitor_dispatch_fifo, i);
+                r = sd_event_add_io(i->manager->event, &i->event_source, i->fifo_fd, /* events= */ 0, inhibitor_dispatch_fifo, i);
                 if (r < 0)
                         return r;
 
@@ -331,7 +330,7 @@ int inhibitor_create_fifo(Inhibitor *i) {
         }
 
         /* Open writing side */
-        return RET_NERRNO(open(i->fifo_path, O_WRONLY|O_CLOEXEC|O_NONBLOCK));
+        return xopenat(AT_FDCWD, i->fifo_path, O_WRONLY|O_NONBLOCK);
 }
 
 static void inhibitor_remove_fifo(Inhibitor *i) {

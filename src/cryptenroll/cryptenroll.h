@@ -11,6 +11,7 @@ typedef enum EnrollType {
         ENROLL_PKCS11,
         ENROLL_FIDO2,
         ENROLL_TPM2,
+        ENROLL_TPM2_WITH_FIDO2,
         _ENROLL_TYPE_MAX,
         _ENROLL_TYPE_INVALID = -EINVAL,
 } EnrollType;
@@ -20,6 +21,7 @@ typedef enum UnlockType {
         UNLOCK_KEYFILE,
         UNLOCK_FIDO2,
         UNLOCK_TPM2,
+        UNLOCK_TPM2_WITH_FIDO2,
         UNLOCK_EMPTY,
         UNLOCK_HEADLESS,
         _UNLOCK_TYPE_MAX,
@@ -44,6 +46,8 @@ typedef enum Tpm2WithPin {
 
 DECLARE_STRING_TABLE_LOOKUP(enroll_type, EnrollType);
 DECLARE_STRING_TABLE_LOOKUP(luks2_token_type, EnrollType);
+
+EnrollType luks2_token_type_from_json(sd_json_variant *v);
 
 /* A single bag of parameters consumed by the enrollment helpers. Populated either from the command line
  * (see enroll_context_from_args() in cryptenroll.c), from a Varlink request (see cryptenroll-varlink.c),
@@ -89,6 +93,7 @@ typedef struct EnrollContext {
         Tpm2PCRValue *tpm2_hash_pcr_values;
         size_t tpm2_n_hash_pcr_values;
         Tpm2WithPin tpm2_pin;
+        bool tpm2_fido2;
         Argon2IdParameters tpm2_argon2id_params;
         usec_t tpm2_argon2id_iter_time;
         char *tpm2_public_key;
@@ -140,3 +145,5 @@ int prepare_luks(const EnrollContext *c, struct crypt_device **ret_cd, struct io
  * was added to. For ENROLL_RECOVERY the generated key is returned via ret_recovery_key (if non-NULL).
  * Defined in cryptenroll.c, shared by the command line and Varlink code paths. */
 int enroll_now(const EnrollContext *c, struct crypt_device *cd, const struct iovec *volume_key, char **ret_recovery_key);
+
+int determine_default_node(char **ret_node);

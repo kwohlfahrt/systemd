@@ -10,12 +10,15 @@
 #include "alloc-util.h"
 #include "capability-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "id128-util.h"
 #include "path-util.h"
 #include "rm-rf.h"
+#include "strv.h"
 #include "tests.h"
 #include "time-util.h"
 #include "tmpfile-util.h"
+#include "virt.h"
 
 #define ID128_WALDI SD_ID128_MAKE(01, 02, 03, 04, 05, 06, 07, 08, 09, 0a, 0b, 0c, 0d, 0e, 0f, 10)
 #define STR_WALDI "0102030405060708090a0b0c0d0e0f10"
@@ -42,7 +45,7 @@ TEST(id128) {
         ASSERT_FALSE(sd_id128_in_set(id, ID128_WALDI));
         ASSERT_FALSE(sd_id128_in_set(id, ID128_WALDI, ID128_WALDI));
 
-        if (sd_booted() > 0 && sd_id128_get_machine(NULL) >= 0) {
+        if (sd_booted() > 0 && sd_id128_get_machine(/* ret= */ NULL) >= 0) {
                 ASSERT_OK(sd_id128_get_machine(&id));
                 printf("machine: %s\n", sd_id128_to_string(id, t));
 
@@ -104,7 +107,7 @@ TEST(id128) {
         ASSERT_FALSE(id128_is_valid("01020304-0506-0708-090a0b0c0d0e0f10"));
         ASSERT_FALSE(id128_is_valid("010203040506-0708-090a-0b0c0d0e0f10"));
 
-        fd = open_tmpfile_unlinkable(NULL, O_RDWR|O_CLOEXEC);
+        fd = open_tmpfile_unlinkable(/* directory= */ NULL, O_RDWR);
         ASSERT_OK(fd);
 
         /* First, write as UUID */
@@ -173,32 +176,32 @@ TEST(id128) {
         ASSERT_OK_ERRNO(ftruncate(fd, 0));
         ASSERT_EQ(write(fd, "uninitialized", STRLEN("uninitialized")), (ssize_t) STRLEN("uninitialized"));
         ASSERT_OK_ERRNO(lseek(fd, 0, SEEK_SET));
-        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, NULL), ENOPKG);
+        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, /* ret= */ NULL), ENOPKG);
 
         ASSERT_OK_ERRNO(lseek(fd, 0, SEEK_SET));
         ASSERT_OK_ERRNO(ftruncate(fd, 0));
         ASSERT_EQ(write(fd, "uninitialized\n", STRLEN("uninitialized\n")), (ssize_t) STRLEN("uninitialized\n"));
         ASSERT_OK_ERRNO(lseek(fd, 0, SEEK_SET));
-        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, NULL), ENOPKG);
+        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, /* ret= */ NULL), ENOPKG);
 
         ASSERT_OK_ERRNO(lseek(fd, 0, SEEK_SET));
         ASSERT_OK_ERRNO(ftruncate(fd, 0));
         ASSERT_EQ(write(fd, "uninitialized\nfoo", STRLEN("uninitialized\nfoo")), (ssize_t) STRLEN("uninitialized\nfoo"));
         ASSERT_OK_ERRNO(lseek(fd, 0, SEEK_SET));
-        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, NULL), EUCLEAN);
+        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, /* ret= */ NULL), EUCLEAN);
 
         ASSERT_OK_ERRNO(lseek(fd, 0, SEEK_SET));
         ASSERT_OK_ERRNO(ftruncate(fd, 0));
         ASSERT_EQ(write(fd, "uninit", STRLEN("uninit")), (ssize_t) STRLEN("uninit"));
         ASSERT_OK_ERRNO(lseek(fd, 0, SEEK_SET));
-        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, NULL), EUCLEAN);
+        ASSERT_ERROR(id128_read_fd(fd, ID128_FORMAT_ANY, /* ret= */ NULL), EUCLEAN);
 
         /* build/systemd-id128 -a f03daaeb1c334b43a732172944bf772e show 51df0b4bc3b04c9780e299b98ca373b8 */
         ASSERT_OK(sd_id128_get_app_specific(SD_ID128_MAKE(51,df,0b,4b,c3,b0,4c,97,80,e2,99,b9,8c,a3,73,b8),
                                             SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id));
         ASSERT_EQ_ID128(id, SD_ID128_MAKE(1d,ee,59,54,e7,5c,4d,6f,b9,6c,c6,c0,4c,a1,8a,86));
 
-        if (sd_booted() > 0 && sd_id128_get_machine(NULL) >= 0) {
+        if (sd_booted() > 0 && sd_id128_get_machine(/* ret= */ NULL) >= 0) {
                 ASSERT_OK(sd_id128_get_machine_app_specific(SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id));
                 ASSERT_OK(sd_id128_get_machine_app_specific(SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id2));
                 ASSERT_EQ_ID128(id, id2);
@@ -207,8 +210,10 @@ TEST(id128) {
         }
 
         /* Check return values */
-        ASSERT_RETURN_EXPECTED_SE(sd_id128_get_app_specific(SD_ID128_ALLF, SD_ID128_NULL, &id) == -ENXIO);
-        ASSERT_RETURN_EXPECTED_SE(sd_id128_get_app_specific(SD_ID128_NULL, SD_ID128_ALLF, &id) == 0);
+        ASSERT_RETURN_EXPECTED(
+                        ASSERT_ERROR(sd_id128_get_app_specific(SD_ID128_ALLF, SD_ID128_NULL, &id), ENXIO));
+        ASSERT_RETURN_EXPECTED(
+                        ASSERT_OK_ZERO(sd_id128_get_app_specific(SD_ID128_NULL, SD_ID128_ALLF, &id)));
 }
 
 TEST(sd_id128_get_invocation) {
@@ -257,7 +262,7 @@ TEST(benchmark_sd_id128_get_machine_app_specific) {
         unsigned iterations = slow_tests_enabled() ? 1000000 : 1000;
         usec_t t, q;
 
-        if (sd_id128_get_machine(NULL) < 0)
+        if (sd_id128_get_machine(/* ret= */ NULL) < 0)
                 return (void) log_tests_skipped("/etc/machine-id is not initialized");
 
         log_info("/* %s (%u iterations) */", __func__, iterations);
@@ -283,7 +288,7 @@ TEST(id128_at) {
         _cleanup_free_ char *p = NULL;
         sd_id128_t id, i;
 
-        tfd = mkdtemp_open(NULL, O_PATH, &t);
+        tfd = mkdtemp_open(/* template= */ NULL, O_PATH, &t);
         ASSERT_OK(tfd);
         ASSERT_OK_ERRNO(mkdirat(tfd, "etc", 0755));
         ASSERT_OK_ERRNO(symlinkat("etc", tfd, "etc2"));
@@ -299,7 +304,7 @@ TEST(id128_at) {
         ASSERT_OK_ERRNO(unlinkat(tfd, "etc/machine-id", 0));
         ASSERT_OK(id128_write_at(tfd, "etc2/machine-id", ID128_FORMAT_PLAIN, id));
         ASSERT_OK_ERRNO(unlinkat(tfd, "etc/machine-id", 0));
-        ASSERT_ERROR(id128_write_at(tfd, "etc/hoge-id", ID128_FORMAT_PLAIN, id), EEXIST);
+        ASSERT_ERROR(id128_write_at(tfd, "etc/hoge-id", ID128_FORMAT_PLAIN, id), ELOOP); /* dangling symlink */
         ASSERT_OK(id128_write_at(tfd, "etc2/machine-id", ID128_FORMAT_PLAIN, id));
 
         /* id128_read_at() */
@@ -363,7 +368,7 @@ TEST(ID128_REFUSE_NULL) {
         _cleanup_close_ int tfd = -EBADF;
         sd_id128_t id;
 
-        tfd = mkdtemp_open(NULL, O_PATH, &t);
+        tfd = mkdtemp_open(/* template= */ NULL, O_PATH, &t);
         ASSERT_OK(tfd);
 
         ASSERT_ERROR(id128_write_at(tfd, "zero-id", ID128_FORMAT_PLAIN | ID128_REFUSE_NULL, (sd_id128_t) {}), ENOMEDIUM);
@@ -376,6 +381,49 @@ TEST(ID128_REFUSE_NULL) {
         ASSERT_EQ_ID128(id, SD_ID128_NULL);
 
         ASSERT_ERROR(id128_read_at(tfd, "zero-id", ID128_FORMAT_PLAIN | ID128_REFUSE_NULL, &id), ENOMEDIUM);
+}
+
+TEST(id128_get_fs_uuid) {
+        sd_id128_t a, b;
+        int r;
+
+        FOREACH_STRING(p, "/", "/var/", "/tmp/") {
+                r = ASSERT_OK_OR(id128_get_fs_uuid(p, &a), -EOPNOTSUPP, -EADDRNOTAVAIL, -ENOENT);
+                if (r < 0) {
+                        log_info_errno(r, "File system UUID of '%s' not available: %m", p);
+                        continue;
+                }
+                ASSERT_FALSE(sd_id128_is_null(a));
+
+                _cleanup_close_ int fd = ASSERT_OK(xopenat(AT_FDCWD, p, O_RDONLY|O_DIRECTORY));
+                ASSERT_OK(id128_get_fs_uuid_fd(fd, &b));
+                ASSERT_EQ_ID128(a, b);
+
+                log_info("File system UUID of '%s': " SD_ID128_UUID_FORMAT_STR, p, SD_ID128_FORMAT_VAL(a));
+        }
+
+        /* procfs does not set a file system UUID, hence the kernel refuses FS_IOC_GETFSUUID with ENOTTY,
+         * which we map to -EOPNOTSUPP */
+        ASSERT_ERROR(id128_get_fs_uuid("/proc/", &a), EOPNOTSUPP);
+}
+
+TEST(id128_get_var_fs_uuid) {
+        sd_id128_t a, b;
+        int r;
+
+        /* In containers the file system backing /var/ is typically owned by the host, hence must be
+         * refused */
+        if (ASSERT_OK(detect_container()) > 0) {
+                ASSERT_ERROR(id128_get_var_fs_uuid(&a), ENOENT);
+                return;
+        }
+
+        r = ASSERT_OK_OR(id128_get_var_fs_uuid(&a), -EOPNOTSUPP, -EADDRNOTAVAIL, -ENOENT);
+        if (r < 0)
+                return (void) log_tests_skipped_errno(r, "File system UUID of /var/ not available");
+
+        ASSERT_OK(id128_get_fs_uuid("/var/", &b));
+        ASSERT_EQ_ID128(a, b);
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

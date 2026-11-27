@@ -589,6 +589,7 @@ testcase_07_22229() {
         "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
         "hello.invalid"
         "hello.alt"
+        "hello.onion"
     )
 
     for name in "${FILTERED_NAMES[@]}"; do
@@ -696,6 +697,10 @@ testcase_08_resolved() {
 
     # without name
     run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveService '{"type":"_mysvc._tcp","domain":"signed.test"}'
+    # A full service name in domain also works with explicitly null name and type.
+    run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveService \
+        '{"name":null,"type":null,"domain":"_mysvc._tcp.signed.test"}'
+    jq -e 'any(.services[]; .hostname == "myservice.signed.test" and .port == 1234)' "$RUN_OUT"
     # without txt (SD_RESOLVE_NO_TXT)
     run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveService '{"type":"_mysvc._tcp","domain":"signed.test","flags":64}'
     (! grep -qF '"txt"' "$RUN_OUT")
@@ -730,6 +735,12 @@ testcase_08_resolved() {
     grep -qF '"data":"' "$RUN_OUT"
     (! run resolvectl openpgp mr.smith@signed.test --json=short --type=A)
     grep -qF -- "The openpgp command may only be combined with --type=OPENPGPKEY." "$RUN_OUT"
+    (! run resolvectl openpgp nobody@signed.test)
+    grep -qF "6382b3cc881412b77bfcaeed026001c00d9e3025e66c20f6e7e92f07._openpgpkey.signed.test" "$RUN_OUT"
+    (! grep -qF "efc75004" "$RUN_OUT")
+    (! run resolvectl openpgp nobody@signed.test --json=short)
+    grep -qF "6382b3cc881412b77bfcaeed026001c00d9e3025e66c20f6e7e92f07._openpgpkey.signed.test" "$RUN_OUT"
+    (! grep -qF "efc75004" "$RUN_OUT")
     (! run resolvectl tlsa tcp)
     grep -qF -- "The tlsa command requires at least one domain." "$RUN_OUT"
     (! run resolvectl tlsa signed.test:invalid --json=short)
@@ -998,20 +1009,61 @@ testcase_09_resolvectl_showcache() {
 }
 
 testcase_10_resolvectl_json() {
-    local status_json
+    local expected_pid has_cgroup_id=false expect_peer_pidfd=false since_ts status_json tcp_id udp_id
 
     # Cleanup
     # shellcheck disable=SC2317,SC2329
     cleanup() {
-        rm -f /run/systemd/resolved.conf.d/90-fallback.conf
+        rm -f /run/test-monitor-client.pid /run/systemd/resolved.conf.d/{90-fallback,90-monitor}.conf
         systemctl reload systemd-resolved.service
         resolvectl revert dns0
     }
 
     trap cleanup RETURN ERR
 
+    if systemd-analyze compare-versions "$(uname -r)" ge 6.13; then
+        has_cgroup_id=true
+    fi
+
+    if systemd-analyze compare-versions "$(uname -r)" ge 6.5; then
+        expect_peer_pidfd=true
+    fi
+
+    {
+        echo "[Resolve]"
+        echo "DNSStubListenerExtra=udp:127.0.0.155:9953"
+    } >/run/systemd/resolved.conf.d/90-monitor.conf
+    systemctl reload systemd-resolved.service
+
+    since_ts="$(date '+%F %T.%N')"
+    systemd-run --unit=resolved-monitor-client --collect --wait --expand-environment=no \
+        sh -c 'echo $$ >/run/test-monitor-client.pid; exec resolvectl query unsigned.test'
+    expected_pid="$(</run/test-monitor-client.pid)"
+    # Parse the query ID from dig's reply. Newer dig versions support
+    # +qid=12345, but CentOS 9's dig does not. Consider using +qid
+    # once the CentOS 9 suite is dropped.
+    udp_id="$(dig @127.0.0.155 -p 9953 unsigned.test. A |
+        sed -nE 's/^;; ->>HEADER<<-.* id: ([0-9]+)[[:space:]]*$/\1/p')"
+    tcp_id="$(dig +tcp @127.0.0.53 unsigned.test. A |
+        sed -nE 's/^;; ->>HEADER<<-.* id: ([0-9]+)[[:space:]]*$/\1/p')"
+    [[ "$udp_id" =~ ^[0-9]+$ ]]
+    [[ "$tcp_id" =~ ^[0-9]+$ ]]
+    busctl call org.freedesktop.resolve1 /org/freedesktop/resolve1 \
+        org.freedesktop.resolve1.Manager ResolveService isssit 0 '' _mysvc._tcp signed.test 0 0
+
     # Issue: https://github.com/systemd/systemd/issues/29580 (part #1)
     dig @127.0.0.54 signed.test
+
+    monitor_check_rr "$since_ts" '[[:space:]]signed[.]test IN A 10[.]0[.]0[.]10$'
+    (
+        set +o pipefail
+        timeout -v 30s journalctl -p info -o cat _SYSTEMD_UNIT=resolvectl-monitor-json.service --since "$since_ts" -f |
+            jq -ne 'first(inputs | select(
+                any(.question[]?; .name == "signed.test") and
+                .client.transport == "stub_udp" and
+                .client.listenerAddress == [127, 0, 0, 54] and
+                .client.listenerPort == 53) | true) // false' >/dev/null
+    )
 
     systemctl stop resolvectl-monitor.service
     systemctl stop resolvectl-monitor-json.service
@@ -1030,6 +1082,58 @@ testcase_10_resolvectl_json() {
         echo "$line" | jq -e '[. | .question, (select(has("answer")) | .answer) | type == "array"] | all'
     done
 
+    journalctl -p info -o cat _SYSTEMD_UNIT="resolvectl-monitor-json.service" --since "$since_ts" |
+        jq -e -s --argjson pid "$expected_pid" --argjson expect_peer_pidfd "$expect_peer_pidfd" --argjson has_cg "$has_cgroup_id" \
+            --argjson udp_id "$udp_id" --argjson tcp_id "$tcp_id" '
+            2 as $AF_INET |
+            any(.[];
+                any(.question[]?; .name == "unsigned.test") and
+                .client.transport == "varlink" and
+                .client.pid.pid == $pid and
+                .client.uid == 0 and
+                (($expect_peer_pidfd | not) or (
+                    (($has_cg | not) or .client.controlGroupId > 0) and
+                    .client.controlGroup == "/system.slice/resolved-monitor-client.service" and
+                    .client.commandLine == ["resolvectl", "query", "unsigned.test"]))) and
+            any(.[];
+                any(.question[]?; .name == "unsigned.test") and
+                .state == "success" and
+                .client.transport == "stub_udp" and
+                .client.family == $AF_INET and
+                .client.address == [127, 0, 0, 1] and
+                .client.port > 0 and
+                .client.listenerAddress == [127, 0, 0, 155] and
+                .client.listenerPort == 9953 and
+                .client.dnsPacketId == $udp_id) and
+            any(.[];
+                any(.question[]?; .name == "unsigned.test") and
+                .state == "success" and
+                .client.transport == "stub_tcp" and
+                .client.family == $AF_INET and
+                .client.address == [127, 0, 0, 1] and
+                .client.port > 0 and
+                .client.listenerAddress == [127, 0, 0, 53] and
+                .client.listenerPort == 53 and
+                .client.dnsPacketId == $tcp_id) and
+            any(.[];
+                any(.question[]?;
+                    .name == "myservice.signed.test" and (.type == 1 or .type == 28)) and
+                .state == "success" and
+                .client == {"transport": "dbus"}) and
+            any(.[];
+                any(.question[]?; .name == "signed.test") and
+                .client.transport == "stub_udp" and
+                .client.listenerAddress == [127, 0, 0, 54] and
+                .client.listenerPort == 53)'
+
+    journalctl -p info -o cat _SYSTEMD_UNIT="resolvectl-monitor.service" --since "$since_ts" |
+        grep -F "O: varlink pid=${expected_pid} uid=0" >/dev/null
+    if "$expect_peer_pidfd"; then
+        journalctl -p info -o cat _SYSTEMD_UNIT="resolvectl-monitor.service" --since "$since_ts" |
+            grep -F "O: varlink pid=${expected_pid} uid=0 cgroup=/system.slice/resolved-monitor-client.service" >/dev/null
+    fi
+    journalctl -p info -o cat _SYSTEMD_UNIT="resolvectl-monitor.service" --since "$since_ts" | grep "O: stub_udp 127.0.0.1:" >/dev/null
+    journalctl -p info -o cat _SYSTEMD_UNIT="resolvectl-monitor.service" --since "$since_ts" | grep "O: stub_tcp 127.0.0.1:" >/dev/null
 
     # Test some global-only settings.
     mkdir -p /run/systemd/resolved.conf.d
@@ -1127,12 +1231,6 @@ testcase_11_nft() {
     grep -qE "no servers could be reached" "$RUN_OUT"
     nft flush ruleset
 
-    . /etc/os-release
-    if [[ "${ID_LIKE:-}" == alpine ]]; then
-        # FIXME: For some reasons, the following tests will fail on Alpine/Nura.
-        return 0
-    fi
-
     ### Test TIMEOUT with serve stale feature ###
 
     mkdir -p /run/systemd/resolved.conf.d
@@ -1220,9 +1318,15 @@ testcase_12_resolvectl2() {
     test "$(resolvectl --json=short query -t AAAA localhost)" == '{"key":{"class":1,"type":28,"name":"localhost"},"address":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]}'
     test "$(resolvectl --json=short query -t A localhost)" == '{"key":{"class":1,"type":1,"name":"localhost"},"address":[127,0,0,1]}'
 
-    # Test ResolveRecord RR resolving via Varlink
-    test "$(varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveRecord '{"name":"localhost","type":1}' --json=short | jq -rc 'del(.rrs | .[] | .ifindex)')" == '{"rrs":[{"rr":{"key":{"class":1,"type":1,"name":"localhost"},"address":[127,0,0,1]},"raw":"CWxvY2FsaG9zdAAAAQABAAAAAAAEfwAAAQ=="}],"flags":786945}'
-    test "$(varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveRecord '{"name":"localhost","type":28}' --json=short | jq -rc 'del(.rrs | .[] | .ifindex)')" == '{"rrs":[{"rr":{"key":{"class":1,"type":28,"name":"localhost"},"address":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]},"raw":"CWxvY2FsaG9zdAAAHAABAAAAAAAQAAAAAAAAAAAAAAAAAAAAAQ=="}],"flags":786945}'
+    # Null query flags select the default behavior.
+    varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveHostname '{"name":"localhost","family":2,"flags":null}' --json=short |
+        jq -e 'any(.addresses[]; .address == [127,0,0,1])'
+    varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveAddress '{"family":2,"address":[127,0,0,1],"flags":null}' --json=short |
+        jq -e 'any(.names[]; .name == "localhost")'
+
+    # ResolveRecord defaults to class IN for both null and omitted class.
+    test "$(varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveRecord '{"name":"localhost","type":1,"class":null}' --json=short | jq -rc 'del(.rrs | .[] | .ifindex)')" == '{"rrs":[{"rr":{"key":{"class":1,"type":1,"name":"localhost"},"address":[127,0,0,1]},"raw":"CWxvY2FsaG9zdAAAAQABAAAAAAAEfwAAAQ=="}],"flags":786945}'
+    test "$(varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveRecord '{"name":"localhost","type":28,"flags":null}' --json=short | jq -rc 'del(.rrs | .[] | .ifindex)')" == '{"rrs":[{"rr":{"key":{"class":1,"type":28,"name":"localhost"},"address":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]},"raw":"CWxvY2FsaG9zdAAAHAABAAAAAAAQAAAAAAAAAAAAAAAAAAAAAQ=="}],"flags":786945}'
 
     # Ensure that reloading keeps the manually configured address
     {
@@ -1742,6 +1846,28 @@ testcase_dot_strict_per_link_verify() {
         --grep "Failed to invoke SSL_do_handshake.*(certificate verify failed|self[- ]signed certificate|unable to get local issuer)"
 }
 
+testcase_cd_bypass_not_cached() {
+    # shellcheck disable=SC2317,SC2329
+    cleanup() {
+        resolvectl revert dns0
+        resolvectl flush-caches
+    }
+    trap cleanup RETURN ERR
+
+    # Queries with DO=1 CD=1 are passed on upstream as they are, CD bit included, hence the upstream server
+    # may skip checks for them. Their answers must not be cached for other clients, even if we don't
+    # validate on our own.
+    resolvectl dnssec dns0 no
+    resolvectl flush-caches
+    run dig +nostats +do +cd signed.test
+    grep -qF "10.0.0.10" "$RUN_OUT"
+    (! resolvectl query --type=A --network=no signed.test)
+    # … while answers to the same queries without CD are
+    run dig +nostats +do signed.test
+    grep -qF "10.0.0.10" "$RUN_OUT"
+    resolvectl query --type=A --network=no signed.test
+}
+
 testcase_static_record() {
     mkdir -p /run/systemd/resolve/static.d/
     cat >/run/systemd/resolve/static.d/statictest.rr <<EOF
@@ -1789,6 +1915,275 @@ EOF
 
     rm /run/systemd/resolve/static.d/statictest*.rr /run/systemd/resolve/static.d/garbage*.rr
     systemctl reload systemd-resolved
+}
+
+do_test_varlink_link_methods() {
+    local ifname ifindex socket orig_config
+
+    ifname="${1:?}"
+    ifindex="$(cat "/sys/class/net/$ifname/ifindex")"
+    socket="${2:?}"
+
+    orig_config="$(resolvectl --json=pretty status "$ifname")"
+
+    # io.systemd.Resolve.Link.SetDNS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,2],"port":53},{"family":10,"address":[253,0,222,173,190,239,202,254,0,0,0,0,0,0,0,2]}]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in '10.0.0.2' "$(resolvectl dns "$ifname")"
+    assert_in 'fd00:dead:beef:cafe::2' "$(resolvectl dns "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=short dns "$ifname" | jq -rc '.[0].servers')" 'null'
+
+    # io.systemd.Resolve.Link.SetDomains
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"example.test","routeOnly":false},{"name":"internal.test","routeOnly":true}]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'example.test' "$(resolvectl domain "$ifindex")"
+    assert_in '~internal.test' "$(resolvectl domain "$ifindex")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=short domain "$ifname" | jq -rc '.[0].searchDomains')" 'null'
+
+    # io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":["local","test"]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq \
+        "$(resolvectl --json=short nta "$ifindex" | jq -rc '.[0].negativeTrustAnchors')" \
+        '["local","test"]'
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":[]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=short nta "$ifindex" | jq -rc '.[0].negativeTrustAnchors')" 'null'
+
+    # io.systemd.Resolve.Link.SetDNSDefaultRoute
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSDefaultRoute \
+        '{"ifindex":"'"$ifindex"'","defaultRoute":true}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl default-route "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSDefaultRoute \
+        '{"ifindex":"'"$ifindex"'","defaultRoute":false}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'no' "$(resolvectl default-route "$ifname")"
+
+    # io.systemd.Resolve.Link.SetLLMNR
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetLLMNR \
+        '{"ifindex":"'"$ifindex"'","llmnr":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl llmnr "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetLLMNR \
+        '{"ifindex":"'"$ifindex"'","llmnr":"resolve"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'resolve' "$(resolvectl llmnr "$ifname")"
+
+    # io.systemd.Resolve.Link.SetMulticastDNS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetMulticastDNS \
+        '{"ifindex":"'"$ifindex"'","mDNS":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl mdns "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetMulticastDNS \
+        '{"ifindex":"'"$ifindex"'","mDNS":"resolve"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'resolve' "$(resolvectl mdns "$ifname")"
+
+    # io.systemd.Resolve.Link.SetDNSOverTLS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSOverTLS \
+        '{"ifindex":"'"$ifindex"'","dnsOverTLS":"opportunistic"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'opportunistic' "$(resolvectl dnsovertls "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSOverTLS \
+        '{"ifindex":"'"$ifindex"'","dnsOverTLS":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl dnsovertls "$ifname")"
+
+    # io.systemd.Resolve.Link.SetDNSSEC
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+        '{"ifindex":"'"$ifindex"'","dnssec":"allow-downgrade"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'allow-downgrade' "$(resolvectl dnssec "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+        '{"ifindex":"'"$ifindex"'","dnssec":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl dnssec "$ifname")"
+
+    # io.systemd.Resolve.Link.RevertDNS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.RevertDNS \
+        '{"ifindex":"'"$ifindex"'"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=pretty status "$ifname")" "$orig_config"
+}
+
+do_test_varlink_link_error() {
+    local ifname ifindex socket error
+
+    ifname="${1:?}"
+    ifindex="$(cat "/sys/class/net/$ifname/ifindex")"
+    socket="${2:?}"
+    error="${3:?}"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNS \
+            '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,2],"port":53},{"family":10,"address":[253,0,222,173,190,239,202,254,0,0,0,0,0,0,0,2]}]}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"example.test","routeOnly":false},{"name":"internal.test","routeOnly":true}]}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":["local","test"]}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSDefaultRoute \
+            '{"ifindex":"'"$ifindex"'","defaultRoute":true}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetLLMNR \
+            '{"ifindex":"'"$ifindex"'","llmnr":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetMulticastDNS \
+            '{"ifindex":"'"$ifindex"'","mDNS":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSOverTLS \
+            '{"ifindex":"'"$ifindex"'","dnsOverTLS":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+            '{"ifindex":"'"$ifindex"'","dnssec":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.RevertDNS \
+            '{"ifindex":"'"$ifindex"'"}' 2>&1)"
+}
+
+do_test_varlink_link_invalid_parameters() {
+    local ifname ifindex socket
+
+    ifname="${1:?}"
+    ifindex="$(cat "/sys/class/net/$ifname/ifindex")"
+    socket="${2:?}"
+
+    # Address and family are inconsistent
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]}]}' 2>&1)"
+
+    # Unspecified address
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[0,0,0,0]}]}' 2>&1)"
+
+    # Interface index of a server does not match with the request
+    assert_in '"parameter":"servers"' "$(varlinkctl call --graceful=org.varlink.service.InvalidParameter \
+        "$socket" io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,2],"ifindex":1}]}' 2>&1)"
+
+    # Root domain as search domain
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"."}]}' 2>&1)"
+
+    # Invalid search domain
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":".."}]}' 2>&1)"
+
+    # routeOnly may be null
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"example.test","routeOnly":null}]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'example.test' "$(resolvectl domain "$ifname")"
+    assert_not_in '~example.test' "$(resolvectl domain "$ifname")"
+
+    # Invalid DNSSEC mode
+    assert_in "org.varlink.service.InvalidParameter" "$(varlinkctl call --graceful=org.varlink.service.InvalidParameter \
+        "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+        '{"ifindex":"'"$ifindex"'","dnssec":"bogus"}' 2>&1)"
+
+    # Invalid NTA domain
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":[".."]}' 2>&1)"
+
+    # Cleanup
+    varlinkctl call "$socket" io.systemd.Resolve.Link.RevertDNS '{"ifindex":"'"$ifindex"'"}'
+}
+
+testcase_16_varlink_link_methods() {
+    # Cleanup
+    # shellcheck disable=SC2317,SC2329
+    cleanup() (
+        set +e
+        resolvectl revert dns0
+        ip link del hoge0
+        rm -f /run/systemd/resolved.conf.d/90-mdns-llmnr.conf
+        systemctl reload systemd-resolved.service
+    )
+    trap cleanup RETURN ERR
+
+    {
+        echo "[Resolve]"
+        echo "MulticastDNS=yes"
+        echo "LLMNR=yes"
+    } >/run/systemd/resolved.conf.d/90-mdns-llmnr.conf
+    systemctl reload systemd-resolved.service
+
+    ip link add hoge0 type dummy
+    ip link set hoge0 up
+
+    /usr/lib/systemd/systemd-networkd-wait-online --timeout=60 --interface=hoge0:degraded
+
+    do_test_varlink_link_methods "hoge0" "/run/systemd/resolve/io.systemd.Resolve"
+    do_test_varlink_link_methods "dns0" "/run/systemd/netif/io.systemd.Network"
+
+    do_test_varlink_link_invalid_parameters "hoge0" "/run/systemd/resolve/io.systemd.Resolve"
+    do_test_varlink_link_invalid_parameters "dns0" "/run/systemd/netif/io.systemd.Network"
+
+    do_test_varlink_link_error "dns0" "/run/systemd/resolve/io.systemd.Resolve" "io.systemd.Resolve.Link.ManagedByNetworkd"
+    do_test_varlink_link_error "hoge0" "/run/systemd/netif/io.systemd.Network" "io.systemd.Network.Link.InterfaceUnmanaged"
+    do_test_varlink_link_error "lo" "/run/systemd/resolve/io.systemd.Resolve" "io.systemd.Resolve.Link.IsLoopback"
+    do_test_varlink_link_error "lo" "/run/systemd/netif/io.systemd.Network" "io.systemd.Resolve.Link.IsLoopback"
 }
 
 # PRE-SETUP

@@ -9,8 +9,8 @@
 #include "sd-json.h"
 
 #include "alloc-util.h"
+#include "argv-util.h"
 #include "ask-password-api.h"
-#include "build.h"
 #include "cryptsetup-fido2.h"
 #include "cryptsetup-keyfile.h"
 #include "cryptsetup-pkcs11.h"
@@ -27,7 +27,7 @@
 #include "fileio.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
-#include "json-util.h"
+#include "keyring-util.h"
 #include "libfido2-util.h"
 #include "libmount-util.h"
 #include "log.h"
@@ -38,6 +38,7 @@
 #include "path-util.h"
 #include "pcrextend-util.h"
 #include "pkcs11-util.h"
+#include "plymouth-util.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "string-table.h"
@@ -124,6 +125,7 @@ static char *arg_link_keyring = NULL;
 static char *arg_link_key_type = NULL;
 static char *arg_link_key_description = NULL;
 static char *arg_fixate_volume_key = NULL;
+static char *arg_friendly_name = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_cipher, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_hash, freep);
@@ -141,11 +143,13 @@ STATIC_DESTRUCTOR_REGISTER(arg_link_keyring, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_link_key_type, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_link_key_description, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_fixate_volume_key, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_friendly_name, freep);
 
 COMMAND(
         "systemd-cryptsetup\0",
         "Attach or detach an encrypted block device.",
-        .man_pages = "systemd-cryptsetup(8)\0",
+        .man_page = "systemd-cryptsetup(8)",
+        .option_namespace = "common",
 );
 
 static const char* const passphrase_type_table[_PASSPHRASE_TYPE_MAX] = {
@@ -209,20 +213,25 @@ static int parse_one_option(const char *option) {
                 arg_key_size = key_size / 8;
 
         } else if ((val = startswith(option, "sector-size="))) {
+                unsigned sector_size;
 
-                r = safe_atou(val, &arg_sector_size);
+                r = safe_atou(val, &sector_size);
                 if (r < 0) {
                         log_warning_errno(r, "Failed to parse %s, ignoring: %m", option);
                         return 0;
                 }
 
-                if (arg_sector_size % 2) {
-                        log_warning("sector-size= not a multiple of 2, ignoring.");
+                if (!ISPOWEROF2(sector_size)) {
+                        log_warning("sector-size= not a power of 2, ignoring.");
                         return 0;
                 }
 
-                if (arg_sector_size < CRYPT_SECTOR_SIZE || arg_sector_size > CRYPT_MAX_SECTOR_SIZE)
+                if (sector_size < CRYPT_SECTOR_SIZE || sector_size > CRYPT_MAX_SECTOR_SIZE) {
                         log_warning("sector-size= is outside of %u and %u, ignoring.", CRYPT_SECTOR_SIZE, CRYPT_MAX_SECTOR_SIZE);
+                        return 0;
+                }
+
+                arg_sector_size = sector_size;
 
         } else if ((val = startswith(option, "key-slot=")) ||
                    (val = startswith(option, "keyslot="))) {
@@ -642,6 +651,27 @@ static int parse_one_option(const char *option) {
                 if (r < 0)
                         return log_oom();
 
+        } else if ((val = startswith(option, "friendly-name="))) {
+
+                if (isempty(val)) {
+                        arg_friendly_name = mfree(arg_friendly_name);
+                        return 0;
+                }
+
+                /* Longest prompt with this name is "PIN has been entered incorrectly previously..." in
+                 * pkcs11_token_login (in src/shared/pkcs11-util.c), which also includes the token label
+                 * (up to 32 bytes), so cap the friendly name at 100 bytes to ensure that the prompt isn't
+                 * too big for a Plymouth message (see plymouth_build_password_packet in
+                 * src/shared/plymouth-util.c). */
+                if (!string_is_safe(val, STRING_ALLOW_GLOBS) || strlen(val) > 100) {
+                        log_warning("Invalid friendly-name= option \"%s\", ignoring.", val);
+                        return 0;
+                }
+
+                r = free_and_strdup(&arg_friendly_name, val);
+                if (r < 0)
+                        return log_oom();
+
         } else if (!streq(option, "x-initrd.attach"))
                 log_warning("Encountered unknown /etc/crypttab option '%s', ignoring.", option);
 
@@ -723,7 +753,7 @@ static char* disk_description(const char *path) {
                         return NULL;
                 }
 
-                if (!isempty(unescaped) && !string_has_cc(unescaped, NULL))
+                if (!isempty(unescaped) && !string_has_cc(unescaped, /* ok= */ NULL))
                         return TAKE_PTR(unescaped);
         }
 
@@ -777,6 +807,9 @@ static char *friendly_disk_name(const char *src, const char *vol) {
         assert(src);
         assert(vol);
 
+        if (arg_friendly_name)
+                return strdup(arg_friendly_name);
+
         description = disk_description(src);
         mount_point = disk_mount_point(vol);
 
@@ -822,11 +855,12 @@ static PassphraseType check_registered_passwords(struct crypt_device *cd) {
         /* Iterate all LUKS2 tokens and keep track of all their slots */
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+                _cleanup_free_ int *keyslots = NULL;
+                size_t n_keyslots;
                 const char *type;
-                sd_json_variant *w, *z;
                 int tk;
 
-                tk = cryptsetup_get_token_as_json(cd, token, NULL, &v);
+                tk = cryptsetup_get_token_as_json(cd, token, /* verify_type= */ NULL, &v);
                 if (IN_SET(tk, -ENOENT, -EINVAL))
                         continue;
                 if (tk < 0) {
@@ -834,47 +868,26 @@ static PassphraseType check_registered_passwords(struct crypt_device *cd) {
                         continue;
                 }
 
-                w = sd_json_variant_by_key(v, "type");
-                if (!w || !sd_json_variant_is_string(w)) {
-                        log_warning("Token JSON data lacks type field, ignoring.");
+                tk = cryptsetup_token_parse_common(v, &type, &keyslots, &n_keyslots);
+                if (tk < 0) {
+                        log_warning_errno(tk, "Token JSON data lacks a valid type or keyslots field, ignoring: %m");
                         continue;
                 }
 
-                type = sd_json_variant_string(w);
-                if (STR_IN_SET(type, "systemd-recovery", "systemd-pkcs11", "systemd-fido2", "systemd-tpm2")) {
+                if (!STR_IN_SET(type, "systemd-recovery", "systemd-pkcs11", "systemd-fido2", "systemd-tpm2"))
+                        continue;
 
-                        /* At least exists one recovery key */
-                        if (streq(type, "systemd-recovery"))
-                                passphrase_type |= PASSPHRASE_RECOVERY_KEY;
+                /* At least exists one recovery key */
+                if (streq(type, "systemd-recovery"))
+                        passphrase_type |= PASSPHRASE_RECOVERY_KEY;
 
-                        w = sd_json_variant_by_key(v, "keyslots");
-                        if (!w || !sd_json_variant_is_array(w)) {
-                                log_warning("Token JSON data lacks keyslots field, ignoring.");
+                FOREACH_ARRAY(k, keyslots, n_keyslots) {
+                        if (*k >= slot_max) {
+                                log_warning("Token JSON data's keyslot field exceeds the maximum value allowed, ignoring.");
                                 continue;
                         }
 
-                        JSON_VARIANT_ARRAY_FOREACH(z, w) {
-                                unsigned u;
-                                int at;
-
-                                if (!sd_json_variant_is_string(z)) {
-                                        log_warning("Token JSON data's keyslot field is not an array of strings, ignoring.");
-                                        continue;
-                                }
-
-                                at = safe_atou(sd_json_variant_string(z), &u);
-                                if (at < 0) {
-                                        log_warning_errno(at, "Token JSON data's keyslot field is not an integer formatted as string, ignoring.");
-                                        continue;
-                                }
-
-                                if (u >= (unsigned) slot_max) {
-                                        log_warning_errno(at, "Token JSON data's keyslot field exceeds the maximum value allowed, ignoring.");
-                                        continue;
-                                }
-
-                                slots[u] = false;
-                        }
+                        slots[*k] = false;
                 }
         }
 
@@ -1315,6 +1328,35 @@ static char *make_bindname(const char *volume, TokenType token_type) {
         return bindname;
 }
 
+_printf_(1, 2)
+static bool ask_plug_in(const char *format, ...) {
+        _cleanup_free_ char *text = NULL;
+        va_list ap;
+        int r;
+
+        /* Asks the user to plug in a security token. As this usually happens at boot, where nobody looks at
+         * the log, show the request via plymouth or on the console too. Returns true if plymouth shows it,
+         * see hide_plug_in() below. */
+
+        va_start(ap, format);
+        r = vasprintf(&text, format, ap);
+        va_end(ap);
+        if (r < 0) {
+                log_oom_debug();
+                return false;
+        }
+
+        log_notice("%s", text);
+        return plymouth_show_message(text) > 0;
+}
+
+static void hide_plug_in(bool *shown) {
+        assert(shown);
+
+        if (*shown)
+                plymouth_hide_message();
+}
+
 static int make_security_device_monitor(
                 sd_event **ret_event,
                 sd_device_monitor **ret_monitor) {
@@ -1333,7 +1375,7 @@ static int make_security_device_monitor(
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        r = sd_event_add_time_relative(event, NULL, CLOCK_MONOTONIC, arg_token_timeout_usec, USEC_PER_SEC, NULL, INT_TO_PTR(-ETIMEDOUT));
+        r = sd_event_add_time_relative(event, /* ret= */ NULL, CLOCK_MONOTONIC, arg_token_timeout_usec, USEC_PER_SEC, /* callback= */ NULL, INT_TO_PTR(-ETIMEDOUT));
         if (r < 0)
                 return log_error_errno(r, "Failed to install timeout event source: %m");
 
@@ -1351,7 +1393,7 @@ static int make_security_device_monitor(
         if (r < 0)
                 return log_error_errno(r, "Failed to attach device monitor: %m");
 
-        r = sd_device_monitor_start(monitor, NULL, NULL);
+        r = sd_device_monitor_start(monitor, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to start device monitor: %m");
 
@@ -1434,17 +1476,16 @@ static bool use_token_plugins(void) {
 
 #if HAVE_LIBCRYPTSETUP_PLUGINS
 static int acquire_pins_from_env_variable(char ***ret_pins) {
-        _cleanup_(erase_and_freep) char *envpin = NULL;
         _cleanup_strv_free_erase_ char **pins = NULL;
-        int r;
+        const char *e;
 
         assert(ret_pins);
 
-        r = getenv_steal_erase("PIN", &envpin);
-        if (r < 0)
-                return log_error_errno(r, "Failed to acquire PIN from environment: %m");
-        if (r > 0) {
-                pins = strv_new(envpin);
+        /* Copies $PIN, but leaves it in the environment: the caller removes it once it has been tried. */
+
+        e = secure_getenv("PIN");
+        if (e) {
+                pins = strv_new(e);
                 if (!pins)
                         return log_oom();
         }
@@ -1485,6 +1526,15 @@ static int crypt_activate_by_token_pin_ask_password(
 
         STRV_FOREACH(p, pins) {
                 r = sym_crypt_activate_by_token_pin(cd, name, type, CRYPT_ANY_TOKEN, *p, strlen(*p), userdata, activation_flags);
+                if (r == -EAGAIN)
+                        /* The token hardware is missing (e.g. the TPM2 chip, or the FIDO2 token of a
+                         * TPM2+FIDO2 slot). Callers wait for it to show up and try again, which needs $PIN
+                         * again, so leave it in the environment. */
+                        return r;
+
+                /* Otherwise $PIN has been tried, remove it from the environment. */
+                (void) getenv_steal_erase("PIN", /* ret= */ NULL);
+
                 if (r > 0) /* returns unlocked keyslot id on success */
                         return 0;
                 if (r == -EEXIST) /* volume is already active */
@@ -1564,6 +1614,7 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         size_t decrypted_key_size;
         _cleanup_free_ char *friendly = NULL;
+        _cleanup_(hide_plug_in) bool plug_in_shown = false;
         int keyslot = arg_key_slot, r;
         bool use_libcryptsetup_plugin = use_token_plugins();
 
@@ -1615,6 +1666,10 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
                                                 &decrypted_key_size);
                         if (r >= 0)
                                 break;
+                        if (r == -ENXIO && !arg_fido2_cid)
+                                /* Same as the plugin path above: the volume has no FIDO2 token enrolled */
+                                return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN),
+                                                       "No FIDO2 token enrolled, falling back to traditional unlocking.");
                 }
 
                 if (r != -EAGAIN) /* EAGAIN means: token not found */
@@ -1630,7 +1685,7 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
                         if (r < 0)
                                 return r;
 
-                        log_notice("Security token not present for unlocking volume %s, please plug it in.", friendly);
+                        plug_in_shown = ask_plug_in("Security token not present for unlocking volume %s, please plug it in.", friendly);
 
                         /* Let's immediately rescan in case the token appeared in the time we needed
                          * to create and configure the monitor */
@@ -1703,7 +1758,7 @@ static int attach_luks2_by_pkcs11_via_plugin(
                 .askpw_flags = arg_ask_password_flags,
         };
 
-        r = sym_crypt_activate_by_token_pin(cd, name, "systemd-pkcs11", CRYPT_ANY_TOKEN, NULL, 0, &params, flags);
+        r = sym_crypt_activate_by_token_pin(cd, name, "systemd-pkcs11", CRYPT_ANY_TOKEN, /* pin= */ NULL, /* pin_size= */ 0, &params, flags);
         if (r > 0) /* returns unlocked keyslot id on success */
                 r = 0;
         if (r == -EEXIST) /* volume is already active */
@@ -1726,6 +1781,7 @@ static int attach_luks_or_plain_or_bitlk_by_pkcs11(
 
         _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor = NULL;
         _cleanup_free_ char *friendly = NULL, *discovered_uri = NULL;
+        _cleanup_(hide_plug_in) bool plug_in_shown = false;
         size_t decrypted_key_size = 0, discovered_key_size = 0;
         _cleanup_(erase_and_freep) void *decrypted_key = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
@@ -1801,8 +1857,8 @@ static int attach_luks_or_plain_or_bitlk_by_pkcs11(
                         if (r < 0)
                                 return r;
 
-                        log_notice("Security token%s%s not present for unlocking volume %s, please plug it in.",
-                                   uri ? " " : "", strempty(uri), friendly);
+                        plug_in_shown = ask_plug_in("Security token%s%s not present for unlocking volume %s, please plug it in.",
+                                                    uri ? " " : "", strempty(uri), friendly);
 
                         /* Let's immediately rescan in case the token appeared in the time we needed
                          * to create and configure the monitor */
@@ -1876,7 +1932,7 @@ static int make_tpm2_device_monitor(
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        r = sd_event_add_time_relative(event, NULL, CLOCK_MONOTONIC, arg_token_timeout_usec, USEC_PER_SEC, NULL, INT_TO_PTR(-ETIMEDOUT));
+        r = sd_event_add_time_relative(event, /* ret= */ NULL, CLOCK_MONOTONIC, arg_token_timeout_usec, USEC_PER_SEC, /* callback= */ NULL, INT_TO_PTR(-ETIMEDOUT));
         if (r < 0)
                 return log_error_errno(r, "Failed to install timeout event source: %m");
 
@@ -1886,7 +1942,7 @@ static int make_tpm2_device_monitor(
 
         (void) sd_device_monitor_set_description(monitor, "tpmrm");
 
-        r = sd_device_monitor_filter_add_match_subsystem_devtype(monitor, "tpmrm", NULL);
+        r = sd_device_monitor_filter_add_match_subsystem_devtype(monitor, "tpmrm", /* devtype= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to configure device monitor: %m");
 
@@ -1894,13 +1950,102 @@ static int make_tpm2_device_monitor(
         if (r < 0)
                 return log_error_errno(r, "Failed to attach device monitor: %m");
 
-        r = sd_device_monitor_start(monitor, NULL, NULL);
+        r = sd_device_monitor_start(monitor, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to start device monitor: %m");
 
         *ret_event = TAKE_PTR(event);
         *ret_monitor = TAKE_PTR(monitor);
         return 0;
+}
+
+typedef enum TokenPinFlags {
+        TOKEN_PIN_TPM2   = 1 << 0, /* A TPM2 PIN only */
+        TOKEN_PIN_FIDO2  = 1 << 1, /* A FIDO2 PIN only, of a standalone or a TPM2+FIDO2 slot */
+        TOKEN_PIN_SHARED = 1 << 2, /* One PIN for both the TPM2 and the FIDO2 token of a TPM2+FIDO2 slot */
+        TOKEN_PIN_OTHER  = 1 << 3, /* Some other kind of token, e.g. PKCS#11, that might ask for a PIN */
+} TokenPinFlags;
+
+static TokenPinFlags token_pin_flags(struct crypt_device *cd, const char *type) {
+        TokenPinFlags flags = 0;
+
+        assert(cd);
+
+        /* Which PINs the LUKS2 tokens (of the specified type, if any) might ask for, so that a PIN prompt
+         * can say what it is for. */
+
+        for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+                struct {
+                        const char *type;
+                        bool tpm2_pin;
+                        bool tpm2_fido2;
+                        int fido2_pin_required;
+                } p = {
+                        .fido2_pin_required = -1,
+                };
+                int r;
+
+                static const sd_json_dispatch_field dispatch_table[] = {
+                        { "type",                     SD_JSON_VARIANT_STRING,  sd_json_dispatch_const_string, voffsetof(p, type),               SD_JSON_MANDATORY },
+                        { "tpm2-pin",                 SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,      voffsetof(p, tpm2_pin),           0                 },
+                        { "tpm2_fido2",               SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,      voffsetof(p, tpm2_fido2),         0                 },
+                        { "fido2-clientPin-required", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,     voffsetof(p, fido2_pin_required), 0                 },
+                        {}
+                };
+
+                if (cryptsetup_get_token_as_json(cd, token, type, &v) < 0)
+                        continue;
+
+                r = sd_json_dispatch(v, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &p);
+                if (r < 0) {
+                        /* We cannot tell what this token asks for, so do not name a device in the prompt */
+                        log_debug_errno(r, "Failed to parse LUKS2 token %i, ignoring: %m", token);
+                        flags |= TOKEN_PIN_OTHER;
+                        continue;
+                }
+
+                if (streq(p.type, "systemd-tpm2")) {
+                        bool fido2_pin = p.tpm2_fido2 && p.fido2_pin_required > 0;
+
+                        if (p.tpm2_pin && fido2_pin)
+                                flags |= TOKEN_PIN_SHARED;
+                        else if (p.tpm2_pin)
+                                flags |= TOKEN_PIN_TPM2;
+                        else if (fido2_pin)
+                                flags |= TOKEN_PIN_FIDO2;
+
+                } else if (streq(p.type, "systemd-fido2")) {
+                        /* Without the field (enrolled by v248), a PIN is asked for if the token needs one */
+                        if (p.fido2_pin_required != 0)
+                                flags |= TOKEN_PIN_FIDO2;
+
+                } else if (!streq(p.type, "systemd-recovery"))
+                        flags |= TOKEN_PIN_OTHER;
+        }
+
+        return flags;
+}
+
+static const char* token_pin_message(TokenPinFlags flags, const char *fallback) {
+        assert(fallback);
+
+        /* Says which device the PIN is for, with the same words as acquire_tpm2_key() and
+         * acquire_fido2_key(). libcryptsetup tries the PIN on every token that asks for one. */
+
+        if (flags == 0 || FLAGS_SET(flags, TOKEN_PIN_OTHER))
+                return fallback;
+
+        switch (flags) {
+        case TOKEN_PIN_TPM2:
+                return "Please enter TPM2 PIN:";
+        case TOKEN_PIN_FIDO2:
+                return "Please enter security token PIN:";
+        case TOKEN_PIN_SHARED:
+                return "Please enter TPM2 and FIDO2 token PIN:";
+        default:
+                return "Please enter TPM2 or security token PIN:";
+        }
 }
 
 static int attach_luks2_by_tpm2_via_plugin(
@@ -1915,11 +2060,18 @@ static int attach_luks2_by_tpm2_via_plugin(
                 .device = arg_tpm2_device,
                 .signature_path = arg_tpm2_signature,
                 .pcrlock_path = arg_tpm2_pcrlock,
+                .fido2_device = arg_fido2_device,
+                .fido2_rp = arg_fido2_rp_id,
         };
 
         if (!use_token_plugins())
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
                                        "libcryptsetup has external plugins support disabled.");
+
+        /* Same keyring entries and credentials as acquire_tpm2_key(): only a PIN that is just for the FIDO2
+         * token is the FIDO2 PIN. */
+        TokenPinFlags pins = token_pin_flags(cd, "systemd-tpm2");
+        bool fido2_only = pins == TOKEN_PIN_FIDO2;
 
         return crypt_activate_by_token_pin_ask_password(
                         cd,
@@ -1928,12 +2080,22 @@ static int attach_luks2_by_tpm2_via_plugin(
                         until,
                         &params,
                         flags,
-                        "Please enter TPM2 PIN:",
-                        "tpm2-pin",
-                        "cryptsetup.tpm2-pin");
+                        token_pin_message(pins, "Please enter TPM2 PIN:"),
+                        fido2_only ? "fido2-pin" : "tpm2-pin",
+                        fido2_only ? "cryptsetup.fido2-pin" : "cryptsetup.tpm2-pin");
 #else
         return -EOPNOTSUPP;
 #endif
+}
+
+static bool tpm2_device_present(void) {
+        _cleanup_free_ char *device = NULL;
+
+        /* The plugin only reports a missing TPM2 chip as -EAGAIN if it has to discover it itself. */
+        if (arg_tpm2_device)
+                return true;
+
+        return tpm2_find_device_auto(&device) >= 0;
 }
 
 static int attach_luks_or_plain_or_bitlk_by_tpm2(
@@ -1945,10 +2107,12 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                 uint32_t flags,
                 bool pass_volume_key) {
 
-        _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor = NULL;
+        _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor = NULL, *fido2_monitor = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL, *fido2_event = NULL;
         _cleanup_(iovec_done_erase) struct iovec decrypted_key = {};
-        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(erase_and_freep) char *pin = NULL;
         _cleanup_free_ char *friendly = NULL;
+        _cleanup_(hide_plug_in) bool plug_in_shown = false;
         int keyslot = arg_key_slot, r;
 
         assert(cd);
@@ -1958,6 +2122,16 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
         friendly = friendly_disk_name(sym_crypt_get_device_name(cd), name);
         if (!friendly)
                 return log_oom();
+
+        /* Every TPM2 slot tried below gets the same $PIN. It is removed from the environment once a slot that
+         * needs a PIN has tried it, so that the fallback methods don't hand it to e.g. a FIDO2 token. A slot
+         * whose hardware is missing (-EAGAIN, -ENOMEDIUM) has not tried it. */
+        const char *e = secure_getenv("PIN");
+        if (e) {
+                pin = strdup(e);
+                if (!pin)
+                        return log_oom();
+        }
 
         for (;;) {
                 if (key_file || iovec_is_set(key_data)) {
@@ -1982,11 +2156,21 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                         /* srk= */ NULL,
                                         /* pcrlock_nv= */ NULL,
                                         arg_tpm2_pin ? TPM2_FLAGS_USE_PIN : 0,
+                                        /* fido2_device= */ NULL,
+                                        /* fido2_cid= */ NULL,
+                                        /* fido2_rp= */ NULL,
+                                        /* fido2_public_key= */ NULL,
+                                        /* fido2_public_key_algorithm= */ NULL,
+                                        /* fido2_public_key_tag= */ NULL,
+                                        /* fido2_flags= */ 0,
                                         until,
                                         "cryptsetup.tpm2-pin",
                                         arg_ask_password_flags,
+                                        pin,
                                         /* argon2id_params= */ NULL,
                                         &decrypted_key);
+                        if (arg_tpm2_pin && r != -EAGAIN)
+                                (void) getenv_steal_erase("PIN", /* ret= */ NULL);
                         if (r >= 0)
                                 break;
                         if (IN_SET(r, -EACCES, -ENOLCK))
@@ -2002,7 +2186,8 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                         r = attach_luks2_by_tpm2_via_plugin(cd, name, until, flags);
                         if (r >= 0)
                                 return 0;
-                        /* EAGAIN     means: no tpm2 chip found
+                        /* EAGAIN     means: no tpm2 chip found, or the FIDO2 token of a TPM2+FIDO2 enrollment
+                         *                   is not plugged in
                          * EOPNOTSUPP means: no libcryptsetup plugins support */
                         if (r == -ENXIO)
                                 return log_notice_errno(SYNTHETIC_ERRNO(EAGAIN),
@@ -2014,10 +2199,16 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                 log_notice_errno(r, "TPM2 operation failed, falling back to traditional unlocking: %m");
                                 return -EAGAIN; /* Mangle error code: let's make any form of TPM2 failure non-fatal. */
                         }
+
+                        /* The plugin reports a missing FIDO2 token as -EAGAIN as well, as that keeps
+                         * libcryptsetup trying the remaining tokens. If the TPM2 chip is around, a FIDO2
+                         * token is what we are waiting for. */
+                        if (r == -EAGAIN && tpm2_device_present())
+                                r = -ENOMEDIUM;
                 }
 
                 if (r == -EOPNOTSUPP) { /* Plugin not available, let's process TPM2 stuff right here instead */
-                        bool found_some = false;
+                        bool found_some = false, fido2_missing = false;
                         int token = 0; /* first token to look at */
 
                         /* If no key data is specified, look for it in the header. In order to support
@@ -2025,14 +2216,17 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                          * works. */
 
                         for (;;) {
-                                _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
+                                _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {}, fido2_cid = {},
+                                        fido2_public_key = {}, fido2_public_key_tag = {};
                                 _cleanup_free_ char *pubkey_policy_ref = NULL;
                                 struct iovec *blobs = NULL, *policy_hash = NULL;
+                                _cleanup_free_ char *fido2_rp = NULL, *fido2_public_key_algorithm = NULL;
                                 uint32_t hash_pcr_mask, pubkey_pcr_mask;
                                 size_t n_blobs = 0, n_policy_hash = 0;
                                 uint16_t pcr_bank, primary_alg;
                                 Argon2IdParameters argon2id_params = {};
                                 TPM2Flags tpm2_flags;
+                                Fido2EnrollFlags fido2_flags;
 
                                 CLEANUP_ARRAY(blobs, n_blobs, iovec_array_free);
                                 CLEANUP_ARRAY(policy_hash, n_policy_hash, iovec_array_free);
@@ -2041,6 +2235,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 cd,
                                                 arg_tpm2_pcr_mask, /* if != UINT32_MAX we'll only look for tokens with this PCR mask */
                                                 token, /* search for the token with this index, or any later index than this */
+                                                LOG_ERR,
                                                 &hash_pcr_mask,
                                                 &pcr_bank,
                                                 &pubkey,
@@ -2055,16 +2250,29 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 &srk,
                                                 &pcrlock_nv,
                                                 &tpm2_flags,
+                                                &fido2_cid,
+                                                &fido2_rp,
+                                                &fido2_public_key,
+                                                &fido2_public_key_algorithm,
+                                                &fido2_public_key_tag,
+                                                &fido2_flags,
                                                 &keyslot,
                                                 &token,
                                                 &argon2id_params);
-                                if (r == -ENXIO)
-                                        /* No further TPM2 tokens found in the LUKS2 header. */
+                                if (r == -ENXIO) {
+                                        /* No further TPM2 tokens found in the LUKS2 header. If we skipped one
+                                         * because its FIDO2 token is not plugged in, wait for it below. */
+                                        if (fido2_missing) {
+                                                r = -ENOMEDIUM;
+                                                break;
+                                        }
+
                                         return log_full_errno(found_some ? LOG_NOTICE : LOG_DEBUG,
                                                               SYNTHETIC_ERRNO(EAGAIN),
                                                               found_some
                                                               ? "No TPM2 metadata matching the current system state found in LUKS2 header, falling back to traditional unlocking."
                                                               : "No TPM2 metadata enrolled in LUKS2 header, falling back to traditional unlocking.");
+                                }
                                 if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                                         /* TPM2 support not compiled in? */
                                         return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN),
@@ -2094,13 +2302,34 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 &srk,
                                                 &pcrlock_nv,
                                                 tpm2_flags,
+                                                arg_fido2_device,
+                                                &fido2_cid,
+                                                /* The relying party a TPM2+FIDO2 slot was enrolled under is
+                                                 * recorded in the token; the crypttab fido2-rp= option is
+                                                 * scoped to standalone systemd-fido2 slots and only serves
+                                                 * as a fallback for tokens that predate the field. */
+                                                fido2_rp ?: arg_fido2_rp_id,
+                                                &fido2_public_key,
+                                                fido2_public_key_algorithm,
+                                                &fido2_public_key_tag,
+                                                fido2_flags,
                                                 until,
                                                 "cryptsetup.tpm2-pin",
                                                 arg_ask_password_flags,
+                                                pin,
                                                 &argon2id_params,
                                                 &decrypted_key);
+                                if (!IN_SET(r, -EAGAIN, -ENOMEDIUM) && tpm2_slot_needs_pin(tpm2_flags, fido2_flags))
+                                        (void) getenv_steal_erase("PIN", /* ret= */ NULL);
                                 if (IN_SET(r, -EACCES, -ENOLCK))
                                         return log_notice_errno(SYNTHETIC_ERRNO(EAGAIN), "TPM2 PIN unlock failed, falling back to traditional unlocking.");
+                                /* The FIDO2 token of this TPM2+FIDO2 enrollment is not plugged in, but a
+                                 * later token might not need it, hence try those first. */
+                                if (r == -ENOMEDIUM) {
+                                        fido2_missing = true;
+                                        token++;
+                                        continue;
+                                }
                                 /* Stop unless we should keep iterating to next token because the tried one
                                  * does not match boot state. For now without -EUCLEAN because currently the
                                  * only error it reports won't be solved by moving to another token. */
@@ -2112,11 +2341,36 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
 
                         if (r >= 0)
                                 break;
-                        /* EAGAIN means: no tpm2 chip found */
-                        if (r != -EAGAIN) {
+                        /* EAGAIN    means: no tpm2 chip found
+                         * ENOMEDIUM means: the enrolled FIDO2 token is not plugged in */
+                        if (!IN_SET(r, -EAGAIN, -ENOMEDIUM)) {
                                 log_notice_errno(r, "TPM2 operation failed, falling back to traditional unlocking: %m");
                                 return -EAGAIN; /* Mangle error code: let's make any form of TPM2 failure non-fatal. */
                         }
+                }
+
+                if (r == -ENOMEDIUM) {
+                        /* We didn't find the FIDO2 token. In this case, watch for it via udev. Let's create
+                         * an event loop and monitor first. */
+
+                        if (!fido2_monitor) {
+                                r = make_security_device_monitor(&fido2_event, &fido2_monitor);
+                                if (r < 0)
+                                        return r;
+
+                                plug_in_shown = ask_plug_in("FIDO2 token not present for unlocking %s, please plug it in.", friendly);
+
+                                /* Let's immediately rescan in case the token appeared in the time we needed
+                                 * to create and configure the monitor */
+                                continue;
+                        }
+
+                        r = run_security_device_monitor(fido2_event, fido2_monitor);
+                        if (r < 0)
+                                return r;
+
+                        log_debug("Got one or more potentially relevant udev events, rescanning for FIDO2 token...");
+                        continue;
                 }
 
                 if (!monitor) {
@@ -2351,7 +2605,7 @@ static int attach_luks_or_plain_or_bitlk(
 
                 /* In contrast to what the name crypt_format() might suggest this doesn't actually format
                  * anything, it just configures encryption parameters when used for plain mode. */
-                r = sym_crypt_format(cd, CRYPT_PLAIN, cipher, cipher_mode, NULL, NULL, arg_keyfile_size, &params);
+                r = sym_crypt_format(cd, CRYPT_PLAIN, cipher, cipher_mode, /* uuid= */ NULL, /* volume_key= */ NULL, arg_keyfile_size, &params);
                 if (r < 0)
                         return log_error_errno(r, "Loading of cryptographic parameters failed: %m");
 
@@ -2380,30 +2634,6 @@ static int attach_luks_or_plain_or_bitlk(
 }
 
 VERB_COMMON_HELP_AUTO_HIDDEN();
-
-static int parse_argv(int argc, char *argv[], char ***ret_args) {
-        assert(argc >= 0);
-        assert(argv);
-        assert(ret_args);
-
-        OptionParser opts = { argc, argv };
-
-        FOREACH_OPTION_OR_RETURN(c, &opts)
-                switch (c) {
-
-                OPTION_COMMON_HELP:
-                        return command_print_help();
-
-                OPTION_COMMON_VERSION:
-                        return version();
-
-                OPTION_COMMON_INTROSPECT_CLI:
-                        return introspect_cli(SD_JSON_FORMAT_OFF);
-                }
-
-        *ret_args = option_parser_get_args(&opts);
-        return 1;
-}
 
 static uint32_t determine_flags(void) {
         uint32_t flags = 0;
@@ -2571,13 +2801,13 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         }
 
         if (!arg_type || STR_IN_SET(arg_type, ANY_LUKS, CRYPT_LUKS1, CRYPT_LUKS2)) {
-                r = sym_crypt_load(cd, !arg_type || streq(arg_type, ANY_LUKS) ? CRYPT_LUKS : arg_type, NULL);
+                r = sym_crypt_load(cd, !arg_type || streq(arg_type, ANY_LUKS) ? CRYPT_LUKS : arg_type, /* params= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to load LUKS superblock on device %s: %m", sym_crypt_get_device_name(cd));
 
                 /* since cryptsetup 2.7.0 (Jan 2024) */
                 if (arg_link_key_description) {
-                        r = sym_crypt_set_keyring_to_link(cd, arg_link_key_description, NULL, arg_link_key_type, arg_link_keyring);
+                        r = sym_crypt_set_keyring_to_link(cd, arg_link_key_description, /* old_key_description= */ NULL, arg_link_key_type, arg_link_keyring);
                         if (r == -ENOSYS)
                                 log_warning("Loaded libcryptsetup does not support linking volume keys in user specified kernel keyrings upon device activation, ignoring.");
                         else if (r < 0)
@@ -2592,6 +2822,10 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
 
                 /* Tokens are available in LUKS2 only, but it is ok to call (and fail) with LUKS1. */
                 if (!key_file && use_token_plugins()) {
+                        /* Only the wording of the prompt depends on the tokens: the keyring entry and the
+                         * credential stay the same, as users might provide the PIN that way. */
+                        TokenPinFlags pins = token_pin_flags(cd, /* type= */ NULL);
+
                         r = crypt_activate_by_token_pin_ask_password(
                                         cd,
                                         volume,
@@ -2599,7 +2833,7 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
                                         until,
                                         /* userdata= */ NULL,
                                         flags,
-                                        "Please enter LUKS2 token PIN:",
+                                        token_pin_message(pins, "Please enter LUKS2 token PIN:"),
                                         "luks2-pin",
                                         "cryptsetup.luks2-pin");
                         if (r >= 0) {
@@ -2612,7 +2846,7 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         }
 
         if (streq_ptr(arg_type, CRYPT_BITLK)) {
-                r = sym_crypt_load(cd, CRYPT_BITLK, NULL);
+                r = sym_crypt_load(cd, CRYPT_BITLK, /* params= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to load Bitlocker superblock on device %s: %m", sym_crypt_get_device_name(cd));
         }
@@ -2624,6 +2858,7 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
                 _cleanup_(iovec_done_erase) struct iovec discovered_key_data = {};
                 const struct iovec *key_data = NULL;
                 TokenType token_type = determine_token_type();
+                bool passphrase_from_cache = false;
 
                 log_debug("Beginning attempt %u to unlock.", tries);
 
@@ -2642,6 +2877,8 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
                         if (r > 0)
                                 key_data = &discovered_key_data;
                         else
+                                /* Nothing discovered; disable so the failure path below doesn't fire
+                                 * and silently retry the same password the user just typed. */
                                 try_discover_key = false;
                 }
 
@@ -2662,6 +2899,10 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
                                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No passphrase or recovery key registered.");
                                 }
 
+                                /* Only treat this as a cached attempt if there is actually a key in
+                                 * the keyring; otherwise get_password() will prompt interactively. */
+                                passphrase_from_cache = use_cached_passphrase && !arg_verify &&
+                                        request_key("user", "cryptsetup", /* callout_info= */ NULL, /* destringid= */ 0) >= 0;
                                 r = get_password(
                                                 volume,
                                                 source,
@@ -2719,6 +2960,9 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
 
                 if (passwords) {
                         passwords = strv_free_erase(passwords);
+                        /* Don't count the cached keyring attempt against tries= — the user never saw a prompt */
+                        if (passphrase_from_cache)
+                                tries--; /* net zero with for-loop tries++; this iteration is not counted */
                         continue;
                 }
 
@@ -2772,10 +3016,14 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
+        /* When run as a service, our log ends up in the journal only. Make sure requests to plug in or
+         * touch a security token are shown on the console if plymouth doesn't show them. */
+        plymouth_set_console_fallback(invoked_by_systemd());
+
         umask(0022);
 
         char **args = NULL;
-        r = parse_argv(argc, argv, &args);
+        r = common_parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 

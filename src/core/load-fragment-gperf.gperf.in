@@ -98,6 +98,7 @@
 {% endif %}
 {{type}}.DelegateNamespaces,                  config_parse_namespace_flags,                       0,                                  offsetof({{type}}, exec_context.delegate_namespaces)
 {{type}}.RestrictFileSystems,                 config_parse_restrict_filesystems,                  0,                                  offsetof({{type}}, exec_context)
+{{type}}.IOUringFilter,                       config_parse_io_uring_filter,                       0,                                  offsetof({{type}}, exec_context)
 {{type}}.LimitCPU,                            config_parse_rlimit,                                RLIMIT_CPU,                         offsetof({{type}}, exec_context.rlimit)
 {{type}}.LimitFSIZE,                          config_parse_rlimit,                                RLIMIT_FSIZE,                       offsetof({{type}}, exec_context.rlimit)
 {{type}}.LimitDATA,                           config_parse_rlimit,                                RLIMIT_DATA,                        offsetof({{type}}, exec_context.rlimit)
@@ -315,6 +316,7 @@ struct ConfigPerfItem;
 %%
 Unit.Description,                             config_parse_unit_string_printf,                    0,                                  offsetof(Unit, description)
 Unit.Documentation,                           config_parse_documentation,                         0,                                  offsetof(Unit, documentation)
+Unit.Tags,                                    config_parse_tags,                                  0,                                  0
 Unit.SourcePath,                              config_parse_unit_path_printf,                      0,                                  offsetof(Unit, source_path)
 Unit.Requires,                                config_parse_unit_deps,                             UNIT_REQUIRES,                      0
 Unit.Requisite,                               config_parse_unit_deps,                             UNIT_REQUISITE,                     0

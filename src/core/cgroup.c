@@ -29,6 +29,7 @@
 #include "fd-util.h"
 #include "fdset.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "in-addr-prefix-util.h"
 #include "inotify-util.h"
 #include "ip-protocol-list.h"
@@ -116,6 +117,7 @@ bool unit_has_startup_cgroup_constraints(Unit *u) {
                 return false;
 
         return c->startup_io_weight != CGROUP_WEIGHT_INVALID ||
+               c->startup_cpu_weight != CGROUP_WEIGHT_INVALID ||
                c->startup_cpuset_cpus.set ||
                c->startup_cpuset_mems.set ||
                c->startup_memory_high_set ||
@@ -797,7 +799,7 @@ static void unit_set_xattr_graceful(Unit *u, const char *name, const void *data,
         if (!crt || !crt->cgroup_path)
                 return;
 
-        r = cg_set_xattr(crt->cgroup_path, name, data, size, 0);
+        r = cg_set_xattr(crt->cgroup_path, name, data, size, /* flags= */ 0);
         if (r < 0)
                 log_unit_debug_errno(u, r, "Failed to set '%s' xattr on control group %s, ignoring: %m", name, empty_to_root(crt->cgroup_path));
 }
@@ -886,11 +888,9 @@ static int cgroup_log_xattr_apply(Unit *u) {
 }
 
 static void cgroup_invocation_id_xattr_apply(Unit *u) {
-        bool b;
-
         assert(u);
 
-        b = !sd_id128_is_null(u->invocation_id);
+        bool b = unit_has_invocation_id(u);
         FOREACH_STRING(xn, "trusted.invocation_id", "user.invocation_id") {
                 if (b)
                         unit_set_xattr_graceful(u, xn, SD_ID128_TO_STRING(u->invocation_id), 32);
@@ -939,26 +939,47 @@ static void cgroup_delegate_xattr_apply(Unit *u) {
 static void cgroup_survive_xattr_apply(Unit *u) {
         assert(u);
 
+        /* SurviveFinalKillSignal= is a system-only unit property */
+        if (!MANAGER_IS_SYSTEM(u->manager))
+                return;
+
         if (u->survive_final_kill_signal)
                 unit_set_xattr_graceful(u, "user.survive_final_kill_signal", "1", 1);
         else
                 unit_remove_xattr_graceful(u, "user.survive_final_kill_signal");
 }
 
+static void cgroup_tags_xattr_apply(Unit *u) {
+        int r;
+
+        assert(u);
+
+        if (!strv_isempty(u->tags)) {
+                _cleanup_free_ char *tags = NULL;
+                size_t size = 0;
+                r = strv_make_nulstr(u->tags, &tags, &size);
+                if (r < 0)
+                        return (void) log_oom();
+
+                unit_set_xattr_graceful(u, "user.tags", tags, size);
+        } else
+                unit_remove_xattr_graceful(u, "user.tags");
+}
+
 static void cgroup_xattr_apply(Unit *u) {
         assert(u);
 
-        /* The 'user.*' xattrs can be set from a user manager. */
+        /* The root slice of the user manager is a unit owned by the system manager */
+        if (!MANAGER_IS_SYSTEM(u->manager) && unit_has_name(u, SPECIAL_ROOT_SLICE))
+                return;
+
         cgroup_oomd_xattr_apply(u);
         cgroup_log_xattr_apply(u);
         cgroup_coredump_xattr_apply(u);
-
-        if (!MANAGER_IS_SYSTEM(u->manager))
-                return;
-
         cgroup_invocation_id_xattr_apply(u);
         cgroup_delegate_xattr_apply(u);
         cgroup_survive_xattr_apply(u);
+        cgroup_tags_xattr_apply(u);
 }
 
 static int lookup_block_device(const char *p, dev_t *ret) {
@@ -1133,10 +1154,8 @@ static void cgroup_apply_cpuset(Unit *u, const char *name, const CPUSet *cpus) {
         _cleanup_free_ char *buf = NULL;
 
         buf = cpu_set_to_range_string(cpus);
-        if (!buf) {
-                log_oom();
-                return;
-        }
+        if (!buf)
+                return (void) log_oom();
 
         (void) set_attribute_and_warn(u, name, buf);
 }
@@ -1173,11 +1192,13 @@ static void cgroup_apply_cpuset_partition(Unit *u, const char *name, const char 
         crt = ASSERT_PTR(unit_get_cgroup_runtime(u));
 
         r = cg_get_attribute(crt->cgroup_path, name, &buf);
-        if (r < 0) {
-                log_unit_full_errno(u, LOG_LEVEL_CGROUP_WRITE(r), r, "Failed to read back '%s' attribute on '%s' as '%.*s': %m",
-                                    name, empty_to_root(crt->cgroup_path), (int) strcspn(partition, NEWLINE), partition);
-                return;
-        }
+        if (r < 0)
+                return (void) log_unit_full_errno(u, LOG_LEVEL_CGROUP_WRITE(r), r,
+                                                  "Failed to read back '%s' attribute on '%s' as '%.*s': %m",
+                                                  name,
+                                                  empty_to_root(crt->cgroup_path),
+                                                  (int) strcspn(partition, NEWLINE),
+                                                  partition);
 
         r = cgroup_cpuset_partition_invalid(buf);
         if (r < 0)
@@ -2216,7 +2237,7 @@ static int unit_attach_pid_to_cgroup_via_bus(Unit *u, const char *cgroup_path, p
         r = bus_call_method(u->manager->system_bus,
                             bus_systemd_mgr,
                             "AttachProcessesToUnit",
-                            &error, NULL,
+                            &error, /* ret_reply= */ NULL,
                             "ssau",
                             NULL /* empty unit name means client's unit, i.e. us */, pp, 1, (uint32_t) pid);
         if (r < 0)
@@ -2814,7 +2835,7 @@ static int unit_prune_cgroup_via_bus(Unit *u) {
         r = bus_call_method(u->manager->system_bus,
                             bus_systemd_mgr,
                             "RemoveSubgroupFromUnit",
-                            &error, NULL,
+                            &error, /* ret_reply= */ NULL,
                             "sst",
                             NULL /* empty unit name means client's unit, i.e. us */,
                             pp,
@@ -3154,16 +3175,12 @@ static void unit_add_to_cgroup_oom_queue(Unit *u) {
                 _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
 
                 r = sd_event_add_defer(u->manager->event, &s, on_cgroup_oom_event, u->manager);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to create cgroup oom event source: %m");
-                        return;
-                }
+                if (r < 0)
+                        return (void) log_error_errno(r, "Failed to create cgroup oom event source: %m");
 
                 r = sd_event_source_set_priority(s, EVENT_PRIORITY_CGROUP_OOM);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to set priority of cgroup oom event source: %m");
-                        return;
-                }
+                if (r < 0)
+                        return (void) log_error_errno(r, "Failed to set priority of cgroup oom event source: %m");
 
                 (void) sd_event_source_set_description(s, "cgroup-oom");
                 u->manager->cgroup_oom_event_source = TAKE_PTR(s);
@@ -3297,7 +3314,7 @@ int manager_setup_cgroup(Manager *m) {
 
         /* 1. Determine hierarchy */
         m->cgroup_root = mfree(m->cgroup_root);
-        r = cg_pid_get_path(0, &m->cgroup_root);
+        r = cg_pid_get_path(/* pid= */ 0, &m->cgroup_root);
         if (r < 0)
                 return log_error_errno(r, "Cannot determine cgroup we are running in: %m");
 
@@ -3312,9 +3329,9 @@ int manager_setup_cgroup(Manager *m) {
 
         /* 2. Pin the cgroupfs mount, so that it cannot be unmounted */
         safe_close(m->pin_cgroupfs_fd);
-        m->pin_cgroupfs_fd = open("/sys/fs/cgroup", O_PATH|O_CLOEXEC|O_DIRECTORY);
+        m->pin_cgroupfs_fd = xopenat(AT_FDCWD, "/sys/fs/cgroup", O_PATH|O_DIRECTORY);
         if (m->pin_cgroupfs_fd < 0)
-                return log_error_errno(errno, "Failed to pin cgroup hierarchy: %m");
+                return log_error_errno(m->pin_cgroupfs_fd, "Failed to pin cgroup hierarchy: %m");
 
         /* 3. Allocate cgroup empty defer event source */
         m->cgroup_empty_event_source = sd_event_source_disable_unref(m->cgroup_empty_event_source);
@@ -3361,7 +3378,7 @@ int manager_setup_cgroup(Manager *m) {
         r = cg_create_and_attach(scope_path, /* pid= */ 0);
         if (r >= 0) {
                 /* Also, move all other userspace processes remaining in the root cgroup into that scope. */
-                r = cg_migrate(m->cgroup_root, scope_path, 0);
+                r = cg_migrate(m->cgroup_root, scope_path, /* flags= */ 0);
                 if (r < 0)
                         log_warning_errno(r, "Couldn't move remaining userspace processes, ignoring: %m");
 
@@ -3394,7 +3411,7 @@ void manager_shutdown_cgroup(Manager *m, bool delete) {
         /* We can't really delete the group, since we are in it. But
          * let's trim it. */
         if (delete && m->cgroup_root && !FLAGS_SET(m->test_run_flags, MANAGER_TEST_RUN_MINIMAL))
-                (void) cg_trim(m->cgroup_root, false);
+                (void) cg_trim(m->cgroup_root, /* delete_root= */ false);
 
         m->cgroup_empty_event_source = sd_event_source_disable_unref(m->cgroup_empty_event_source);
 
@@ -3711,9 +3728,9 @@ int unit_get_ip_accounting(
                 return -ENODATA;
 
         if (IN_SET(metric, CGROUP_IP_INGRESS_BYTES, CGROUP_IP_EGRESS_BYTES))
-                r = bpf_firewall_read_accounting(fd, &value, NULL);
+                r = bpf_firewall_read_accounting(fd, &value, /* ret_packets= */ NULL);
         else
-                r = bpf_firewall_read_accounting(fd, NULL, &value);
+                r = bpf_firewall_read_accounting(fd, /* ret_bytes= */ NULL, &value);
         if (r < 0)
                 return r;
 
@@ -3829,7 +3846,7 @@ static int unit_get_io_accounting_raw(
                 for (;;) {
                         _cleanup_free_ char *word = NULL;
 
-                        r = extract_first_word(&p, &word, NULL, EXTRACT_RETAIN_ESCAPE);
+                        r = extract_first_word(&p, &word, /* separators= */ NULL, EXTRACT_RETAIN_ESCAPE);
                         if (r < 0)
                                 return r;
                         if (r == 0)

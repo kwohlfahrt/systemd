@@ -38,6 +38,7 @@ extern DLSYM_PROTOTYPE(crypt_get_cipher_mode);
 extern DLSYM_PROTOTYPE(crypt_get_data_offset);
 extern DLSYM_PROTOTYPE(crypt_get_device_name);
 extern DLSYM_PROTOTYPE(crypt_get_dir);
+extern DLSYM_PROTOTYPE(crypt_get_pbkdf_type_params);
 extern DLSYM_PROTOTYPE(crypt_get_type);
 extern DLSYM_PROTOTYPE(crypt_get_uuid);
 extern DLSYM_PROTOTYPE(crypt_get_verity_info);
@@ -101,6 +102,7 @@ int cryptsetup_get_volume_key_id(struct crypt_device *cd, const char *volume_nam
 
 int dlopen_cryptsetup(int log_level) _dlopen_loader_;
 
+int cryptsetup_token_parse_common(sd_json_variant *v, const char **ret_type, int **ret_keyslots, size_t *ret_n_keyslots);
 int cryptsetup_get_keyslot_from_token(sd_json_variant *v);
 
 const char* mangle_none(const char *s);

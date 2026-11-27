@@ -78,11 +78,12 @@ static int process_managed_oom_message(Manager *m, uid_t uid, sd_json_variant *p
                 Hashmap *monitor_hm;
                 loadavg_t limit;
                 usec_t duration;
+                bool limit_overridden = false, duration_overridden = false;
 
                 if (!sd_json_variant_is_object(c))
                         continue;
 
-                r = sd_json_dispatch(c, dispatch_table, 0, &message);
+                r = sd_json_dispatch(c, dispatch_table, /* flags= */ 0, &message);
                 if (r == -ENOMEM)
                         return r;
                 if (r < 0)
@@ -138,7 +139,7 @@ static int process_managed_oom_message(Manager *m, uid_t uid, sd_json_variant *p
                         continue;
                 }
 
-                limit = m->default_mem_pressure_limit;
+                limit = m->config.default_mem_pressure_limit;
 
                 if (streq(message.property, "ManagedOOMMemoryPressure") && message.limit > 0) {
                         int permyriad = UINT32_SCALE_TO_PERMYRIAD(message.limit);
@@ -146,12 +147,15 @@ static int process_managed_oom_message(Manager *m, uid_t uid, sd_json_variant *p
                         r = store_loadavg_fixed_point(permyriad / 100LU, permyriad % 100LU, &limit);
                         if (r < 0)
                                 continue;
+
+                        limit_overridden = true;
                 }
 
-                if (streq(message.property, "ManagedOOMMemoryPressure") && message.duration != USEC_INFINITY)
+                if (streq(message.property, "ManagedOOMMemoryPressure") && message.duration != USEC_INFINITY) {
                         duration = message.duration;
-                else
-                        duration = m->default_mem_pressure_duration_usec;
+                        duration_overridden = true;
+                } else
+                        duration = m->config.default_mem_pressure_duration_usec;
 
                 /* For OOMRules, only insert/update if rules are actually provided */
                 if (streq(message.property, "OOMRules")) {
@@ -163,7 +167,7 @@ static int process_managed_oom_message(Manager *m, uid_t uid, sd_json_variant *p
                          * a fresh one if the cgroup is new. */
                         ctx = hashmap_get(monitor_hm, empty_to_root(message.path));
                         if (!ctx) {
-                                r = oomd_insert_cgroup_context(NULL, monitor_hm, message.path);
+                                r = oomd_insert_cgroup_context(/* old_h= */ NULL, monitor_hm, message.path);
                                 if (r == -ENOMEM)
                                         return r;
                                 if (r < 0) {
@@ -204,7 +208,7 @@ static int process_managed_oom_message(Manager *m, uid_t uid, sd_json_variant *p
                         continue;
                 }
 
-                r = oomd_insert_cgroup_context(NULL, monitor_hm, message.path);
+                r = oomd_insert_cgroup_context(/* old_h= */ NULL, monitor_hm, message.path);
                 if (r == -ENOMEM)
                         return r;
                 if (r < 0 && r != -EEXIST)
@@ -214,6 +218,8 @@ static int process_managed_oom_message(Manager *m, uid_t uid, sd_json_variant *p
                  * ignored so always updating it here is not a problem. */
                 ctx = hashmap_get(monitor_hm, empty_to_root(message.path));
                 if (ctx) {
+                        ctx->mem_pressure_limit_overridden = limit_overridden;
+                        ctx->mem_pressure_duration_overridden = duration_overridden;
                         ctx->mem_pressure_limit = limit;
                         ctx->mem_pressure_duration_usec = duration;
                 }
@@ -304,7 +310,7 @@ static int recursively_get_cgroup_context(Hashmap *new_h, const char *path) {
         if (r < 0)
                 return r;
         else if (r == 0) { /* No subgroups? We're a leaf node */
-                r = oomd_insert_cgroup_context(NULL, new_h, path);
+                r = oomd_insert_cgroup_context(/* old_h= */ NULL, new_h, path);
                 if (r == -ENOMEM)
                         return r;
                 if (r < 0)
@@ -330,7 +336,7 @@ static int recursively_get_cgroup_context(Hashmap *new_h, const char *path) {
                         continue;
                 }
                 if (r > 0)
-                        r = oomd_insert_cgroup_context(NULL, new_h, cg_path);
+                        r = oomd_insert_cgroup_context(/* old_h= */ NULL, new_h, cg_path);
                 else
                         r = recursively_get_cgroup_context(new_h, cg_path);
                 if (r == -ENOMEM)
@@ -436,7 +442,7 @@ static int acquire_managed_oom_connect(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to bind reply callback: %m");
 
-        r = sd_varlink_observe(link, "io.systemd.ManagedOOM.SubscribeManagedOOMCGroups", NULL);
+        r = sd_varlink_observe(link, "io.systemd.ManagedOOM.SubscribeManagedOOMCGroups", /* parameters= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to observe varlink call: %m");
 
@@ -475,8 +481,8 @@ static int monitor_swap_contexts_handler(sd_event_source *s, uint64_t usec, void
          * nodes are the ones that matter). */
 
         /* Check amount of memory available and swap free so we don't free up swap when memory is still available. */
-        if (oomd_mem_available_below(&m->system_context, 10000 - m->swap_used_limit_permyriad) &&
-                        oomd_swap_free_below(&m->system_context, 10000 - m->swap_used_limit_permyriad)) {
+        if (oomd_mem_available_below(&m->system_context, 10000 - m->config.swap_used_limit_permyriad) &&
+                        oomd_swap_free_below(&m->system_context, 10000 - m->config.swap_used_limit_permyriad)) {
                 _cleanup_hashmap_free_ Hashmap *candidates = NULL;
                 OomdCGroupContext *selected = NULL;
                 uint64_t threshold;
@@ -485,7 +491,7 @@ static int monitor_swap_contexts_handler(sd_event_source *s, uint64_t usec, void
                           "swap used (%"PRIu64") / total (%"PRIu64") is more than " PERMYRIAD_AS_PERCENT_FORMAT_STR,
                           m->system_context.mem_used, m->system_context.mem_total,
                           m->system_context.swap_used, m->system_context.swap_total,
-                          PERMYRIAD_AS_PERCENT_FORMAT_VAL(m->swap_used_limit_permyriad));
+                          PERMYRIAD_AS_PERCENT_FORMAT_VAL(m->config.swap_used_limit_permyriad));
 
                 r = get_monitored_cgroup_contexts_candidates(m->monitored_swap_cgroup_contexts, &candidates);
                 if (r == -ENOMEM)
@@ -515,7 +521,7 @@ static int monitor_swap_contexts_handler(sd_event_source *s, uint64_t usec, void
                                            selected->path,
                                            m->system_context.mem_used, m->system_context.mem_total,
                                            m->system_context.swap_used, m->system_context.swap_total,
-                                           PERMYRIAD_AS_PERCENT_FORMAT_VAL(m->swap_used_limit_permyriad));
+                                           PERMYRIAD_AS_PERCENT_FORMAT_VAL(m->config.swap_used_limit_permyriad));
                         return 0;
                 }
         }
@@ -1069,7 +1075,7 @@ static int monitor_swap_contexts(Manager *m) {
         assert(m);
         assert(m->event);
 
-        r = sd_event_add_time(m->event, &s, CLOCK_MONOTONIC, 0, 0, monitor_swap_contexts_handler, m);
+        r = sd_event_add_time(m->event, &s, CLOCK_MONOTONIC, /* usec= */ 0, /* accuracy= */ 0, monitor_swap_contexts_handler, m);
         if (r < 0)
                 return r;
 
@@ -1094,7 +1100,7 @@ static int monitor_memory_pressure_contexts(Manager *m) {
         assert(m);
         assert(m->event);
 
-        r = sd_event_add_time(m->event, &s, CLOCK_MONOTONIC, 0, 0, monitor_memory_pressure_contexts_handler, m);
+        r = sd_event_add_time(m->event, &s, CLOCK_MONOTONIC, /* usec= */ 0, /* accuracy= */ 0, monitor_memory_pressure_contexts_handler, m);
         if (r < 0)
                 return r;
 
@@ -1119,7 +1125,7 @@ static int monitor_rules_contexts(Manager *m) {
         assert(m);
         assert(m->event);
 
-        r = sd_event_add_time(m->event, &s, CLOCK_MONOTONIC, 0, 0, monitor_rules_contexts_handler, m);
+        r = sd_event_add_time(m->event, &s, CLOCK_MONOTONIC, /* usec= */ 0, /* accuracy= */ 0, monitor_rules_contexts_handler, m);
         if (r < 0)
                 return r;
 
@@ -1168,8 +1174,31 @@ static int manager_dispatch_reload_signal(sd_event_source *s, const struct signa
 
         (void) notify_reloading();
 
-        manager_set_defaults(m);
-        manager_parse_config_file(m);
+        OomdConfig config;
+        int r = oomd_config_parse(&config);
+        manager_load_rulesets(m);
+
+        if (r < 0)
+                log_warning_errno(r, "Failed to read oomd.conf, keeping previous settings: %m");
+        else {
+                OomdCGroupContext *ctx;
+
+                m->config = config;
+
+                HASHMAP_FOREACH(ctx, m->monitored_mem_pressure_cgroup_contexts) {
+                        if (!ctx->mem_pressure_limit_overridden &&
+                            ctx->mem_pressure_limit != config.default_mem_pressure_limit) {
+                                ctx->mem_pressure_limit = config.default_mem_pressure_limit;
+
+                                /* Start a new observation window for the updated threshold. */
+                                ctx->mem_pressure_limit_hit_start = 0;
+                        }
+
+                        if (!ctx->mem_pressure_duration_overridden)
+                                ctx->mem_pressure_duration_usec = config.default_mem_pressure_duration_usec;
+                }
+        }
+
         warn_missing_rulesets(m);
 
         (void) sd_notify(/* unset_environment= */ false, NOTIFY_READY_MESSAGE);
@@ -1186,8 +1215,8 @@ int manager_new(Manager **ret) {
         if (!m)
                 return -ENOMEM;
 
-        manager_set_defaults(m);
-        manager_parse_config_file(m);
+        (void) oomd_config_parse(&m->config);
+        manager_load_rulesets(m);
 
         r = sd_event_default(&m->event);
         if (r < 0)
@@ -1245,11 +1274,11 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_request_name_async(m->bus, NULL, "org.freedesktop.oom1", 0, NULL, NULL);
+        r = sd_bus_request_name_async(m->bus, /* ret_slot= */ NULL, "org.freedesktop.oom1", /* flags= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
-        r = sd_bus_attach_event(m->bus, m->event, 0);
+        r = sd_bus_attach_event(m->bus, m->event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
@@ -1367,9 +1396,10 @@ int manager_get_dump_string(Manager *m, char **ret) {
                 "Default Memory Pressure Duration: %s\n"
                 "System Context:\n",
                 yes_no(m->dry_run),
-                PERMYRIAD_AS_PERCENT_FORMAT_VAL(m->swap_used_limit_permyriad),
-                LOADAVG_INT_SIDE(m->default_mem_pressure_limit), LOADAVG_DECIMAL_SIDE(m->default_mem_pressure_limit),
-                FORMAT_TIMESPAN(m->default_mem_pressure_duration_usec, USEC_PER_SEC));
+                PERMYRIAD_AS_PERCENT_FORMAT_VAL(m->config.swap_used_limit_permyriad),
+                LOADAVG_INT_SIDE(m->config.default_mem_pressure_limit),
+                LOADAVG_DECIMAL_SIDE(m->config.default_mem_pressure_limit),
+                FORMAT_TIMESPAN(m->config.default_mem_pressure_duration_usec, USEC_PER_SEC));
         oomd_dump_system_context(&m->system_context, f, "\t");
 
         r = hashmap_dump_sorted(m->monitored_swap_cgroup_contexts, (void***) &sorted, &n);
@@ -1389,5 +1419,5 @@ int manager_get_dump_string(Manager *m, char **ret) {
         FOREACH_ARRAY(c, sorted, n)
                 oomd_dump_memory_pressure_cgroup_context(*c, f, "\t");
 
-        return memstream_finalize(&ms, ret, NULL);
+        return memstream_finalize(&ms, ret, /* ret_size= */ NULL);
 }

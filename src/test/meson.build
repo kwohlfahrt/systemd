@@ -28,26 +28,28 @@ endif
 generate_sym_test_py = files('generate-sym-test.py')
 
 test_libsystemd_sym_c = custom_target(
-        input : [libsystemd_sym_path,
+        input : [libsystemd_sym,
                  systemd_headers,
                  libsystemd_sources],
         output : 'test-libsystemd-sym.c',
-        command : [generate_sym_test_py,
-                   libsystemd_sym_path,
-                   libsystemd_dir_path,
+        command : [python,
+                   generate_sym_test_py,
+                   '@INPUT0@',
+                   relative_source_path / 'src/libsystemd',
                    systemd_headers],
         capture : true,
         build_by_default : want_tests != 'false')
 
 test_libudev_sym_c = custom_target(
-        input : [libudev_sym_path,
-                 libudev_h_path,
+        input : [libudev_sym,
+                 libudev_h,
                  libudev_sources],
         output : 'test-libudev-sym.c',
-        command : [generate_sym_test_py,
-                   libudev_sym_path,
-                   libudev_dir_path,
-                   libudev_h_path],
+        command : [python,
+                   generate_sym_test_py,
+                   '@INPUT0@',
+                   relative_source_path / 'src/libudev',
+                   '@INPUT1@'],
         capture : true,
         build_by_default : want_tests != 'false')
 
@@ -68,6 +70,7 @@ simple_tests += files(
         'test-bitfield.c',
         'test-bitmap.c',
         'test-blockdev-util.c',
+        'test-bmp.c',
         'test-bootspec.c',
         'test-build-path.c',
         'test-bus-unit-util.c',
@@ -87,6 +90,7 @@ simple_tests += files(
         'test-copy.c',
         'test-coredump-util.c',
         'test-cpu-set-util.c',
+        'test-csi-inband-resize.c',
         'test-daemon.c',
         'test-data-fd-util.c',
         'test-date.c',
@@ -94,7 +98,10 @@ simple_tests += files(
         'test-device-nodes.c',
         'test-devnum-util.c',
         'test-dirent-util.c',
+        'test-discover-image.c',
+        'test-dm-util.c',
         'test-dns-domain.c',
+        'test-dropin.c',
         'test-ellipsize.c',
         'test-env-file.c',
         'test-env-util.c',
@@ -104,7 +111,9 @@ simple_tests += files(
         'test-exec-util.c',
         'test-execve.c',
         'test-exit-status.c',
+        'test-extension-util.c',
         'test-extract-word.c',
+        'test-fanotify-util.c',
         'test-fdset.c',
         'test-fiemap.c',
         'test-fileio.c',
@@ -120,6 +129,7 @@ simple_tests += files(
         'test-gunicode.c',
         'test-hash-funcs.c',
         'test-hexdecoct.c',
+        'test-hexdump.c',
         'test-hmac.c',
         'test-hostname-setup.c',
         'test-hostname-util.c',
@@ -131,12 +141,15 @@ simple_tests += files(
         'test-initrd-cpio.c',
         'test-install-file.c',
         'test-install-root.c',
+        'test-io-uring-filter.c',
+        'test-io-uring-util.c',
         'test-io-util.c',
         'test-iovec-util.c',
         'test-iovec-wrapper.c',
         'test-ip-protocol-list.c',
         'test-journal-importer.c',
         'test-kbd-util.c',
+        'test-keyring-util.c',
         'test-label.c',
         'test-limits-util.c',
         'test-list.c',
@@ -163,6 +176,7 @@ simple_tests += files(
         'test-notify-recv.c',
         'test-nsresource.c',
         'test-nulstr-util.c',
+        'test-object-tags.c',
         'test-open-file.c',
         'test-options.c',
         'test-ordered-set.c',
@@ -186,6 +200,7 @@ simple_tests += files(
         'test-procfs-util.c',
         'test-progress-bar.c',
         'test-psi-util.c',
+        'test-ptyfwd.c',
         'test-qmp-client.c',
         'test-qrcode-util.c',
         'test-ratelimit.c',
@@ -231,9 +246,13 @@ simple_tests += files(
         'test-user-record-nss.c',
         'test-user-util.c',
         'test-utf8.c',
+        'test-validatefs-util.c',
         'test-verbs.c',
+        'test-vfat-util.c',
+        'test-voa-util.c',
         'test-vpick.c',
         'test-web-util.c',
+        'test-xattr-match.c',
         'test-xattr-util.c',
         'test-xml.c',
 )
@@ -277,6 +296,10 @@ executables += [
                 'type' : 'manual',
         },
         test_template + {
+                'sources' : files('test-cli-c.c'),
+                'type' : 'manual',
+        },
+        test_template + {
                 'sources' : files('test-compress-benchmark.c'),
                 'link_with' : [libshared],
                 'timeout' : 90,
@@ -310,11 +333,23 @@ executables += [
                 'c_args' : ['-fno-sanitize=all', '-fno-optimize-sibling-calls', '-O1'],
         },
         test_template + {
+                'sources' : files('test-coredump-thread.c'),
+                'type' : 'manual',
+        },
+        test_template + {
                 'sources' : files('test-creds.c'),
                 'dependencies' : [
                         libopenssl_cflags,
                         tpm2_cflags,
                 ],
+        },
+        test_template + {
+                'sources' : files('test-cryptsetup-util.c'),
+                'dependencies' : libcryptsetup_cflags,
+        },
+        test_template + {
+                'sources' : files('test-cryptsetup-fido2.c'),
+                'dependencies' : libfido2_cflags,
         },
         test_template + {
                 'sources' : files('test-crypto-util.c'),
@@ -410,6 +445,9 @@ executables += [
                 'type' : 'unsafe',
         },
         test_template + {
+                'sources' : files('test-kernel-image.c'),
+        },
+        test_template + {
                 'sources' : files('test-kexec.c'),
                 'link_with' : [libshared],
         },
@@ -435,6 +473,10 @@ executables += [
         test_template + {
                 'sources' : files('test-luo.c'),
                 'type' : 'manual',
+        },
+        test_template + {
+                'sources' : files('test-manifest-util.c'),
+                'dependencies' : libopenssl_cflags,
         },
         test_template + {
                 'sources' : files('test-math-util.c'),
@@ -469,6 +511,12 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-pe-binary.c'),
+                'export' : files('pe-test-util.c'),
+                'dependencies' : libopenssl_cflags,
+        },
+        test_template + {
+                'sources' : files('test-pe-writer.c'),
+                'import' : ['test-pe-binary'],
                 'dependencies' : libopenssl_cflags,
         },
         test_template + {
@@ -486,6 +534,11 @@ executables += [
                 'conditions' : ['ENABLE_VMSPAWN'],
         },
         test_template + {
+                'sources' : files('test-ssh-util.c'),
+                'dependencies' : libopenssl_cflags,
+                'conditions' : ['HAVE_OPENSSL'],
+        },
+        test_template + {
                 'sources' : files('test-random-util.c'),
                 'timeout' : 120,
         },
@@ -496,7 +549,7 @@ executables += [
         test_template + {
                 'sources' : files('test-sbat.c'),
                 'conditions' : ['ENABLE_BOOTLOADER'],
-                'c_args' : f'-I@efi_config_h_dir@',
+                'c_args' : '-Isrc/boot',
         },
         test_template + {
                 'sources' : files('test-seccomp.c'),
@@ -523,8 +576,13 @@ executables += [
                 'timeout' : 120,
         },
         test_template + {
+                'sources' : files('test-pkcs11-util.c'),
+                'dependencies' : libp11kit_cflags,
+        },
+        test_template + {
                 'sources' : files('test-tpm2.c'),
                 'dependencies' : [
+                        libfido2_cflags,
                         libopenssl_cflags,
                         tpm2_cflags,
                 ],
@@ -624,6 +682,9 @@ executables += [
         core_test_template + {
                 'sources' : files('test-engine.c'),
                 'dependencies' : common_test_dependencies,
+        },
+        core_test_template + {
+                'sources' : files('test-exec-directory.c'),
         },
         core_test_template + {
                 'sources' : files('test-execute.c'),
@@ -757,6 +818,20 @@ if static_libudev != 'false'
                         'build_by_default' : want_tests != 'false',
                         'install' : install_tests ? 'yes' : 'no',
                         'suite' : 'libudev',
+                },
+        ]
+endif
+
+############################################################
+
+if have_rust
+        executables += [
+                rust_test_template + {
+                        'sources' : files('test-rust-shared.rs'),
+                },
+                rust_test_template + {
+                        'sources' : files('test-cli-rust.rs'),
+                        'type' : 'manual',
                 },
         ]
 endif

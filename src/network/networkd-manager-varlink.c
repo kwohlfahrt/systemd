@@ -21,6 +21,7 @@
 #include "string-util.h"
 #include "varlink-io.systemd.Network.h"
 #include "varlink-io.systemd.Network.Link.h"
+#include "varlink-io.systemd.Resolve.Link.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
 
@@ -192,7 +193,7 @@ static int vl_method_set_persistent_storage(sd_varlink *vlink, sd_json_variant *
                         return log_warning_errno(r, "Failed to check if the persistent storage is writable: %m");
                 if (r > 0) {
                         log_warning("The persistent storage is on read-only filesystem.");
-                        return sd_varlink_error(vlink, "io.systemd.Network.StorageReadOnly", NULL);
+                        return sd_varlink_error(vlink, "io.systemd.Network.StorageReadOnly", /* parameters= */ NULL);
                 }
 
                 if (fstat(fd, &st) < 0)
@@ -205,11 +206,11 @@ static int vl_method_set_persistent_storage(sd_varlink *vlink, sd_json_variant *
                 if (manager->persistent_storage_fd >= 0 &&
                     fstat(manager->persistent_storage_fd, &st_prev) >= 0 &&
                     stat_inode_same(&st, &st_prev))
-                        return sd_varlink_reply(vlink, NULL);
+                        return sd_varlink_reply(vlink, /* parameters= */ NULL);
 
         } else {
                 if (manager->persistent_storage_fd < 0)
-                        return sd_varlink_reply(vlink, NULL);
+                        return sd_varlink_reply(vlink, /* parameters= */ NULL);
         }
 
         r = varlink_verify_polkit_async(
@@ -234,7 +235,7 @@ static int vl_method_set_persistent_storage(sd_varlink *vlink, sd_json_variant *
 
         manager_toggle_dhcp4_server_state(manager, ready);
 
-        return sd_varlink_reply(vlink, NULL);
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
 }
 
 static int vl_method_reload(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -250,7 +251,7 @@ static int vl_method_reload(sd_varlink *vlink, sd_json_variant *parameters, sd_v
         assert(vlink);
 
         if (m->reloading > 0)
-                return sd_varlink_error(vlink, "io.systemd.Network.AlreadyReloading", NULL);
+                return sd_varlink_error(vlink, "io.systemd.Network.AlreadyReloading", /* parameters= */ NULL);
 
         const char *method;
         r = sd_varlink_get_current_method(vlink, &method);
@@ -283,7 +284,7 @@ static int vl_method_reload(sd_varlink *vlink, sd_json_variant *parameters, sd_v
         if (m->reloading > 0)
                 return 0; /* Reply will be sent asynchronously. */
 
-        return sd_varlink_reply(vlink, NULL);
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
 }
 
 int manager_varlink_init(Manager *m, int fd) {
@@ -310,29 +311,39 @@ int manager_varlink_init(Manager *m, int fd) {
                         s,
                         &vl_interface_io_systemd_Network,
                         &vl_interface_io_systemd_Network_Link,
+                        &vl_interface_io_systemd_Resolve_Link,
                         &vl_interface_io_systemd_service);
         if (r < 0)
                 return log_error_errno(r, "Failed to add Network interface to varlink server: %m");
 
         r = sd_varlink_server_bind_method_many(
                         s,
-                        "io.systemd.Network.Describe",             vl_method_describe,
-                        "io.systemd.Network.GetStates",            vl_method_get_states,
-                        "io.systemd.Network.GetNamespaceId",       vl_method_get_namespace_id,
-                        "io.systemd.Network.GetLLDPNeighbors",     vl_method_get_lldp_neighbors,
-                        "io.systemd.Network.Reload",               vl_method_reload,
-                        "io.systemd.Network.SetPersistentStorage", vl_method_set_persistent_storage,
-                        "io.systemd.Network.Link.Describe",        vl_method_link_describe,
-                        "io.systemd.Network.Link.Up",              vl_method_link_up,
-                        "io.systemd.Network.Link.Down",            vl_method_link_down,
-                        "io.systemd.Network.Link.Renew",           vl_method_link_renew,
-                        "io.systemd.Network.Link.ForceRenew",      vl_method_link_force_renew,
-                        "io.systemd.Network.Link.Reconfigure",     vl_method_link_reconfigure,
-                        "io.systemd.service.Ping",                 varlink_method_ping,
-                        "io.systemd.service.Reload",               vl_method_reload,
-                        "io.systemd.service.SetLogLevel",          varlink_method_set_log_level,
-                        "io.systemd.service.GetLogLevel",          varlink_method_get_log_level,
-                        "io.systemd.service.GetEnvironment",       varlink_method_get_environment);
+                        "io.systemd.Network.Describe",                           vl_method_describe,
+                        "io.systemd.Network.GetStates",                          vl_method_get_states,
+                        "io.systemd.Network.GetNamespaceId",                     vl_method_get_namespace_id,
+                        "io.systemd.Network.GetLLDPNeighbors",                   vl_method_get_lldp_neighbors,
+                        "io.systemd.Network.Reload",                             vl_method_reload,
+                        "io.systemd.Network.SetPersistentStorage",               vl_method_set_persistent_storage,
+                        "io.systemd.Network.Link.Describe",                      vl_method_link_describe,
+                        "io.systemd.Network.Link.Up",                            vl_method_link_up,
+                        "io.systemd.Network.Link.Down",                          vl_method_link_down,
+                        "io.systemd.Network.Link.Renew",                         vl_method_link_renew,
+                        "io.systemd.Network.Link.ForceRenew",                    vl_method_link_force_renew,
+                        "io.systemd.Network.Link.Reconfigure",                   vl_method_link_reconfigure,
+                        "io.systemd.Resolve.Link.SetDNS",                        vl_method_link_set_dns,
+                        "io.systemd.Resolve.Link.SetDomains",                    vl_method_link_set_domains,
+                        "io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors", vl_method_link_set_dnssec_negative_trust_anchors,
+                        "io.systemd.Resolve.Link.SetDNSDefaultRoute",            vl_method_link_set_dns_default_route,
+                        "io.systemd.Resolve.Link.SetLLMNR",                      vl_method_link_set_llmnr,
+                        "io.systemd.Resolve.Link.SetMulticastDNS",               vl_method_link_set_mdns,
+                        "io.systemd.Resolve.Link.SetDNSOverTLS",                 vl_method_link_set_dns_over_tls,
+                        "io.systemd.Resolve.Link.SetDNSSEC",                     vl_method_link_set_dnssec,
+                        "io.systemd.Resolve.Link.RevertDNS",                     vl_method_link_revert_dns,
+                        "io.systemd.service.Ping",                               varlink_method_ping,
+                        "io.systemd.service.Reload",                             vl_method_reload,
+                        "io.systemd.service.SetLogLevel",                        varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",                        varlink_method_get_log_level,
+                        "io.systemd.service.GetEnvironment",                     varlink_method_get_environment);
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");
 

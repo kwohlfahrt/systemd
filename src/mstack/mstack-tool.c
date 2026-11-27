@@ -49,7 +49,7 @@ COMMAND(
                 "WHAT\0"
                 "--mount WHAT WHERE\0"
                 "--umount WHERE\0",
-        .man_pages = "systemd-mstack(1)\0",
+        .man_page = "systemd-mstack(1)",
         .option_namespace = "systemd-mstack",
         .pager_flags = &arg_pager_flags,
 );
@@ -191,7 +191,7 @@ static int parse_argv(int argc, char *argv[]) {
 COMMAND(
         "mount.mstack\0",
         "External helper for mount.8 to mount mount stacks.",
-        .man_pages = "systemd-mstack(1)\0",
+        .man_page = "systemd-mstack(1)",
         .option_namespace = "mount.mstack",
 );
 
@@ -353,7 +353,7 @@ static int umount_mstack(void) {
 
         fd = safe_close(fd);
 
-        r = umount_recursive(canonical, 0);
+        r = umount_recursive(canonical, /* flags= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to unmount '%s': %m", canonical);
 
@@ -373,6 +373,7 @@ static int run(int argc, char *argv[]) {
         LIBCRYPTO_NOTE(suggested);
         LIBCRYPTSETUP_NOTE(suggested);
         LIBMOUNT_NOTE(recommended);
+        TPM2_NOTE(suggested);
 
         log_setup();
 

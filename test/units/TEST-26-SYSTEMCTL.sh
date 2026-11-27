@@ -23,7 +23,7 @@ export UNIT_NAME="systemctl-test-$RANDOM.service"
 export UNIT_NAME2="systemctl-test-$RANDOM.service"
 export UNIT_NAME_TEMPLATE="systemctl-test-${RANDOM}@.service"
 
-cat >"/usr/lib/systemd/system/$UNIT_NAME" <<\EOF
+cat >"/usr/lib/systemd/system/$UNIT_NAME" <<EOF
 [Unit]
 Description=systemctl test
 
@@ -96,6 +96,16 @@ systemctl list-dependencies --before systemd-journald
 systemctl list-dependencies --after --reverse systemd-journald
 systemctl list-dependencies --before --reverse systemd-journald
 systemctl list-dependencies --plain systemd-journald
+# Tree mode shows a unit once for every path that leads to it, --plain only once, so the tree must be
+# longer while still listing exactly the same set of units
+systemctl list-dependencies --full --all sysinit.target >/tmp/list-deps-tree
+systemctl list-dependencies --full --all --plain sysinit.target >/tmp/list-deps-plain
+(( $(wc -l </tmp/list-deps-tree) > $(wc -l </tmp/list-deps-plain) ))
+diff <(sed -nE 's/^.*(├─|└─|\|-|`-)//p' /tmp/list-deps-tree | grep -vx '\.\.\.' | sort -u) \
+     <(sed -nE 's/^  //p' /tmp/list-deps-plain | sort -u)
+rm -f /tmp/list-deps-tree /tmp/list-deps-plain
+systemctl list-dependencies --all --reverse systemd-journald >/dev/null
+systemctl list-dependencies --all sysinit.target basic.target >/dev/null
 
 # list-* verbs
 systemctl list-units
@@ -369,6 +379,14 @@ systemctl status "sys-devices-*-ttyS0.device"
 systemctl status -- -.mount
 systemctl status 1
 
+# Exited commands are shown with argument boundaries preserved (#43938)
+systemd-run --unit=status-quoting-test.service -p Type=oneshot -p RemainAfterExit=yes \
+            --expand-environment=no true "foo bar" "" "a\$b"
+output="$(systemctl status --full --no-pager --lines=0 status-quoting-test.service)"
+systemctl stop status-quoting-test.service
+# shellcheck disable=SC2016
+grep -F ' "foo bar" "" "a\$b" (code=exited, status=0/SUCCESS)' <<<"$output"
+
 # --marked
 systemctl restart "$UNIT_NAME"
 systemctl set-property "$UNIT_NAME" "Markers=needs-reload needs-restart"
@@ -396,7 +414,14 @@ systemctl reload-or-restart --marked
 (! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
 (! systemctl is-active "$UNIT_NAME")
 
-# Test marker normalization with incremental (+) syntax
+# needs-restart should be silently ignored on inactive units (D-Bus)
+systemctl set-property "$UNIT_NAME" "Markers=needs-restart"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-restart)
+systemctl set-property "$UNIT_NAME" "Markers=+needs-restart"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-restart)
+
+# Test marker normalization with incremental (+) syntax (needs-restart is only kept on active units)
+systemctl start "$UNIT_NAME"
 
 # needs-start + +needs-restart → needs-restart (restart wins against start)
 systemctl set-property "$UNIT_NAME" "Markers=needs-start"
@@ -473,7 +498,15 @@ timeout 30 bash -c "until systemctl list-jobs $UNIT_NAME | grep \"No jobs\" 2>/d
 (! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
 (! systemctl is-active "$UNIT_NAME")
 
+# needs-restart should be silently ignored on inactive units (Varlink)
+(! systemctl is-active "$UNIT_NAME")
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-restart\"]}}"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-restart)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"+needs-restart\"]}}"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-restart)
+
 # Test marker normalization with incremental (+) syntax via varlinkctl
+systemctl start "$UNIT_NAME"
 
 # needs-start + +needs-restart → needs-restart (restart wins against start)
 varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-start\"]}}"

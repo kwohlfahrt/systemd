@@ -197,6 +197,7 @@ int dns_packet_patch_ttls(DnsPacket *p, usec_t timestamp);
 
 void dns_packet_truncate(DnsPacket *p, size_t sz);
 int dns_packet_truncate_opt(DnsPacket *p);
+int dns_packet_truncate_rrs(DnsPacket *p, size_t max_size, bool reserve_opt);
 
 int dns_packet_read(DnsPacket *p, size_t sz, const void **ret, size_t *start);
 int dns_packet_read_blob(DnsPacket *p, void *d, size_t sz, size_t *start);
@@ -211,7 +212,6 @@ int dns_packet_read_rr(DnsPacket *p, DnsResourceRecord **ret, bool *ret_cache_fl
 
 void dns_packet_rewind(DnsPacket *p, size_t idx);
 
-int dns_packet_skip_question(DnsPacket *p);
 int dns_packet_extract(DnsPacket *p);
 
 bool dns_packet_equal(const DnsPacket *a, const DnsPacket *b);

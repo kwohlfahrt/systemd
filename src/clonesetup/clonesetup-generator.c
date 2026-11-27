@@ -13,6 +13,15 @@
 #include "path-util.h"
 #include "specifier.h"
 #include "unit-name.h"
+#include "verbs.h"
+
+COMMAND(
+        "systemd-clonesetup-generator\0",
+        "Generate units from /etc/clonetab.",
+        .argspec = GENERATOR_ARGSPEC,
+        .man_page = "systemd-clonesetup-generator(8)",
+        .option_namespace = "common",
+);
 
 static const char *arg_dest = NULL;
 

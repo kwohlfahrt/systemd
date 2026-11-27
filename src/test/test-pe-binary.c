@@ -26,6 +26,7 @@
 #include "fd-util.h"
 #include "memfd-util.h"
 #include "pe-binary.h"
+#include "pe-test-util.h"
 #include "tests.h"
 #include "uki.h"
 #include "unaligned.h"
@@ -36,35 +37,6 @@
 
 /* Match the cap defined in src/shared/pe-binary.c (PLAN §3.2). */
 #define UKI_HASH_PADDING_CAP_BYTES (64U * 1024U * 1024U)
-
-/* File offsets of the PE32+ header skeleton this test builds. */
-#define SECTION_TABLE_OFFSET 0x148
-#define IMAGE_FILE_HEADER_NOS_OFFSET 0x46    /* NumberOfSections (le16) */
-#define IMAGE_SECTION_HEADER_BYTES 40
-
-/* Header skeleton, byte-for-byte compatible with the canonical reproducer
- * so that pe_load_headers() succeeds without further mutation. We only
- * patch NumberOfSections at runtime (offset 0x46) and append section
- * headers + raw data after the optional header. */
-static const uint8_t HEADER_SKELETON[SECTION_TABLE_OFFSET] = {
-        /* DOS header: "MZ" at 0x00, e_lfanew = 0x40 at 0x3c */
-        [0x00] = 'M', 'Z',
-        [0x3c] = 0x40, 0x00, 0x00, 0x00,
-
-        /* PE signature at 0x40 */
-        [0x40] = 'P', 'E', 0x00, 0x00,
-
-        /* IMAGE_FILE_HEADER at 0x44 */
-        [0x44] = 0x64, 0x86,                  /* Machine = 0x8664 (x86_64) */
-        /* [0x46]: NumberOfSections — patched per test */
-        [0x54] = 0xf0, 0x00,                  /* SizeOfOptionalHeader = 0xf0 */
-        [0x56] = 0x22, 0x00,                  /* Characteristics = executable image */
-
-        /* IMAGE_OPTIONAL_HEADER (PE32+) at 0x58 */
-        [0x58] = 0x0b, 0x02,                  /* Magic = 0x020b (PE32+) */
-        [0x9c] = 0x0a, 0x00,                  /* Subsystem = EFI Application */
-        [0xc4] = 0x10, 0x00, 0x00, 0x00,      /* NumberOfRvaAndSizes = 16 (matches SizeOfOptionalHeader=0xf0) */
-};
 
 typedef struct SectionSpec {
         const char *name;       /* PE section name; truncated/padded to 8 bytes on write */
@@ -88,7 +60,7 @@ static int build_pe_file(
 
         /* Minimum size is "headers + section table"; sections with SizeOfRawData>0
          * must additionally fit inside the file. */
-        size_t base = SECTION_TABLE_OFFSET + n_sections * IMAGE_SECTION_HEADER_BYTES;
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + n_sections * sizeof(IMAGE_SECTION_HEADER);
         size_t needed = base;
         FOREACH_ARRAY(spec, specs, n_sections)
                 if (spec->size_of_raw_data > 0) {
@@ -101,12 +73,11 @@ static int build_pe_file(
         ASSERT_GE(file_size, base);
         _cleanup_free_ uint8_t *buf = ASSERT_NOT_NULL(new0(uint8_t, file_size));
 
-        memcpy(buf, HEADER_SKELETON, sizeof(HEADER_SKELETON));
-        unaligned_write_le16(buf + IMAGE_FILE_HEADER_NOS_OFFSET, (uint16_t) n_sections);
+        pe_test_init_headers(buf, file_size, (uint16_t) n_sections);
 
         /* Section table at 0x148. */
         FOREACH_ARRAY(spec, specs, n_sections) {
-                uint8_t *sh = buf + SECTION_TABLE_OFFSET + (spec - specs) * IMAGE_SECTION_HEADER_BYTES;
+                uint8_t *sh = buf + PE_TEST_SECTION_TABLE_OFFSET + (spec - specs) * sizeof(IMAGE_SECTION_HEADER);
                 size_t nlen = strnlen(spec->name, 8);
                 memcpy(sh, spec->name, nlen);
                 unaligned_write_le32(sh + 8,  spec->virtual_size);
@@ -135,6 +106,15 @@ static int load_headers_and_sections(
         if (r < 0)
                 return r;
         return pe_load_sections(fd, *ret_dos, *ret_pe, ret_sections);
+}
+
+TEST(pe_section_name_is_valid) {
+        ASSERT_TRUE(pe_section_name_is_valid(".linux"));
+        ASSERT_TRUE(pe_section_name_is_valid(".dtbauto"));
+        ASSERT_FALSE(pe_section_name_is_valid(""));
+        ASSERT_FALSE(pe_section_name_is_valid(".toolong9"));
+        ASSERT_FALSE(pe_section_name_is_valid(".a\tb"));
+        ASSERT_FALSE(pe_section_name_is_valid(".\xc3\xa4"));
 }
 
 /* ======================================================================
@@ -180,7 +160,7 @@ TEST(pe_load_sections_valid_in_bounds) {
                 .name = ".initrd",
                 .virtual_size = 16,
                 .size_of_raw_data = 16,
-                .pointer_to_raw_data = SECTION_TABLE_OFFSET + IMAGE_SECTION_HEADER_BYTES,
+                .pointer_to_raw_data = PE_TEST_SECTION_TABLE_OFFSET + sizeof(IMAGE_SECTION_HEADER),
         };
         _cleanup_close_ int fd = build_pe_file(&s, /* n_sections= */ 1, /* override_file_size= */ 4096);
         _cleanup_free_ IMAGE_DOS_HEADER *dos = NULL;
@@ -196,7 +176,7 @@ TEST(pe_load_sections_section_exactly_fills_file) {
                 .name = ".initrd",
                 .virtual_size = 16,
                 .size_of_raw_data = 16,
-                .pointer_to_raw_data = SECTION_TABLE_OFFSET + IMAGE_SECTION_HEADER_BYTES,
+                .pointer_to_raw_data = PE_TEST_SECTION_TABLE_OFFSET + sizeof(IMAGE_SECTION_HEADER),
         };
         size_t exact_size = (size_t) s.pointer_to_raw_data + s.size_of_raw_data;
         _cleanup_close_ int fd = build_pe_file(&s, /* n_sections= */ 1, exact_size);
@@ -213,7 +193,7 @@ TEST(pe_load_sections_section_past_eof_by_one) {
                 .name = ".initrd",
                 .virtual_size = 16,
                 .size_of_raw_data = 16,
-                .pointer_to_raw_data = SECTION_TABLE_OFFSET + IMAGE_SECTION_HEADER_BYTES,
+                .pointer_to_raw_data = PE_TEST_SECTION_TABLE_OFFSET + sizeof(IMAGE_SECTION_HEADER),
         };
         size_t short_size = (size_t) s.pointer_to_raw_data + s.size_of_raw_data - 1;
         _cleanup_close_ int fd = build_pe_file(&s, /* n_sections= */ 1, short_size);
@@ -295,7 +275,7 @@ TEST(pe_load_sections_uint32_overflow_sum) {
 
 /* Zero sections: bounds check loop runs zero times, fstat still succeeds. */
 TEST(pe_load_sections_zero_sections) {
-        _cleanup_close_ int fd = build_pe_file(NULL, /* n_sections= */ 0, /* override_file_size= */ 0);
+        _cleanup_close_ int fd = build_pe_file(/* specs= */ NULL, /* n_sections= */ 0, /* override_file_size= */ 0);
         _cleanup_free_ IMAGE_DOS_HEADER *dos = NULL;
         _cleanup_free_ PeHeader *pe = NULL;
         _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
@@ -305,7 +285,7 @@ TEST(pe_load_sections_zero_sections) {
 
 /* Multiple sections, all valid — happy path with N>1. */
 TEST(pe_load_sections_multi_all_valid) {
-        size_t base = SECTION_TABLE_OFFSET + 3 * IMAGE_SECTION_HEADER_BYTES;
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + 3 * sizeof(IMAGE_SECTION_HEADER);
         SectionSpec specs[3] = {
                 { .name = ".linux",   .virtual_size = 16,  .size_of_raw_data = 16,
                   .pointer_to_raw_data = (uint32_t) base },
@@ -325,7 +305,7 @@ TEST(pe_load_sections_multi_all_valid) {
 /* Multiple sections; one of them claims data past EOF — the whole file
  * must be rejected, not just that section silently skipped. */
 TEST(pe_load_sections_multi_one_past_eof) {
-        size_t base = SECTION_TABLE_OFFSET + 3 * IMAGE_SECTION_HEADER_BYTES;
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + 3 * sizeof(IMAGE_SECTION_HEADER);
         SectionSpec specs[3] = {
                 { .name = ".linux",   .virtual_size = 16, .size_of_raw_data = 16,
                   .pointer_to_raw_data = (uint32_t) base },
@@ -340,6 +320,70 @@ TEST(pe_load_sections_multi_one_past_eof) {
         _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
 
         ASSERT_ERROR(load_headers_and_sections(fd, &dos, &pe, &sections), EBADMSG);
+}
+
+/* ======================================================================
+ * pe_read_section_data
+ * ====================================================================== */
+
+/* The bytes after the SizeOfRawData bytes of .cmdline belong to .uname, so reading .cmdline must not
+ * return them. */
+TEST(pe_read_section_data_reads_raw_data_only) {
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + 2 * sizeof(IMAGE_SECTION_HEADER);
+        SectionSpec specs[2] = {
+                { .name = ".cmdline", .virtual_size = 32, .size_of_raw_data = 16,
+                  .pointer_to_raw_data = (uint32_t) base },
+                { .name = ".uname",   .virtual_size = 8,  .size_of_raw_data = 16,
+                  .pointer_to_raw_data = (uint32_t) (base + 16) },
+        };
+        static const char contents[] = "0123456789abcdefABCDEFGHIJKLMNOP";
+        _cleanup_close_ int fd = build_pe_file(specs, /* n_sections= */ 2, /* override_file_size= */ 0);
+        ASSERT_OK_EQ_ERRNO(pwrite(fd, contents, strlen(contents), base), (ssize_t) strlen(contents));
+
+        _cleanup_free_ PeHeader *pe = NULL;
+        _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
+        ASSERT_OK(pe_load_headers_and_sections(fd, &pe, &sections));
+
+        _cleanup_free_ void *data = NULL;
+        size_t size;
+        ASSERT_OK(pe_read_section_data(fd, sections + 0, SIZE_MAX, &data, &size));
+        ASSERT_MEMEQ_NN(data, size, "0123456789abcdef", 16U);
+
+        data = mfree(data);
+        ASSERT_OK(pe_read_section_data(fd, sections + 1, SIZE_MAX, &data, &size));
+        ASSERT_MEMEQ_NN(data, size, "ABCDEFGH", 8U);
+}
+
+TEST(pe_section_to_memfd) {
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + 2 * sizeof(IMAGE_SECTION_HEADER);
+        SectionSpec specs[2] = {
+                { .name = ".cmdline", .virtual_size = 32, .size_of_raw_data = 16,
+                  .pointer_to_raw_data = (uint32_t) base },
+                { .name = ".uname",   .virtual_size = 8,  .size_of_raw_data = 16,
+                  .pointer_to_raw_data = (uint32_t) (base + 16) },
+        };
+        static const char contents[] = "0123456789abcdefABCDEFGHIJKLMNOP";
+        _cleanup_close_ int fd = build_pe_file(specs, /* n_sections= */ 2, /* override_file_size= */ 0);
+        ASSERT_OK_EQ_ERRNO(pwrite(fd, contents, strlen(contents), base), (ssize_t) strlen(contents));
+
+        _cleanup_free_ PeHeader *pe = NULL;
+        _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
+        ASSERT_OK(pe_load_headers_and_sections(fd, &pe, &sections));
+
+        char buf[32];
+        _cleanup_close_ int cmdline_fd = ASSERT_OK(pe_section_to_memfd(fd, sections + 0, "cmdline"));
+        ASSERT_OK_EQ_ERRNO(read(cmdline_fd, buf, sizeof(buf)), (ssize_t) 16);
+        ASSERT_EQ(memcmp(buf, "0123456789abcdef", 16), 0);
+
+        _cleanup_close_ int uname_fd = ASSERT_OK(pe_section_to_memfd(fd, sections + 1, "uname"));
+        ASSERT_OK_EQ_ERRNO(read(uname_fd, buf, sizeof(buf)), (ssize_t) 8);
+        ASSERT_EQ(memcmp(buf, "ABCDEFGH", 8), 0);
+
+        /* The section data ends 8 bytes after the end of the file. */
+        IMAGE_SECTION_HEADER past_eof = sections[1];
+        past_eof.PointerToRawData = htole32(base + 24);
+        past_eof.VirtualSize = htole32(16);
+        ASSERT_ERROR(pe_section_to_memfd(fd, &past_eof, "past-eof"), EBADMSG);
 }
 
 /* ======================================================================
@@ -362,7 +406,7 @@ static int call_uki_hash_with(SectionSpec spec) {
 
         void *hashes[_UNIFIED_SECTION_MAX] = {};
         size_t hash_size = 0;
-        r = uki_hash(fd, sym_EVP_sha256(), hashes, &hash_size);
+        r = uki_hash(fd, sym_EVP_sha256(), /* profile= */ 0, hashes, &hash_size);
         free_many(hashes, _UNIFIED_SECTION_MAX);
         return r;
 }
@@ -377,7 +421,7 @@ TEST_RET(uki_hash_no_padding) {
                 .name = ".initrd",
                 .virtual_size = 16,
                 .size_of_raw_data = 16,
-                .pointer_to_raw_data = SECTION_TABLE_OFFSET + IMAGE_SECTION_HEADER_BYTES,
+                .pointer_to_raw_data = PE_TEST_SECTION_TABLE_OFFSET + sizeof(IMAGE_SECTION_HEADER),
         };
         ASSERT_OK(call_uki_hash_with(s));
         return EXIT_SUCCESS;
@@ -392,7 +436,7 @@ TEST_RET(uki_hash_one_byte_padding) {
                 .name = ".initrd",
                 .virtual_size = 17,
                 .size_of_raw_data = 16,
-                .pointer_to_raw_data = SECTION_TABLE_OFFSET + IMAGE_SECTION_HEADER_BYTES,
+                .pointer_to_raw_data = PE_TEST_SECTION_TABLE_OFFSET + sizeof(IMAGE_SECTION_HEADER),
         };
         ASSERT_OK(call_uki_hash_with(s));
         return EXIT_SUCCESS;
@@ -475,7 +519,7 @@ TEST_RET(uki_hash_one_bad_among_many_rejected) {
         if (dlopen_libcrypto(LOG_DEBUG) < 0)
                 return log_tests_skipped("openssl not available");
 
-        size_t base = SECTION_TABLE_OFFSET + 2 * IMAGE_SECTION_HEADER_BYTES;
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + 2 * sizeof(IMAGE_SECTION_HEADER);
         SectionSpec specs[2] = {
                 { .name = ".linux",  .virtual_size = 16, .size_of_raw_data = 16,
                   .pointer_to_raw_data = (uint32_t) base },
@@ -491,7 +535,7 @@ TEST_RET(uki_hash_one_bad_among_many_rejected) {
 
         void *hashes[_UNIFIED_SECTION_MAX] = {};
         size_t hash_size = 0;
-        ASSERT_ERROR(uki_hash(fd, sym_EVP_sha256(), hashes, &hash_size), EBADMSG);
+        ASSERT_ERROR(uki_hash(fd, sym_EVP_sha256(), /* profile= */ 0, hashes, &hash_size), EBADMSG);
         free_many(hashes, _UNIFIED_SECTION_MAX);
         return EXIT_SUCCESS;
 }
@@ -503,7 +547,7 @@ TEST_RET(uki_hash_empty_pe_does_not_reject) {
         if (dlopen_libcrypto(LOG_DEBUG) < 0)
                 return log_tests_skipped("openssl not available");
 
-        _cleanup_close_ int fd = build_pe_file(NULL, /* n_sections= */ 0, /* override_file_size= */ 0);
+        _cleanup_close_ int fd = build_pe_file(/* specs= */ NULL, /* n_sections= */ 0, /* override_file_size= */ 0);
         _cleanup_free_ IMAGE_DOS_HEADER *dos = NULL;
         _cleanup_free_ PeHeader *pe = NULL;
         _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
@@ -513,8 +557,82 @@ TEST_RET(uki_hash_empty_pe_does_not_reject) {
         void *hashes[_UNIFIED_SECTION_MAX] = {};
         size_t hash_size = 0;
         /* No UKI sections to hash — succeeds without hitting the cap path. */
-        ASSERT_OK(uki_hash(fd, sym_EVP_sha256(), hashes, &hash_size));
+        ASSERT_OK(uki_hash(fd, sym_EVP_sha256(), /* profile= */ 0, hashes, &hash_size));
         free_many(hashes, _UNIFIED_SECTION_MAX);
+        return EXIT_SUCCESS;
+}
+
+static int build_multi_profile_pe_file(void) {
+        /* The file contains only zero bytes, hence the sections get different sizes to get different hashes. */
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + 7 * sizeof(IMAGE_SECTION_HEADER);
+        SectionSpec specs[7] = {
+                /* The sections before the first .profile section are the base profile. */
+                { .name = ".linux",   .virtual_size = 16, .size_of_raw_data = 16, .pointer_to_raw_data = (uint32_t) base },
+                { .name = ".cmdline", .virtual_size = 8,  .size_of_raw_data = 8,  .pointer_to_raw_data = (uint32_t) base },
+                /* Profile @0 overrides nothing. */
+                { .name = ".profile", .virtual_size = 4,  .size_of_raw_data = 4,  .pointer_to_raw_data = (uint32_t) base },
+                /* Profile @1 overrides .cmdline. */
+                { .name = ".profile", .virtual_size = 5,  .size_of_raw_data = 5,  .pointer_to_raw_data = (uint32_t) base },
+                { .name = ".cmdline", .virtual_size = 12, .size_of_raw_data = 12, .pointer_to_raw_data = (uint32_t) base },
+                /* Profile @2 masks .cmdline. */
+                { .name = ".profile", .virtual_size = 6,  .size_of_raw_data = 6,  .pointer_to_raw_data = (uint32_t) base },
+                { .name = ".cmdline" },
+        };
+
+        return build_pe_file(specs, ELEMENTSOF(specs), /* override_file_size= */ 0);
+}
+
+TEST_RET(uki_hash_multi_profile) {
+        if (dlopen_libcrypto(LOG_DEBUG) < 0)
+                return log_tests_skipped("openssl not available");
+
+        _cleanup_close_ int fd = build_multi_profile_pe_file();
+        void *h0[_UNIFIED_SECTION_MAX] = {}, *h1[_UNIFIED_SECTION_MAX] = {}, *h2[_UNIFIED_SECTION_MAX] = {},
+                *h3[_UNIFIED_SECTION_MAX] = {};
+        size_t hash_size = 0;
+
+        ASSERT_OK_POSITIVE(uki_hash(fd, sym_EVP_sha256(), /* profile= */ 0, h0, &hash_size));
+        ASSERT_OK_POSITIVE(uki_hash(fd, sym_EVP_sha256(), /* profile= */ 1, h1, &hash_size));
+        ASSERT_OK_POSITIVE(uki_hash(fd, sym_EVP_sha256(), /* profile= */ 2, h2, &hash_size));
+        ASSERT_OK_ZERO(uki_hash(fd, sym_EVP_sha256(), /* profile= */ 3, h3, &hash_size));
+
+        /* Every profile inherits .linux from the base profile. */
+        ASSERT_NOT_NULL(h0[UNIFIED_SECTION_LINUX]);
+        ASSERT_EQ(memcmp(h0[UNIFIED_SECTION_LINUX], h1[UNIFIED_SECTION_LINUX], hash_size), 0);
+        ASSERT_EQ(memcmp(h0[UNIFIED_SECTION_LINUX], h2[UNIFIED_SECTION_LINUX], hash_size), 0);
+
+        /* Every profile has its own .profile section. */
+        ASSERT_NE(memcmp(h0[UNIFIED_SECTION_PROFILE], h1[UNIFIED_SECTION_PROFILE], hash_size), 0);
+        ASSERT_NE(memcmp(h1[UNIFIED_SECTION_PROFILE], h2[UNIFIED_SECTION_PROFILE], hash_size), 0);
+
+        /* Profile @0 inherits .cmdline, profile @1 overrides it, and profile @2 masks it. */
+        ASSERT_NOT_NULL(h0[UNIFIED_SECTION_CMDLINE]);
+        ASSERT_NE(memcmp(h0[UNIFIED_SECTION_CMDLINE], h1[UNIFIED_SECTION_CMDLINE], hash_size), 0);
+        ASSERT_NULL(h2[UNIFIED_SECTION_CMDLINE]);
+
+        FOREACH_ELEMENT(h, h3)
+                ASSERT_NULL(*h);
+
+        free_many(h0, _UNIFIED_SECTION_MAX);
+        free_many(h1, _UNIFIED_SECTION_MAX);
+        free_many(h2, _UNIFIED_SECTION_MAX);
+        return EXIT_SUCCESS;
+}
+
+TEST_RET(uki_hash_duplicate_section_in_profile_rejected) {
+        if (dlopen_libcrypto(LOG_DEBUG) < 0)
+                return log_tests_skipped("openssl not available");
+
+        size_t base = PE_TEST_SECTION_TABLE_OFFSET + 2 * sizeof(IMAGE_SECTION_HEADER);
+        SectionSpec specs[2] = {
+                { .name = ".dtbauto", .virtual_size = 8,  .size_of_raw_data = 8,  .pointer_to_raw_data = (uint32_t) base },
+                { .name = ".dtbauto", .virtual_size = 12, .size_of_raw_data = 12, .pointer_to_raw_data = (uint32_t) base },
+        };
+        _cleanup_close_ int fd = build_pe_file(specs, ELEMENTSOF(specs), /* override_file_size= */ 0);
+
+        void *hashes[_UNIFIED_SECTION_MAX] = {};
+        size_t hash_size = 0;
+        ASSERT_ERROR(uki_hash(fd, sym_EVP_sha256(), /* profile= */ 0, hashes, &hash_size), EBADMSG);
         return EXIT_SUCCESS;
 }
 

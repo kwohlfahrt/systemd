@@ -15,6 +15,7 @@ typedef enum VarlinkState {
         VARLINK_IDLE_CLIENT,
         VARLINK_AWAITING_REPLY,
         VARLINK_AWAITING_REPLY_MORE,
+        VARLINK_AWAITING_REPLY_UPGRADE,
         VARLINK_CALLING,
         VARLINK_CALLED,
         VARLINK_COLLECTING,
@@ -55,6 +56,7 @@ typedef enum VarlinkState {
                VARLINK_IDLE_CLIENT,                     \
                VARLINK_AWAITING_REPLY,                  \
                VARLINK_AWAITING_REPLY_MORE,             \
+               VARLINK_AWAITING_REPLY_UPGRADE,          \
                VARLINK_CALLING,                         \
                VARLINK_CALLED,                          \
                VARLINK_COLLECTING,                      \
@@ -80,6 +82,13 @@ typedef enum VarlinkState {
                VARLINK_PROCESSING_METHOD_MORE,          \
                VARLINK_PROCESSING_METHOD_UPGRADE)
 
+/* Tests whether a method call still needs a reply after dispatch has returned. */
+#define VARLINK_STATE_IS_PENDING_METHOD(state)          \
+        IN_SET(state,                                   \
+               VARLINK_PENDING_METHOD,                  \
+               VARLINK_PENDING_METHOD_MORE,             \
+               VARLINK_PENDING_METHOD_UPGRADE)
+
 typedef struct sd_varlink {
         unsigned n_ref;
 
@@ -93,6 +102,8 @@ typedef struct sd_varlink {
          * delegated. */
         JsonStream stream;
 
+        /* Number of method calls we issued as client that have not been fully replied to yet. Must be zero
+         * in VARLINK_IDLE_CLIENT state, and is reset to zero when the connection is closed. */
         unsigned n_pending;
 
         sd_varlink_reply_t reply_callback;
@@ -102,6 +113,10 @@ typedef struct sd_varlink {
         sd_json_variant *current_collected;
         sd_varlink_reply_flags_t current_reply_flags;
         sd_varlink_symbol *current_method;
+
+        /* The fiber that runs the method call pending on this (server side) connection. We don't take a
+         * reference on the fiber. The fiber clears this field when it is freed. */
+        sd_future *fiber;
 
         int *pushed_fds;
         size_t n_pushed_fds;
@@ -117,6 +132,17 @@ typedef struct sd_varlink {
         sd_event_source *defer_event_source;
 
         PidRef exec_pidref;
+
+        /* Kernel-derived identifier of the connection, stable across execve(), see
+         * sd_varlink_get_connection_id(). Calculated lazily. */
+        char *connection_id;
+
+        /* The method call pending on this (server side) connection shall be kept across serialization. Reset
+         * whenever the pending method call is completed. */
+        bool serialize_pending;
+
+        /* All connections of a server */
+        LIST_FIELDS(sd_varlink, connections);
 } sd_varlink;
 
 typedef struct VarlinkServerSocket VarlinkServerSocket;
@@ -137,6 +163,11 @@ typedef struct sd_varlink_server {
         sd_varlink_server_flags_t flags;
 
         LIST_HEAD(VarlinkServerSocket, sockets);
+
+        LIST_HEAD(sd_varlink, connections);
+        Hashmap *unclaimed;            /* Connection id → sd_varlink*, for deserialized connections with
+                                        * pending method calls not claimed yet */
+        Hashmap *claimed;              /* Same, for connections already claimed */
 
         Hashmap *methods;              /* Fully qualified symbol name of a method → sd_varlink_method_t */
         Hashmap *fiber_methods;        /* Fully qualified symbol name of a fiber method → sd_varlink_method_t */

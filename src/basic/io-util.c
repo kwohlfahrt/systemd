@@ -11,6 +11,7 @@
 #include "errno-util.h"
 #include "fiber-ops.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "time-util.h"
 
 uint32_t poll_events_to_epoll(uint32_t events) {
@@ -20,15 +21,6 @@ uint32_t poll_events_to_epoll(uint32_t events) {
                (events & POLLERR   ? EPOLLERR   : 0) |
                (events & POLLHUP   ? EPOLLHUP   : 0) |
                (events & POLLRDHUP ? EPOLLRDHUP : 0);
-}
-
-uint32_t epoll_events_to_poll(uint32_t events) {
-        return (events & EPOLLIN    ? POLLIN    : 0) |
-               (events & EPOLLOUT   ? POLLOUT   : 0) |
-               (events & EPOLLPRI   ? POLLPRI   : 0) |
-               (events & EPOLLERR   ? POLLERR   : 0) |
-               (events & EPOLLHUP   ? POLLHUP   : 0) |
-               (events & EPOLLRDHUP ? POLLRDHUP : 0);
 }
 
 int flush_fd(int fd) {
@@ -44,7 +36,7 @@ int flush_fd(int fd) {
                 ssize_t l;
                 int r;
 
-                r = fd_wait_for_event(fd, POLLIN, 0);
+                r = fd_wait_for_event(fd, POLLIN, /* timeout= */ 0);
                 if (r == -EINTR)
                         continue;
                 if (r < 0)
@@ -249,10 +241,59 @@ int loop_write_full(int fd, const void *buf, size_t nbytes, usec_t timeout) {
         return 0;
 }
 
+int pwritev_full(int fd, struct iovec *iovec, size_t n, uint64_t offset, uint64_t *ret_written) {
+        uint64_t written = 0;
+        int r = 0;
+
+        assert(fd >= 0);
+        assert(iovec || n == 0);
+
+        /* Writes all of the iovecs at the offset. The iovecs are advanced past what was written, and
+         * 'ret_written' tells how much that was, also if the write fails halfway. */
+
+        for (size_t i = 0;;) {
+                size_t m;
+                ssize_t k;
+
+                while (i < n && !iovec_is_set(iovec + i))
+                        i++;
+                if (i >= n)
+                        break;
+
+                m = MIN(n - i, (size_t) IOV_MAX);
+                k = pwritev(fd, iovec + i, m, offset + written);
+                if (k < 0) {
+                        if (errno == EINTR)
+                                continue;
+
+                        r = -errno;
+                        break;
+                }
+                if (k == 0) {
+                        r = -EIO;
+                        break;
+                }
+
+                written += k;
+                (void) iovec_inc_many(iovec + i, m, k);
+        }
+
+        if (ret_written)
+                *ret_written = written;
+        return r;
+}
+
+int pwrite_full(int fd, const void *buf, size_t nbytes, uint64_t offset) {
+        assert(fd >= 0);
+        assert(buf || nbytes == 0);
+
+        return pwritev_full(fd, &IOVEC_MAKE((void*) buf, nbytes), 1, offset, /* ret_written= */ NULL);
+}
+
 int pipe_eof(int fd) {
         int r;
 
-        r = fd_wait_for_event(fd, POLLIN, 0);
+        r = fd_wait_for_event(fd, POLLIN, /* timeout= */ 0);
         if (r <= 0)
                 return r;
 

@@ -1,16 +1,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <net/if.h>
+
 #include "sd-dhcp-server.h"
 #include "sd-varlink.h"
 
 #include "bus-polkit.h"
+#include "dns-domain.h"
 #include "json-util.h"
 #include "networkd-dhcp4.h"
+#include "networkd-dhcp6.h"
 #include "networkd-json.h"
 #include "networkd-link.h"
 #include "networkd-link-varlink.h"
 #include "networkd-manager.h"
 #include "networkd-setlink.h"
+#include "networkd-state-file.h"
+#include "ordered-set.h"
+#include "resolve-varlink-util.h"
+#include "set.h"
+#include "strv.h"
 
 int dispatch_link(sd_varlink *vlink, sd_json_variant *parameters, Manager *manager, DispatchLinkFlag flags, Link **ret) {
         struct {
@@ -139,7 +148,7 @@ int vl_method_link_renew(sd_varlink *vlink, sd_json_variant *parameters, sd_varl
                 return r;
 
         if (!link->network)
-                return sd_varlink_error(vlink, "io.systemd.Network.Link.InterfaceUnmanaged", NULL);
+                return sd_varlink_error(vlink, "io.systemd.Network.Link.InterfaceUnmanaged", /* parameters= */ NULL);
 
         r = varlink_verify_polkit_async(
                         vlink,
@@ -154,7 +163,11 @@ int vl_method_link_renew(sd_varlink *vlink, sd_json_variant *parameters, sd_varl
         if (r < 0)
                 return log_link_warning_errno(link, r, "Failed to renew DHCPv4 lease: %m");
 
-        return sd_varlink_reply(vlink, NULL);
+        r = dhcp6_renew(link);
+        if (r < 0)
+                return log_link_warning_errno(link, r, "Failed to renew DHCPv6 lease: %m");
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
 }
 
 int vl_method_link_force_renew(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -169,7 +182,7 @@ int vl_method_link_force_renew(sd_varlink *vlink, sd_json_variant *parameters, s
                 return r;
 
         if (!link->network)
-                return sd_varlink_error(vlink, "io.systemd.Network.Link.InterfaceUnmanaged", NULL);
+                return sd_varlink_error(vlink, "io.systemd.Network.Link.InterfaceUnmanaged", /* parameters= */ NULL);
 
         r = varlink_verify_polkit_async(
                         vlink,
@@ -186,7 +199,7 @@ int vl_method_link_force_renew(sd_varlink *vlink, sd_json_variant *parameters, s
                         return log_link_warning_errno(link, r, "Failed to force-renew DHCP server leases: %m");
         }
 
-        return sd_varlink_reply(vlink, NULL);
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
 }
 
 int vl_method_link_reconfigure(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -219,5 +232,493 @@ int vl_method_link_reconfigure(sd_varlink *vlink, sd_json_variant *parameters, s
         if (r > 0)
                 return 0; /* Reply will be sent asynchronously via vlink */
 
-        return sd_varlink_reply(vlink, NULL);
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+static int dispatch_resolve_link(sd_varlink *vlink, sd_json_variant *parameters, Manager *manager, Link **ret) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex, 0, SD_JSON_MANDATORY|SD_JSON_RELAX },
+                {},
+        };
+        int r;
+
+        assert(vlink);
+        assert(manager);
+        assert(ret);
+
+        int ifindex;
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &ifindex);
+        if (r < 0)
+                return r;
+
+        Link *link = NULL;
+        r = link_get_by_index(manager, ifindex, &link);
+        if (r < 0)
+                return sd_varlink_error_invalid_parameter(vlink, JSON_VARIANT_STRING_CONST("ifindex"));
+
+        if (FLAGS_SET(link->flags, IFF_LOOPBACK))
+                return sd_varlink_error(vlink, "io.systemd.Resolve.Link.IsLoopback", /* parameters= */ NULL);
+
+        if (link->state == LINK_STATE_UNMANAGED)
+                return sd_varlink_error(vlink, "io.systemd.Network.Link.InterfaceUnmanaged", /* parameters= */ NULL);
+
+        *ret = link;
+        return 0;
+}
+
+int vl_method_link_set_dns(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "servers", SD_JSON_VARIANT_ARRAY,         dispatch_dns_server_context_array, offsetof(DNSConfiguration, dns_servers), SD_JSON_MANDATORY               },
+                { "ifindex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,             offsetof(DNSConfiguration, ifindex),     SD_JSON_MANDATORY|SD_JSON_RELAX },
+                {},
+        };
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        _cleanup_(dns_configuration_freep) DNSConfiguration *c = new0(DNSConfiguration, 1);
+        if (!c)
+                return log_oom();
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, c);
+        if (r < 0)
+                return r;
+
+        struct in_addr_full **dns_servers = NULL;
+        size_t n_dns_servers = 0;
+        CLEANUP_ARRAY(dns_servers, n_dns_servers, in_addr_full_free_array);
+
+        DNSServer *s;
+        ORDERED_SET_FOREACH(s, c->dns_servers) {
+                if (!GREEDY_REALLOC0(dns_servers, n_dns_servers + 1))
+                        return log_oom();
+
+                if (s->ifindex != 0 && s->ifindex != link->ifindex)
+                        return sd_varlink_error_invalid_parameter(vlink, JSON_VARIANT_STRING_CONST("servers"));
+
+                r = in_addr_full_new(
+                                s->family,
+                                &s->in_addr.address,
+                                s->port,
+                                s->ifindex,
+                                s->server_name,
+                                &dns_servers[n_dns_servers++]);
+                if (r < 0)
+                        return r;
+        }
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-dns-servers",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        link_set_dns(link, TAKE_PTR(dns_servers), n_dns_servers);
+
+        r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_set_domains(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex",       _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,                offsetof(DNSConfiguration, ifindex),        SD_JSON_MANDATORY|SD_JSON_RELAX },
+                { "searchDomains", SD_JSON_VARIANT_ARRAY,         dispatch_search_domain_context_array, offsetof(DNSConfiguration, search_domains), SD_JSON_MANDATORY               },
+                {},
+        };
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        _cleanup_(dns_configuration_freep) DNSConfiguration *c = new0(DNSConfiguration, 1);
+        if (!c)
+                return log_oom();
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, c);
+        if (r < 0)
+                return r;
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-domains",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        /* The method accepts an empty strv, to override the domains set in .network.
+         * Hence, we need to explicitly allocate empty sets here. */
+        _cleanup_ordered_set_free_ OrderedSet *search_domains = ordered_set_new(&dns_name_hash_ops_free);
+        if (!search_domains)
+                return log_oom();
+
+        _cleanup_ordered_set_free_ OrderedSet *route_domains = ordered_set_new(&dns_name_hash_ops_free);
+        if (!route_domains)
+                return log_oom();
+
+        SearchDomain *d;
+        ORDERED_SET_FOREACH(d, c->search_domains) {
+                r = ordered_set_consume(d->route_only ? route_domains : search_domains, TAKE_PTR(d->name));
+                if (r < 0)
+                        return r;
+        }
+
+        free_and_replace_full(link->route_domains, route_domains, ordered_set_free);
+        free_and_replace_full(link->search_domains, search_domains, ordered_set_free);
+
+        r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_set_dnssec_negative_trust_anchors(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex",              _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,           offsetof(DNSConfiguration, ifindex),                SD_JSON_MANDATORY|SD_JSON_RELAX },
+                { "negativeTrustAnchors", SD_JSON_VARIANT_ARRAY,         dispatch_negative_trust_anchors, offsetof(DNSConfiguration, negative_trust_anchors), SD_JSON_MANDATORY               },
+                {},
+        };
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        _cleanup_(dns_configuration_freep) DNSConfiguration *c = new0(DNSConfiguration, 1);
+        if (!c)
+                return log_oom();
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, c);
+        if (r < 0)
+                return r;
+
+        /* The method accepts an empty strv, to override the negative trust anchors set in .network.
+         * Hence, we need to explicitly allocate an empty set here. */
+        _cleanup_set_free_ Set *ns = set_new(&dns_name_hash_ops_free);
+        if (!ns)
+                return log_oom();
+
+        STRV_FOREACH(a, c->negative_trust_anchors) {
+                r = set_put_strdup_full(&ns, &dns_name_hash_ops_free, *a);
+                if (r < 0)
+                        return r;
+        }
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-dnssec-negative-trust-anchors",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        set_free_and_replace(link->dnssec_negative_trust_anchors, ns);
+
+        r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_set_dns_default_route(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        struct {
+                bool default_route;
+                int ifindex;
+        } p = {};
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex",      _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,    voffsetof(p, ifindex),       SD_JSON_RELAX     },
+                { "defaultRoute", SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool, voffsetof(p, default_route), SD_JSON_MANDATORY },
+                {},
+        };
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, &p);
+        if (r < 0)
+                return r;
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-default-route",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        if (p.default_route != link->dns_default_route) {
+                link->dns_default_route = p.default_route;
+
+                r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_set_llmnr(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        struct {
+                ResolveSupport mode;
+                int ifindex;
+        } p = {
+                .mode = RESOLVE_SUPPORT_YES,
+        };
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex",  _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,         voffsetof(p, ifindex), SD_JSON_RELAX     },
+                { "llmnr",    SD_JSON_VARIANT_STRING,        dispatch_resolve_support_mode, voffsetof(p, mode),    SD_JSON_MANDATORY },
+                {},
+        };
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, &p);
+        if (r < 0)
+                return r;
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-llmnr",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        if (link->llmnr != p.mode) {
+                link->llmnr = p.mode;
+
+                r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_set_mdns(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        struct {
+                ResolveSupport mode;
+                int ifindex;
+        } p = {
+                .mode = RESOLVE_SUPPORT_NO,
+        };
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,         voffsetof(p, ifindex), SD_JSON_RELAX     },
+                { "mDNS",    SD_JSON_VARIANT_STRING,        dispatch_resolve_support_mode, voffsetof(p, mode),    SD_JSON_MANDATORY },
+                {},
+        };
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, &p);
+        if (r < 0)
+                return r;
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-mdns",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        if (link->mdns != p.mode) {
+                link->mdns = p.mode;
+
+                r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_set_dns_over_tls(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        struct {
+                DnsOverTlsMode mode;
+                int ifindex;
+        } p = {
+                .mode = _DNS_OVER_TLS_MODE_INVALID,
+        };
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex",    _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,      voffsetof(p, ifindex), SD_JSON_RELAX    },
+                { "dnsOverTLS", SD_JSON_VARIANT_STRING,        dispatch_dns_over_tls_mode, voffsetof(p, mode),    SD_JSON_NULLABLE },
+                {},
+        };
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, &p);
+        if (r < 0)
+                return r;
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-dns-over-tls",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        if (link->dns_over_tls_mode != p.mode) {
+                link->dns_over_tls_mode = p.mode;
+
+                r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_set_dnssec(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        struct {
+                const char *mode;
+                int ifindex;
+        } p = {};
+        static const sd_json_dispatch_field dispatch_table[] = {
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                { "ifindex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,         voffsetof(p, ifindex), SD_JSON_RELAX    },
+                { "dnssec",  SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, voffsetof(p, mode),    SD_JSON_NULLABLE },
+                {},
+        };
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG, &p);
+        if (r < 0)
+                return r;
+
+        DnssecMode mode;
+        if (isempty(p.mode))
+                mode = _DNSSEC_MODE_INVALID;
+        else {
+                mode = dnssec_mode_from_string(p.mode);
+                if (mode < 0)
+                        return sd_varlink_error_invalid_parameter(vlink, JSON_VARIANT_STRING_CONST("dnssec"));
+        }
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.set-dnssec",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        if (link->dnssec_mode != mode) {
+                link->dnssec_mode = mode;
+
+                r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
+}
+
+int vl_method_link_revert_dns(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        Link *link = NULL;
+        r = dispatch_resolve_link(vlink, parameters, manager, &link);
+        if (r < 0)
+                return r;
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        manager->bus,
+                        "org.freedesktop.network1.revert-dns",
+                        (const char**) STRV_MAKE("interface", link->ifname),
+                        &manager->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        link_dns_settings_clear(link);
+
+        r = link_save_and_clean_full(link, /* also_save_manager= */ true);
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(vlink, /* parameters= */ NULL);
 }

@@ -26,7 +26,7 @@ int bus_scope_method_abandon(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        r = bus_verify_manage_units_async(UNIT(s)->manager, message, reterr_error);
+        r = bus_verify_manage_units_async(UNIT(s)->manager, message, /* details= */ NULL, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -38,7 +38,7 @@ int bus_scope_method_abandon(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_result, scope_result, ScopeResult);
@@ -278,7 +278,7 @@ int bus_scope_send_request_stop(Scope *s) {
         if (r < 0)
                 return r;
 
-        return sd_bus_send_to(UNIT(s)->manager->api_bus, m, s->controller, NULL);
+        return sd_bus_send_to(UNIT(s)->manager->api_bus, m, s->controller, /* ret_cookie= */ NULL);
 }
 
 static int on_controller_gone(sd_bus_track *track, void *userdata) {
@@ -303,6 +303,9 @@ int bus_scope_track_controller(Scope *s) {
         assert(s);
 
         if (!s->controller || s->controller_track)
+                return 0;
+
+        if (!UNIT(s)->manager->api_bus_ready)
                 return 0;
 
         r = sd_bus_track_new(UNIT(s)->manager->api_bus, &s->controller_track, on_controller_gone, s);

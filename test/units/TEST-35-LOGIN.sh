@@ -21,7 +21,12 @@ cleanup_test_user() (
 
 setup_test_user() {
     mkdir -p /var/spool/cron /var/spool/mail
-    useradd -m -s /usr/bin/bash logind-test-user
+    # Sometimes test VMs reboot
+    if ! getent passwd logind-test-user >/dev/null; then
+        useradd -m -s /usr/bin/bash logind-test-user
+    else
+        loginctl disable-linger logind-test-user
+    fi
     trap cleanup_test_user EXIT
 }
 
@@ -76,6 +81,145 @@ EOF
     assert_eq "$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager KillUserProcesses)" "b true"
 
     rm -rf /run/systemd/logind.conf.d
+}
+
+teardown_boot_loader_entries_symlink() (
+    set +eux
+
+    rm -rf /run/boot-loader-entries
+
+    return 0
+)
+
+testcase_boot_loader_entries_symlink() {
+    local loader_entries var=/sys/firmware/efi/efivars/LoaderEntries-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+
+    if [[ -e /run/boot-loader-entries ]]; then
+        echo "/run/boot-loader-entries already exists, skipping."
+        return 0
+    fi
+
+    trap teardown_boot_loader_entries_symlink RETURN
+
+    if [[ -e "$var" ]]; then
+        # Skip the attributes, the rest is a list of NUL terminated UTF-16 strings.
+        loader_entries="$(od -An -v -tu2 -j4 "$var" | jq -s -c 'implode | split("\u0000") | map(select(. != "")) | unique')"
+    else
+        loader_entries="[]"
+    fi
+
+    # Symlinks are not allowed in the boot loader entries tree (see #44636). Loading the entries fails,
+    # but reading the properties must not, and the entries reported by the boot loader must be listed.
+    mkdir -p /run/boot-loader-entries/loader.0/entries
+    ln -s loader.0 /run/boot-loader-entries/loader
+
+    assert_eq "$(busctl --json=short get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager BootLoaderEntries | jq -c '.data | unique')" "$loader_entries"
+    busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.DBus.Properties GetAll s org.freedesktop.login1.Manager >/dev/null
+}
+
+test_kill_user_process() {
+    local su=${1:?}
+    local username=${2:?}
+    local should_kill=${3:?}
+    local pid
+
+    pid=$("$su" -l "$username" -c 'nohup sleep 300 </dev/null >/dev/null 2>&1 & echo $!')
+
+    if "$should_kill"; then
+        timeout 30 bash -c "while ps -p $pid >/dev/null; do sleep .5; done"
+    else
+        sleep 2
+        ps -p "$pid" -o pid,args
+        kill -TERM "$pid"
+    fi
+}
+
+testcase_kill_user_processes() {
+    local su="su"
+
+    # su/runuser -l does not propagate LD_PRELOAD.
+    if [[ -v ASAN_OPTIONS ]]; then
+        echo "ASan is enabled, skipping the testcase."
+        return
+    fi
+
+    # Arch does not use pam_systemd.so in su-l pam setting.
+    if os_release_id_is arch; then
+        su="runuser"
+    fi
+
+    mkdir -p /run/systemd/logind.conf.d
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=testuser
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser false
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=testuser root
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser false
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=testuser
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=testuser root
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=root
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser false
+
+    rm -rf /run/systemd/logind.conf.d
+    systemctl reload systemd-logind.service
 }
 
 testcase_sleep_automated() {
@@ -133,6 +277,11 @@ teardown_suspend() (
 
 testcase_suspend_on_lid() {
     local pid input_name lid_dev
+
+    if [[ ! -x /usr/lib/systemd/systemd-sleep ]]; then
+        echo "systemd-sleep is not installed, skipping suspend test"
+        return
+    fi
 
     if systemd-detect-virt --quiet --container; then
         echo "Skipping suspend test in container"
@@ -271,6 +420,9 @@ cleanup_session() (
 
     systemctl stop getty@tty2.service
 
+    rm -rf /run/systemd/system/getty@tty2.service.d
+    systemctl daemon-reload
+
     for s in $(loginctl --no-legend list-sessions | grep -v manager | awk '$3 == "logind-test-user" { print $1 }'); do
         echo "INFO: stopping session $s"
         loginctl terminate-session "$s"
@@ -298,9 +450,6 @@ cleanup_session() (
     if ! timeout 30 bash -c "while systemctl is-active --quiet user-${uid}.slice; do sleep 1; done"; then
         echo "WARNING: user-${uid}.slice is still active, ignoring."
     fi
-
-    rm -rf /run/systemd/system/getty@tty2.service.d
-    systemctl daemon-reload
 
     return 0
 )
@@ -710,6 +859,183 @@ EOF
     rm -f "$SCRIPT" "$PAMSERVICE"
 }
 
+testcase_ambient_caps_pam_cap_defer() {
+    local PAMSERVICE TRANSIENTUNIT SCRIPT CAPCONF PAMCAP
+
+    # Verify that pam_end() is called with PAM_DATA_SILENT in the process executing the payload, by
+    # making use of pam_cap's "defer" option, which applies its capabilities only then. pam_systemd
+    # sets CAP_KILL as ambient capability, which pam_cap is expected to replace by CAP_CHOWN.
+
+    if ! grep -q 'CapAmb:' /proc/self/status ; then
+        echo "ambient caps not available, skipping test." >&2
+        return
+    fi
+
+    for PAMCAP in /usr/lib{64,}/security/pam_cap.so \
+                  /usr/lib/*/security/pam_cap.so \
+                  /lib{64,}/security/pam_cap.so; do
+        [[ -e "$PAMCAP" ]] && break
+    done
+    if [[ ! -e "$PAMCAP" ]]; then
+        echo "pam_cap.so not available, skipping test." >&2
+        return
+    fi
+
+    # The "defer" option was added in libcap 2.58, older versions ignore it
+    if ! grep -aq defer "$PAMCAP"; then
+        echo "pam_cap.so does not support the defer option, skipping test." >&2
+        return
+    fi
+
+    # We dlopen() libpam, hence PAM modules not linked against it fail to load (e.g. on CentOS Stream 9)
+    if ! grep -aq libpam.so "$PAMCAP"; then
+        echo "pam_cap.so is not linked against libpam, skipping test." >&2
+        return
+    fi
+
+    typeset -i BND MASK
+
+    # Get PID 1's bounding set
+    BND="0x$(grep 'CapBnd:' /proc/1/status | cut -d: -f2 | tr -d '[:space:]')"
+
+    # CAP_CHOWN | CAP_KILL
+    MASK=$(((1 << 0) | (1 << 5)))
+
+    if [ $((BND & MASK)) -ne "$MASK" ] ; then
+        echo "CAP_CHOWN or CAP_KILL not available in bounding set, skipping test." >&2
+        return
+    fi
+
+    PAMSERVICE="pamserv$RANDOM"
+    TRANSIENTUNIT="pamcapdefer$RANDOM.service"
+    SCRIPT="/tmp/pamcapdefer$RANDOM.sh"
+    CAPCONF="/tmp/pamcapdefer$RANDOM.conf"
+
+    echo "^cap_chown logind-test-user" >"$CAPCONF"
+
+    cat >/etc/pam.d/"$PAMSERVICE" <<EOF
+auth optional      pam_cap.so defer config=$CAPCONF
+auth required      pam_permit.so
+account sufficient pam_unix.so
+account required   pam_permit.so
+session optional   pam_systemd.so default-capability-ambient-set=CAP_KILL debug
+session required   pam_unix.so
+EOF
+
+    cat >"$SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -ex
+typeset -i AMB MASK
+AMB="0x$(grep 'CapAmb:' /proc/self/status | cut -d: -f2 | tr -d '[:space:]')"
+MASK=$((1 << 0))
+test "$AMB" -eq "$MASK"
+EOF
+
+    chmod +x "$SCRIPT"
+
+    systemd-run -u "$TRANSIENTUNIT" -p PAMName="$PAMSERVICE" -p Type=oneshot -p User=logind-test-user -p StandardError=tty "$SCRIPT"
+
+    rm -f "$SCRIPT" "$CAPCONF" /etc/pam.d/"$PAMSERVICE"
+}
+
+testcase_ambient_caps_pam_permitted() (
+    local pam="test-pam-caps-$BASHPID"
+
+    if ! command -v python3 >/dev/null; then
+        echo "python3 not available, skipping test." >&2
+        return
+    fi
+
+    trap 'rm -f "/etc/pam.d/$pam"' EXIT
+    cat >"/etc/pam.d/$pam" <<EOF
+auth    required pam_permit.so
+account required pam_permit.so
+session required pam_permit.so
+EOF
+
+    # A normal exec replaces the permitted set, hiding what the executor retained. Hold a write lease on
+    # a private copy of true: the kernel notifies us and blocks exec until we have inspected its credentials.
+    python3 - "$pam" <<'PY'
+import ctypes
+import fcntl
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+pam = f'PAMName={sys.argv[1]}'
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGIO})
+
+with tempfile.TemporaryDirectory(dir='/var/tmp') as tmp:
+    probe = Path(tmp) / 'true'
+    shutil.copy('/usr/bin/true', probe)
+    probe.parent.chmod(0o755)
+
+    def permitted(name, *properties):
+        unit = f'{sys.argv[1]}-{name}.service'
+        with probe.open('rb') as f:
+            fcntl.fcntl(f, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+            cmd = ['systemd-run', '--quiet', '--wait', '--service-type=exec', f'--unit={unit}',
+                   '-p', 'User=logind-test-user', '-p', 'NoNewPrivileges=yes']
+            with subprocess.Popen([*cmd, *(f'--property={p}' for p in properties), probe]) as runner:
+                try:
+                    assert signal.sigtimedwait({signal.SIGIO}, 30), f'{unit}: did not reach exec'
+                    pid = subprocess.check_output(['systemctl', 'show', '-P', 'MainPID', unit], text=True).strip()
+                    status = dict(line.split(':', 1) for line in Path(f'/proc/{pid}/status').read_text().splitlines())
+                    assert int(status['Uid'].split()[0]) != 0 and int(status['NoNewPrivs']) == 1, status
+                    caps = int(status['CapPrm'], 16)
+                finally:
+                    fcntl.fcntl(f, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+                assert runner.wait(timeout=30) == 0, unit
+        return caps
+
+    # No ambient capabilities were requested. Check both sides of seccomp_allows_drop_privileges().
+    for name, options in [('plain', []), ('seccomp', ['SystemCallFilter=@system-service']),
+                          ('no-capset', ['SystemCallFilter=~capset'])]:
+        caps = permitted(name, pam, *options)
+        assert caps == 0, (name, hex(caps))
+
+    # Settings which retain capabilities independently of PAM must behave the same with and without it.
+    for name, prop in [('ambient', 'AmbientCapabilities=CAP_CHOWN'), ('keep', 'SecureBits=keep-caps')]:
+        without = permitted(name, prop)
+        with_pam = permitted(f'{name}-pam', prop, pam)
+        assert with_pam == without, (name, hex(with_pam), hex(without))
+
+    # An inherited no-setuid-fixup preserves capabilities at the UID change, except when entering a user
+    # namespace has reset it. Restoring the manager's securebits afterwards must not affect the PAM drop.
+    bits = ctypes.CDLL(None).prctl(27, 0, 0, 0, 0)  # PR_GET_SECUREBITS
+    assert bits >= 0
+    if bits != 0:
+        print('Securebits already set, skipping inherited securebits check.', file=sys.stderr)
+        sys.exit(0)
+    if subprocess.run(['unshare', '--user', 'true']).returncode != 0:
+        print('User namespaces unavailable, skipping inherited securebits check.', file=sys.stderr)
+        sys.exit(0)
+
+    dropin = Path(f'/run/systemd/system.conf.d/99-{sys.argv[1]}.conf')
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+
+    def set_manager_securebits(bits):
+        dropin.write_text(f'[Manager]\nSecureBits={bits}\n')
+        subprocess.run(['systemctl', 'daemon-reload'], check=True)
+
+    try:
+        set_manager_securebits('no-setuid-fixup')
+        assert permitted('inherited', pam) != 0
+        caps = permitted('inherited-private-users', pam, 'PrivateUsers=yes')
+        assert caps == 0, hex(caps)
+    finally:
+        # An unset SecureBits= leaves live bits alone, so explicitly clear ours before removing the drop-in.
+        try:
+            set_manager_securebits('')
+        finally:
+            dropin.unlink(missing_ok=True)
+            subprocess.run(['systemctl', 'daemon-reload'], check=True)
+PY
+)
+
 background_at_return() {
     rm -f /etc/pam.d/"$PAMSERVICE"
     unset PAMSERVICE
@@ -1012,6 +1338,110 @@ EOF
     echo "$no_sess_rel" | grep NoSuchSession >/dev/null
 }
 
+teardown_metrics() (
+    set +ex
+
+    systemctl stop metrics-sleeper-background-light.service metrics-sleeper-user.service
+    rm -f /etc/pam.d/"$PAMSERVICE"
+    return 0
+)
+
+login_metric() {
+    # Prints the value of the specified io.systemd.Login metric with the specified field value
+    varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.List '{}' |
+        jq --seq -r --arg n "io.systemd.Login.$1" --arg k "$2" --arg v "$3" \
+           'select(.name == $n and .fields[$k] == $v) | .value | tostring'
+}
+
+wait_session_gone() {
+    # Waits until no session of the specified class of the test user is known to logind anymore
+    timeout 30 bash -c "while loginctl --no-legend | grep logind-test-user | grep -w -- '$1' >/dev/null; do sleep .5; done"
+}
+
+testcase_metrics() {
+    local uid list c before_started before_current started current
+
+    uid=$(id -u logind-test-user)
+
+    PAMSERVICE="pammetrics$RANDOM"
+    trap teardown_metrics RETURN
+
+    cat >/etc/pam.d/"$PAMSERVICE" <<EOF
+auth sufficient    pam_unix.so
+auth required      pam_deny.so
+account sufficient pam_unix.so
+account required   pam_permit.so
+session optional   pam_systemd.so debug
+session required   pam_unix.so
+EOF
+
+    # Some distros don't enable the socket by default. logind only picks up the socket when it is started, and
+    # PID 1 refuses to start a socket whose service is already running, hence stop logind first.
+    if ! systemctl is-active --quiet systemd-logind-metrics.socket; then
+        systemctl stop systemd-logind.service
+        systemctl start systemd-logind-metrics.socket
+        systemctl start systemd-logind.service
+        systemctl reset-failed systemd-logind.service
+    fi
+    test -S /run/systemd/report/io.systemd.Login
+    test -f /run/systemd/login-counters
+
+    list="$(varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.Describe '{}')"
+    jq --seq -r '.name' <<<"$list" | grep '^io.systemd.Login.CurrentSessions$' >/dev/null
+    jq --seq -r '.name' <<<"$list" | grep '^io.systemd.Login.SessionsStarted$' >/dev/null
+    jq --seq -r '.name' <<<"$list" | grep '^io.systemd.Login.SuspendCounter$' >/dev/null
+
+    # One row per session class, except for "none"
+    list="$(varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.List '{}')"
+    for c in user user-early user-incomplete user-light user-early-light greeter lock-screen background background-light manager manager-early; do
+        [[ "$(jq --seq -r --arg c "$c" 'select(.name == "io.systemd.Login.SessionsStarted" and .fields.class == $c) | .name' <<<"$list" | wc -l)" -eq 1 ]]
+        [[ "$(jq --seq -r --arg c "$c" 'select(.name == "io.systemd.Login.CurrentSessions" and .fields.class == $c) | .name' <<<"$list" | wc -l)" -eq 1 ]]
+    done
+    [[ -z "$(jq --seq -r 'select(.fields.class == "none") | .name' <<<"$list")" ]]
+
+    # Start a session without service manager
+    wait_session_gone background-light
+    before_started="$(login_metric SessionsStarted class background-light)"
+    before_current="$(login_metric CurrentSessions class background-light)"
+    systemd-run -u metrics-sleeper-background-light.service -p PAMName="$PAMSERVICE" -p Type=exec \
+        -p Environment=XDG_SESSION_CLASS=background-light -p User=logind-test-user sleep infinity
+    started="$(login_metric SessionsStarted class background-light)"
+    current="$(login_metric CurrentSessions class background-light)"
+    (( started == before_started + 1 ))
+    (( current == before_current + 1 ))
+
+    # A restart of logind neither resets nor increases the counter, and the session is still current. Reset
+    # the start rate limit afterwards, so that later test cases which restart logind don't trip over it.
+    systemctl restart systemd-logind.service
+    systemctl reset-failed systemd-logind.service
+    (( $(login_metric SessionsStarted class background-light) == started ))
+    (( $(login_metric CurrentSessions class background-light) == current ))
+
+    # Logging out decreases the number of current sessions, but not the counter
+    systemctl stop metrics-sleeper-background-light.service
+    wait_session_gone background-light
+    (( $(login_metric SessionsStarted class background-light) == started ))
+    (( $(login_metric CurrentSessions class background-light) == before_current ))
+
+    # A full user session also starts the service manager, which gets its own session
+    systemctl stop user@"$uid".service
+    wait_session_gone manager
+    before_started="$(login_metric SessionsStarted class manager)"
+    systemd-run -u metrics-sleeper-user.service -p PAMName="$PAMSERVICE" -p Type=exec \
+        -p Environment=XDG_SESSION_CLASS=user -p User=logind-test-user sleep infinity
+    (( $(login_metric SessionsStarted class manager) == before_started + 1 ))
+    (( $(login_metric CurrentSessions class manager) >= 1 ))
+    systemctl stop metrics-sleeper-user.service
+
+    # The suspend counters are taken from the kernel as they are, but are suppressed in containers
+    if [[ -e /sys/power/suspend_stats/success ]] && ! systemd-detect-virt --quiet --container; then
+        (( $(login_metric SuspendCounter result success) == $(cat /sys/power/suspend_stats/success) ))
+        (( $(login_metric SuspendCounter result fail) == $(cat /sys/power/suspend_stats/fail) ))
+    else
+        [[ -z "$(varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.List '{}' | jq --seq -r 'select(.name == "io.systemd.Login.SuspendCounter") | .name')" ]]
+    fi
+}
+
 testcase_restart() {
     local classes unit c
 
@@ -1032,8 +1462,134 @@ testcase_restart() {
     done
 }
 
+testcase_inhibit_default() {
+    local mode what inhibitor_out
+    local -a args
+
+    for mode in delay block; do
+        args=()
+        what='["idle", "shutdown", "sleep"]'
+        if [[ "$mode" == delay ]]; then
+            args=(--mode=delay)
+            what='["shutdown", "sleep"]'
+        fi
+
+        # Query from the inhibited command so the lock is held throughout the query.
+        inhibitor_out=$(systemd-inhibit "${args[@]}" --who="inhibit-default-$mode" \
+            varlinkctl call --more /run/systemd/io.systemd.Login io.systemd.Login.ListInhibitors '{}')
+        echo "$inhibitor_out" | jq --seq --slurp -e --arg mode "$mode" --argjson what "$what" '
+            map(select(.context.Who == ("inhibit-default-" + $mode))) |
+            length == 1 and all(.[]; .context.Mode == $mode and (.context.What | sort) == $what)
+        ' >/dev/null
+    done
+
+    (! systemd-inhibit --mode=delay --what=idle true)
+}
+
+testcase_inhibit_empty_who_why() {
+    local unit=inhibit-empty-who-why.service
+
+    # An inhibitor with empty who/why must survive a restart of logind (i.e. deserialization from the
+    # state file and re-serialization)
+    systemd-run --unit="$unit" systemd-inhibit --who= --why= --what=idle --mode=block sleep infinity
+    timeout 30 bash -c "until systemd-inhibit --list --no-legend --who= --why= --what=idle --mode=block | grep . >/dev/null; do sleep .5; done"
+
+    systemctl restart systemd-logind.service
+    systemctl --quiet is-active systemd-logind.service
+
+    systemd-inhibit --list --no-legend --who= --why= --what=idle --mode=block | grep . >/dev/null
+    systemctl stop "$unit"
+}
+
+teardown_polkit_details() (
+    set +ex
+
+    rm -f /etc/polkit-1/rules.d/00-logind-test-details.rules
+    systemctl try-reload-or-restart polkit.service
+    cleanup_session
+
+    return 0
+)
+
+testcase_polkit_details() {
+    local uid session
+
+    if ! command -v pkcheck >/dev/null; then
+        echo "polkit is not available, skipping test ${FUNCNAME[0]}."
+        return
+    fi
+
+    if [[ ! -c /dev/tty2 ]]; then
+        echo "/dev/tty2 does not exist, skipping test ${FUNCNAME[0]}."
+        return
+    fi
+
+    trap teardown_polkit_details RETURN
+
+    create_session
+
+    uid=$(id -u logind-test-user)
+    session=$(loginctl --no-legend | grep -v manager | awk '$3 == "logind-test-user" { print $1 }')
+
+    # testuser neither owns the session nor has a session of its own, so without the rules below all
+    # of the operations below would be denied. Only allow them if the right details are passed.
+    mkdir -p /etc/polkit-1/rules.d
+    cat >/etc/polkit-1/rules.d/00-logind-test-details.rules <<EOF
+polkit.addRule(function(action, subject) {
+    if (subject.user != "testuser" || action.id.indexOf("org.freedesktop.login1.") != 0)
+        return polkit.Result.NOT_HANDLED;
+
+    var target_user = action.lookup("uid") == "$uid" && action.lookup("username") == "logind-test-user";
+    var target_session = target_user && action.lookup("session") == "$session";
+    var no_session = action.lookup("session") == undefined;
+
+    if (action.id == "org.freedesktop.login1.set-user-linger" &&
+        target_user && action.lookup("verb") == "enable")
+        return polkit.Result.YES;
+    if (action.id == "org.freedesktop.login1.lock-sessions" &&
+        (target_session || no_session) && action.lookup("verb") == "lock")
+        return polkit.Result.YES;
+    if (action.id == "org.freedesktop.login1.chvt" &&
+        action.lookup("seat") == "seat0")
+        return polkit.Result.YES;
+    if (action.id == "org.freedesktop.login1.manage" &&
+        action.lookup("verb") == "terminate" &&
+        (target_session || (target_user && no_session)))
+        return polkit.Result.YES;
+
+    return polkit.Result.NO;
+});
+EOF
+    systemctl try-reload-or-restart polkit.service
+
+    # lock-sessions: session, uid, username, verb
+    runas testuser loginctl lock-session "$session"
+    (! runas testuser loginctl unlock-session "$session")
+    # lock-sessions on all sessions: verb
+    runas testuser loginctl lock-sessions
+    (! runas testuser loginctl unlock-sessions)
+
+    # chvt: seat
+    runas testuser loginctl activate "$session"
+
+    # set-user-linger: uid, username, verb
+    (! runas testuser loginctl enable-linger root)
+    runas testuser loginctl enable-linger logind-test-user
+    assert_eq "$(loginctl show-user logind-test-user -P Linger)" yes
+    (! runas testuser loginctl disable-linger logind-test-user)
+    assert_eq "$(loginctl show-user logind-test-user -P Linger)" yes
+
+    # manage: session, uid, username, verb
+    (! runas testuser loginctl kill-session "$session")
+    (! runas testuser loginctl kill-user logind-test-user)
+    runas testuser loginctl terminate-session "$session"
+    # The user is kept around by lingering, so it can be terminated separately.
+    runas testuser loginctl terminate-user logind-test-user
+}
+
 setup_test_user
 test_write_dropin
 run_testcases
+run_subtests
 
 touch /testok

@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 
 #include "fd-util.h"
+#include "fs-util.h"
 #include "log.h"
 #include "recurse-dir.h"
 #include "rm-rf.h"
@@ -29,7 +30,7 @@ static int nftw_cb(
 
         case FTW_F:
                 log_debug("ftw found %s", fpath);
-                assert_se(strv_extend(&list_nftw, fpath) >= 0);
+                ASSERT_OK(strv_extend(&list_nftw, fpath));
                 break;
 
         case FTW_SL:
@@ -38,7 +39,7 @@ static int nftw_cb(
 
         case FTW_D:
                 log_debug("ftw entering %s", fpath);
-                assert_se(strv_extendf(&list_nftw, "%s/", fpath) >= 0);
+                ASSERT_OK(strv_extendf(&list_nftw, "%s/", fpath));
                 break;
 
         case FTW_DNR:
@@ -69,26 +70,26 @@ static int recurse_dir_callback(
 
         char ***l = userdata;
 
-        assert_se(path);
-        assert_se(de);
+        ASSERT_NOT_NULL(path);
+        ASSERT_NOT_NULL(de);
 
         switch (event) {
 
         case RECURSE_DIR_ENTRY:
-                assert_se(!IN_SET(de->d_type, DT_UNKNOWN, DT_DIR));
+                ASSERT_FALSE(IN_SET(de->d_type, DT_UNKNOWN, DT_DIR));
 
                 log_debug("found %s%s", path,
                           de->d_type == DT_LNK ? ", ignoring." : "");
 
                 if (de->d_type != DT_LNK)
-                        assert_se(strv_extend(l, path) >= 0);
+                        ASSERT_OK(strv_extend(l, path));
                 break;
 
         case RECURSE_DIR_ENTER:
-                assert_se(de->d_type == DT_DIR);
+                ASSERT_EQ(de->d_type, DT_DIR);
 
                 log_debug("entering %s", path);
-                assert_se(strv_extendf(l, "%s/", path) >= 0);
+                ASSERT_OK(strv_extendf(l, "%s/", path));
                 break;
 
         case RECURSE_DIR_LEAVE:
@@ -148,11 +149,9 @@ static void assert_entries(DirectoryEntries *de, char **expected) {
 
 static void check_readdir_all(int tfd, RecurseDirFlags flags, char **expected) {
         _cleanup_free_ DirectoryEntries *de = NULL;
-        _cleanup_close_ int fd = -EBADF;
 
-        /* readdir_all() consumes the directory fd offset, hence reopen a fresh fd for each enumeration. */
-        ASSERT_OK(fd = fd_reopen(tfd, O_DIRECTORY|O_CLOEXEC));
-        ASSERT_OK(readdir_all(fd, flags, &de));
+        /* readdir_all() consumes the directory fd offset, hence have it reopened for each enumeration. */
+        ASSERT_OK(readdir_all(tfd, flags|RECURSE_DIR_REOPEN, &de));
         assert_entries(de, expected);
 }
 
@@ -165,16 +164,16 @@ static void test_must_be_flags(void) {
         /* Populate a temporary directory with one entry of each interesting type and verify that the
          * RECURSE_DIR_MUST_BE_* flags select exactly the right subset. */
 
-        ASSERT_OK(tfd = mkdtemp_open(NULL, O_DIRECTORY|O_CLOEXEC, &t));
+        ASSERT_OK(tfd = mkdtemp_open(/* template= */ NULL, O_DIRECTORY, &t));
 
         ASSERT_OK_ERRNO(mkdirat(tfd, "dir", 0777));
-        ASSERT_OK_ERRNO(reg_fd = openat(tfd, "reg", O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC, 0666));
+        ASSERT_OK(reg_fd = xopenat_full(tfd, "reg", O_CREAT|O_EXCL|O_WRONLY, /* xopen_flags= */ 0, 0666));
         reg_fd = safe_close(reg_fd);
         ASSERT_OK_ERRNO(symlinkat("reg", tfd, "lnk"));
         ASSERT_OK_ERRNO(mknodat(tfd, "sock", S_IFSOCK|0666, 0));
 
         /* Without any MUST_BE flag we get all four entries. */
-        check_readdir_all(tfd, 0, STRV_MAKE("dir", "reg", "lnk", "sock"));
+        check_readdir_all(tfd, /* flags= */ 0, STRV_MAKE("dir", "reg", "lnk", "sock"));
 
         /* A single MUST_BE flag selects exactly the entries of the matching type. */
         check_readdir_all(tfd, RECURSE_DIR_MUST_BE_DIRECTORY, STRV_MAKE("dir"));
@@ -187,6 +186,42 @@ static void test_must_be_flags(void) {
         check_readdir_all(tfd, RECURSE_DIR_MUST_BE_DIRECTORY|RECURSE_DIR_MUST_BE_SOCKET, STRV_MAKE("dir", "sock"));
 }
 
+static void test_reopen(void) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF, fd = -EBADF, path_fd = -EBADF;
+
+        log_info("/* %s */", __func__);
+
+        ASSERT_OK(tfd = mkdtemp_open(/* template= */ NULL, O_DIRECTORY, &t));
+        ASSERT_OK_ERRNO(mkdirat(tfd, "a", 0777));
+        ASSERT_OK_ERRNO(mkdirat(tfd, "b", 0777));
+
+        /* Entries created after a directory was opened are not necessarily seen when enumerating it via
+         * that fd (POSIX leaves this unspecified), hence open a new fd now that the entries exist. */
+        ASSERT_OK(fd = xopenat(tfd, ".", O_DIRECTORY));
+
+        /* Without RECURSE_DIR_REOPEN the file offset of the fd is consumed, hence a second enumeration on
+         * the same fd yields nothing … */
+        _cleanup_free_ DirectoryEntries *de1 = NULL, *de2 = NULL, *de3 = NULL, *de4 = NULL, *de5 = NULL;
+        ASSERT_OK(readdir_all(fd, RECURSE_DIR_SORT, &de1));
+        assert_entries(de1, STRV_MAKE("a", "b"));
+        ASSERT_OK(readdir_all(fd, RECURSE_DIR_SORT, &de2));
+        ASSERT_EQ(de2->n_entries, 0U);
+
+        /* … but with it every enumeration starts from the beginning */
+        ASSERT_OK(readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_REOPEN, &de3));
+        assert_entries(de3, STRV_MAKE("a", "b"));
+
+        /* O_PATH fds can only be enumerated if reopened, directly or via an empty path */
+        ASSERT_OK(path_fd = xopenat(AT_FDCWD, t, O_PATH|O_DIRECTORY));
+        ASSERT_ERROR(readdir_all(path_fd, /* flags= */ 0, /* ret= */ NULL), EBADF);
+        ASSERT_OK(readdir_all(path_fd, RECURSE_DIR_SORT|RECURSE_DIR_REOPEN, &de4));
+        assert_entries(de4, STRV_MAKE("a", "b"));
+        ASSERT_OK(readdir_all_at(path_fd, "", RECURSE_DIR_SORT|RECURSE_DIR_REOPEN, &de5));
+        assert_entries(de5, STRV_MAKE("a", "b"));
+        ASSERT_ERROR(readdir_all_at(path_fd, "", /* flags= */ 0, /* ret= */ NULL), ENOENT);
+}
+
 int main(int argc, char *argv[]) {
         _cleanup_strv_free_ char **list_recurse_dir = NULL;
         const char *p;
@@ -197,16 +232,17 @@ int main(int argc, char *argv[]) {
         test_setup_logging(LOG_INFO);
 
         test_must_be_flags();
+        test_reopen();
 
         if (argc > 1)
                 p = argv[1];
         else
                 p = "/usr/share/man"; /* something hopefully reasonably stable while we run (and limited in size) */
 
-        fd = open(p, O_DIRECTORY|O_CLOEXEC);
-        if (fd < 0 && errno == ENOENT)
-                return log_tests_skipped_errno(errno, "Couldn't open directory %s", p);
-        assert_se(fd >= 0);
+        fd = xopenat(AT_FDCWD, p, O_DIRECTORY);
+        if (fd == -ENOENT)
+                return log_tests_skipped_errno(fd, "Couldn't open directory %s", p);
+        ASSERT_OK(fd);
 
         /* If the test directory is on an overlayfs then files and their directory may return different
          * st_dev in stat results, which confuses nftw into thinking they're on different filesystems and
@@ -219,11 +255,11 @@ int main(int argc, char *argv[]) {
          * https://github.com/systemd/systemd/issues/29603), so ignore them to avoid bogus errors. */
 
         t1 = now(CLOCK_MONOTONIC);
-        assert_se(recurse_dir(fd, p, 0, UINT_MAX, RECURSE_DIR_SORT|RECURSE_DIR_ENSURE_TYPE|RECURSE_DIR_SAME_MOUNT, recurse_dir_callback, &list_recurse_dir) >= 0);
+        ASSERT_OK(recurse_dir(fd, p, /* statx_mask= */ 0, UINT_MAX, RECURSE_DIR_SORT|RECURSE_DIR_ENSURE_TYPE|RECURSE_DIR_SAME_MOUNT, recurse_dir_callback, &list_recurse_dir));
         t2 = now(CLOCK_MONOTONIC);
 
         t3 = now(CLOCK_MONOTONIC);
-        assert_se(nftw(p, nftw_cb, 64, FTW_PHYS|FTW_MOUNT) >= 0);
+        ASSERT_OK_ERRNO(nftw(p, nftw_cb, 64, FTW_PHYS|FTW_MOUNT));
         t4 = now(CLOCK_MONOTONIC);
 
         log_info("recurse_dir(): %s – nftw(): %s", FORMAT_TIMESPAN(t2 - t1, 1), FORMAT_TIMESPAN(t4 - t3, 1));

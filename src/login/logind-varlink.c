@@ -13,6 +13,7 @@
 #include "json-util.h"
 #include "login-util.h"
 #include "logind.h"
+#include "logind-counters.h"
 #include "logind-dbus.h"
 #include "logind-inhibit.h"
 #include "logind-seat.h"
@@ -368,6 +369,8 @@ static int vl_method_create_session(sd_varlink *link, sd_json_variant *parameter
         r = session_start(session, /* properties= */ NULL, /* error= */ NULL);
         if (r < 0)
                 goto fail;
+
+        session_count_started(session);
 
         session->create_link = sd_varlink_ref(link);
 
@@ -763,7 +766,7 @@ static int vl_method_release_session(sd_varlink *link, sd_json_variant *paramete
         if (r < 0)
                 return r;
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int setup_wall_message_timer(Manager *m, sd_varlink *link) {
@@ -838,7 +841,7 @@ static int manager_do_shutdown_action(sd_varlink *link, sd_json_variant *paramet
 
         (void) setup_wall_message_timer(m, link);
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_power_off(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {

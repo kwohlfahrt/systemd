@@ -116,13 +116,13 @@ set -o pipefail
 EXIT_STATUS=88
 LEAVE=0
 
-function reload() {
+reload() {
     systemd-notify --reloading --status="Adding 11 to exit status"
     EXIT_STATUS=\$((EXIT_STATUS + 11))
     systemd-notify --ready --status="Back running"
 }
 
-function leave() {
+leave() {
     systemd-notify --stopping --status="Adding 7 to exit status"
     EXIT_STATUS=\$((EXIT_STATUS + 7))
     LEAVE=1
@@ -167,7 +167,7 @@ Restart=on-failure
 RestartMode=debug
 StartLimitBurst=3
 MountAPIVFS=yes
-BindPaths=/nonexistent-debug-59
+BindPaths=/nonexistent-debug-59:/run/dst-debug-59
 EOF
 
 systemctl daemon-reload
@@ -175,5 +175,7 @@ systemctl start testservice-fail-restart-debug-59.service
 wait_on_state_or_fail "testservice-fail-restart-debug-59.service" "failed" "15"
 journalctl --sync
 journalctl -b | grep "Failed to follow symlinks on /nonexistent-debug-59: No such file or directory" >/dev/null
+# The missing bind mount source, not the destination, is reported at error level
+journalctl -b | grep "Required path '/nonexistent-debug-59' not found while mounting" >/dev/null
 
 touch /testok

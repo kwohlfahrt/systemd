@@ -9,6 +9,7 @@
 #include "netlink-internal.h"
 #include "resolved-dns-scope.h"
 #include "resolved-dns-server.h"
+#include "resolved-dns-transport-dns.h"
 #include "resolved-link.h"
 #include "resolved-manager.h"
 #include "tests.h"
@@ -63,22 +64,22 @@ TEST(link_relevant) {
         ASSERT_NOT_NULL(link);
 
         link->flags = IFF_LOOPBACK;
-        ASSERT_FALSE(link_relevant(link, AF_INET, true));
-        ASSERT_FALSE(link_relevant(link, AF_INET, false));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ true));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 
         link->flags = IFF_UP;
-        ASSERT_FALSE(link_relevant(link, AF_INET, true));
-        ASSERT_FALSE(link_relevant(link, AF_INET, false));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ true));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 
         link->flags = IFF_UP | IFF_LOWER_UP;
-        ASSERT_FALSE(link_relevant(link, AF_INET, true));
-        ASSERT_FALSE(link_relevant(link, AF_INET, false));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ true));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 
         link->flags = IFF_UP | IFF_LOWER_UP | IFF_MULTICAST;
         link->operstate = IF_OPER_UP;
 
-        ASSERT_FALSE(link_relevant(link, AF_INET, true));
-        ASSERT_FALSE(link_relevant(link, AF_INET, false));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ true));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 
         union in_addr_union ip = { .in.s_addr = htobe32(0xc0a84301) };
         union in_addr_union bcast = { .in.s_addr = htobe32(0xc0a843ff) };
@@ -86,18 +87,18 @@ TEST(link_relevant) {
         ASSERT_OK(link_address_new(link, &address, AF_INET, &ip, &bcast));
         ASSERT_NOT_NULL(address);
 
-        ASSERT_TRUE(link_relevant(link, AF_INET, true));
-        ASSERT_TRUE(link_relevant(link, AF_INET, false));
+        ASSERT_TRUE(link_relevant(link, AF_INET, /* local_multicast= */ true));
+        ASSERT_TRUE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 
         link->flags = IFF_UP | IFF_LOWER_UP;
-        ASSERT_FALSE(link_relevant(link, AF_INET, true));
-        ASSERT_TRUE(link_relevant(link, AF_INET, false));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ true));
+        ASSERT_TRUE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 
         link->is_managed = true;
-        ASSERT_FALSE(link_relevant(link, AF_INET, false));
+        ASSERT_FALSE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 
         link->networkd_operstate = LINK_OPERSTATE_DEGRADED_CARRIER;
-        ASSERT_TRUE(link_relevant(link, AF_INET, false));
+        ASSERT_TRUE(link_relevant(link, AF_INET, /* local_multicast= */ false));
 }
 
 /* ================================================================
@@ -197,16 +198,31 @@ TEST(link_allocate_scopes_resets_manager_dns_server) {
         link_alloc_env_setup(&env, AF_INET, DNS_SERVER_SYSTEM);
 
         env.link->unicast_relevant = false;
-        env.manager.dns_servers->verified_feature_level = DNS_SERVER_FEATURE_LEVEL_EDNS0;
-        env.manager.dns_servers->possible_feature_level = DNS_SERVER_FEATURE_LEVEL_DO;
-        env.manager.dns_servers->received_udp_fragment_max = 1024u;
+        env.manager.dns_servers->verified_feature_level = (DnsServerFeatureLevel) {
+                .transport = DNS_TRANSPORT_DNS,
+                .edns = DNS_SERVER_EDNS_LEVEL_EDNS0,
+                .ipproto = IPPROTO_UDP,
+        };
+        env.manager.dns_servers->possible_feature_level = (DnsServerFeatureLevel) {
+                .transport = DNS_TRANSPORT_DNS,
+                .edns = DNS_SERVER_EDNS_LEVEL_DO,
+                .ipproto = IPPROTO_UDP,
+        };
+        DnsTransportDns *d = ASSERT_PTR(DNS_TRANSPORT_TO_DNS(env.manager.dns_servers->transports[DNS_TRANSPORT_DNS]));
+        d->received_udp_fragment_max = 1024u;
+        d->n_failed_udp = 2;
+        d->n_failed_tcp = 2;
+        d->packet_truncated = true;
 
         link_allocate_scopes(env.link);
 
         ASSERT_TRUE(env.link->unicast_relevant);
-        ASSERT_EQ(env.manager.dns_servers->verified_feature_level, _DNS_SERVER_FEATURE_LEVEL_INVALID);
-        ASSERT_EQ(env.manager.dns_servers->possible_feature_level, DNS_SERVER_FEATURE_LEVEL_BEST);
-        ASSERT_EQ(env.manager.dns_servers->received_udp_fragment_max, DNS_PACKET_UNICAST_SIZE_MAX);
+        ASSERT_FALSE(dns_server_feature_level_is_valid(env.manager.dns_servers->verified_feature_level));
+        ASSERT_TRUE(dns_server_feature_level_equal(env.manager.dns_servers->possible_feature_level, dns_server_feature_level_best()));
+        ASSERT_EQ(d->received_udp_fragment_max, DNS_PACKET_UNICAST_SIZE_MAX);
+        ASSERT_EQ(d->n_failed_udp, 0u);
+        ASSERT_EQ(d->n_failed_tcp, 0u);
+        ASSERT_FALSE(d->packet_truncated);
 
         ASSERT_FALSE(env.manager.dns_servers->packet_bad_opt);
         ASSERT_FALSE(env.manager.dns_servers->packet_rrsig_missing);
@@ -226,16 +242,31 @@ TEST(link_allocate_scopes_unicast) {
         link_alloc_env_setup(&env, AF_INET, DNS_SERVER_LINK);
 
         env.link->unicast_relevant = true;
-        env.link->dns_servers->verified_feature_level = DNS_SERVER_FEATURE_LEVEL_EDNS0;
-        env.link->dns_servers->possible_feature_level = DNS_SERVER_FEATURE_LEVEL_DO;
-        env.link->dns_servers->received_udp_fragment_max = 1024u;
+        env.link->dns_servers->verified_feature_level = (DnsServerFeatureLevel) {
+                .transport = DNS_TRANSPORT_DNS,
+                .edns = DNS_SERVER_EDNS_LEVEL_EDNS0,
+                .ipproto = IPPROTO_UDP,
+        };
+        env.link->dns_servers->possible_feature_level = (DnsServerFeatureLevel) {
+                .transport = DNS_TRANSPORT_DNS,
+                .edns = DNS_SERVER_EDNS_LEVEL_DO,
+                .ipproto = IPPROTO_UDP,
+        };
+        DnsTransportDns *d = ASSERT_PTR(DNS_TRANSPORT_TO_DNS(env.link->dns_servers->transports[DNS_TRANSPORT_DNS]));
+        d->received_udp_fragment_max = 1024u;
+        d->n_failed_udp = 2;
+        d->n_failed_tcp = 2;
+        d->packet_truncated = true;
 
         link_allocate_scopes(env.link);
 
         ASSERT_TRUE(env.link->unicast_relevant);
-        ASSERT_EQ(env.link->dns_servers->verified_feature_level, _DNS_SERVER_FEATURE_LEVEL_INVALID);
-        ASSERT_EQ(env.link->dns_servers->possible_feature_level, DNS_SERVER_FEATURE_LEVEL_BEST);
-        ASSERT_EQ(env.link->dns_servers->received_udp_fragment_max, DNS_PACKET_UNICAST_SIZE_MAX);
+        ASSERT_FALSE(dns_server_feature_level_is_valid(env.link->dns_servers->verified_feature_level));
+        ASSERT_TRUE(dns_server_feature_level_equal(env.link->dns_servers->possible_feature_level, dns_server_feature_level_best()));
+        ASSERT_EQ(d->received_udp_fragment_max, DNS_PACKET_UNICAST_SIZE_MAX);
+        ASSERT_EQ(d->n_failed_udp, 0u);
+        ASSERT_EQ(d->n_failed_tcp, 0u);
+        ASSERT_FALSE(d->packet_truncated);
 
         ASSERT_FALSE(env.link->dns_servers->packet_bad_opt);
         ASSERT_FALSE(env.link->dns_servers->packet_rrsig_missing);

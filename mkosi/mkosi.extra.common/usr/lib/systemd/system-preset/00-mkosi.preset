@@ -6,8 +6,8 @@ disable sshd.service
 
 # These are started manually in integration tests so don't start them by default.
 disable dnsmasq.service
-disable isc-dhcp-server.service
-disable isc-dhcp-server6.service
+disable kea-dhcp6.service
+disable kea-dhcp6-server.service
 
 # Make sure dbus-broker is started by default on Debian/Ubuntu.
 enable dbus-broker.service
@@ -28,6 +28,11 @@ disable systemd-time-wait-sync.service
 
 # systemd-userdbd.socket is disabled by default on OpenSUSE
 enable systemd-userdbd.socket
+
+# The metrics sockets are disabled by default on OpenSUSE, and can't be started at runtime while the services
+# they belong to are already running.
+enable systemd-journald-metrics.socket
+enable systemd-logind-metrics.socket
 
 # We install dnf in some images but it's only going to be used rarely,
 # so let's not have dnf create its cache.
@@ -77,3 +82,7 @@ disable rtkit-daemon.service
 # Disable Nura specific zram swap service.
 # Maybe better to replace it with zram-generator?
 disable zram_swap.service
+
+# nftables.service is enabled by default on Nura, with a default-drop firewall
+# that drops e.g. mDNS and DHCP packets, and breaks many integration tests.
+disable nftables.service

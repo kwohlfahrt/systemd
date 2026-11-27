@@ -66,6 +66,7 @@ extern DLSYM_PROTOTYPE(fdisk_ref_partition);
 extern DLSYM_PROTOTYPE(fdisk_save_user_sector_size);
 extern DLSYM_PROTOTYPE(fdisk_set_ask);
 extern DLSYM_PROTOTYPE(fdisk_set_disklabel_id);
+extern DLSYM_PROTOTYPE(fdisk_set_first_lba);
 extern DLSYM_PROTOTYPE(fdisk_set_partition);
 extern DLSYM_PROTOTYPE(fdisk_table_get_nents);
 extern DLSYM_PROTOTYPE(fdisk_table_get_partition);
@@ -81,6 +82,9 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct fdisk_parttype*, sym_fdisk_unref_
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct fdisk_table*, sym_fdisk_unref_table, fdisk_unref_tablep, NULL);
 
 int fdisk_new_context_at(int dir_fd, const char *path, bool read_only, uint32_t sector_size, struct fdisk_context **ret);
+
+int fdisk_get_disklabel_id_as_id128(struct fdisk_context *c, sd_id128_t *ret);
+int fdisk_set_disklabel_id_as_id128(struct fdisk_context *c, sd_id128_t id);
 
 int fdisk_partition_get_uuid_as_id128(struct fdisk_partition *p, sd_id128_t *ret);
 int fdisk_partition_get_type_as_id128(struct fdisk_partition *p, sd_id128_t *ret);

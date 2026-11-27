@@ -65,6 +65,15 @@ evdev:input:b0003v0460p0004*
  EVDEV_ABS_01=::40
 
 #########################################
+# Acer
+#########################################
+
+# Swift 16 AI (SF16-71T) / Pixart Touchpad 093A:4813
+evdev:input:b0018v093Ap4813*
+ EVDEV_ABS_18=::500
+ EVDEV_ABS_3a=::500
+
+#########################################
 # AIPTEK
 #########################################
 
@@ -74,6 +83,11 @@ evdev:input:b0003v08CAp0010*
 evdev:input:b0003v08CAp0020*
  EVDEV_ABS_00=::20
  EVDEV_ABS_01=::20
+
+# APT-USB-3 (sold as Trust TB-3100), 200x150 mm active area
+evdev:input:b0003v08CAp0021*
+ EVDEV_ABS_00=::15
+ EVDEV_ABS_01=::15
 
 # AIPTEK Media Tablet Ultimate (detected as Waltop International Corp. Batteryless Tablet)
 evdev:input:b0003v172Fp0503*
@@ -1031,6 +1045,15 @@ evdev:input:b0003v2179p0004*
 evdev:input:b0003v2FEBp0006*
  EVDEV_ABS_00=::129
  EVDEV_ABS_01=::215
+
+#########################################
+# ViewSonic
+#########################################
+
+# ViewSonic WoodPad 7 PF0730-E0WW
+evdev:input:b0003v0543pE667*
+ EVDEV_ABS_00=::103
+ EVDEV_ABS_01=::105
 
 #########################################
 # Waltop

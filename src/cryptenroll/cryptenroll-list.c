@@ -7,9 +7,7 @@
 #include "cryptenroll-list.h"
 #include "cryptsetup-util.h"
 #include "format-table.h"
-#include "json-util.h"
 #include "log.h"
-#include "parse-util.h"
 
 int collect_enrolled_slots(struct crypt_device *cd, EnrolledSlot **ret, size_t *ret_n) {
         _cleanup_free_ EnrolledSlot *slots = NULL;
@@ -43,10 +41,11 @@ int collect_enrolled_slots(struct crypt_device *cd, EnrolledSlot **ret, size_t *
          * token they are assigned to */
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
-                sd_json_variant *w, *z;
+                _cleanup_free_ int *keyslots = NULL;
+                size_t n_keyslots;
                 EnrollType et;
 
-                r = cryptsetup_get_token_as_json(cd, token, NULL, &v);
+                r = cryptsetup_get_token_as_json(cd, token, /* verify_type= */ NULL, &v);
                 if (IN_SET(r, -ENOENT, -EINVAL))
                         continue;
                 if (r < 0) {
@@ -54,36 +53,17 @@ int collect_enrolled_slots(struct crypt_device *cd, EnrolledSlot **ret, size_t *
                         continue;
                 }
 
-                w = sd_json_variant_by_key(v, "type");
-                if (!w || !sd_json_variant_is_string(w)) {
-                        log_warning("Token JSON data lacks type field, ignoring.");
+                r = cryptsetup_token_parse_common(v, /* ret_type= */ NULL, &keyslots, &n_keyslots);
+                if (r < 0) {
+                        log_warning_errno(r, "Token JSON data lacks a valid type or keyslots field, ignoring: %m");
                         continue;
                 }
 
-                et = luks2_token_type_from_string(sd_json_variant_string(w)); /* _ENROLL_TYPE_INVALID for unrecognized type */
+                et = luks2_token_type_from_json(v); /* _ENROLL_TYPE_INVALID for unrecognized type */
 
-                w = sd_json_variant_by_key(v, "keyslots");
-                if (!w || !sd_json_variant_is_array(w)) {
-                        log_warning("Token JSON data lacks keyslots field, ignoring.");
-                        continue;
-                }
-
-                JSON_VARIANT_ARRAY_FOREACH(z, w) {
-                        unsigned u;
-
-                        if (!sd_json_variant_is_string(z)) {
-                                log_warning("Token JSON data's keyslot field is not an array of strings, ignoring.");
-                                continue;
-                        }
-
-                        r = safe_atou(sd_json_variant_string(z), &u);
-                        if (r < 0) {
-                                log_warning_errno(r, "Token JSON data's keyslot field is not an integer formatted as string, ignoring.");
-                                continue;
-                        }
-
+                FOREACH_ARRAY(k, keyslots, n_keyslots)
                         FOREACH_ARRAY(s, slots, n_slots) {
-                                if ((unsigned) s->slot != u)
+                                if (s->slot != *k)
                                         continue;
 
                                 if (s->conflict) /* Already marked as claimed multiple times. */
@@ -94,7 +74,6 @@ int collect_enrolled_slots(struct crypt_device *cd, EnrolledSlot **ret, size_t *
                                 else
                                         s->type = et;
                         }
-                }
         }
 
         *ret = TAKE_PTR(slots);
@@ -120,7 +99,7 @@ int list_enrolled(struct crypt_device *cd) {
         if (!t)
                 return log_oom();
 
-        assert_se(cell = table_get_cell(t, 0, 0));
+        assert_se(cell = table_get_cell(t, /* row= */ 0, /* column= */ 0));
         (void) table_set_align_percent(t, cell, 100);
 
         FOREACH_ARRAY(s, slots, n_slots) {

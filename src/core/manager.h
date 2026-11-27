@@ -18,6 +18,9 @@ struct libmnt_monitor;
 
 /* Enforce upper limit on how many names we allow */
 #define MANAGER_MAX_NAMES 131072 /* 128K */
+/* Unprivileged callers have to be authorized for every unit of a batch separately, which takes one polkit
+ * round trip per unit. Only allow so many units for them, and don't let a huge batch keep PID 1 busy. */
+#define MANAGER_MAX_POLKIT_NAMES 1024
 
 /* Enforce upper limit on the number of patterns/states requested over IPC */
 #define MANAGER_MAX_PATTERNS_PER_CALL 4096U
@@ -356,6 +359,11 @@ typedef struct Manager {
         sd_bus_message *pending_reload_message_dbus;
         sd_varlink *pending_reload_message_vl;
 
+        /* This is used during reexecution: we keep the request around so preparation failures before
+         * execve() can be reported. Successful reexecution is still reported by disconnecting. */
+        sd_bus_message *pending_reexecute_message_dbus;
+        sd_varlink *pending_reexecute_message_vl;
+
         Hashmap *watch_bus;  /* D-Bus names => Unit object n:1 */
 
         uint32_t current_job_id;
@@ -493,6 +501,8 @@ typedef struct Manager {
         unsigned notifygen;
 
         sd_varlink_server *varlink_server;
+        /* Varlink clients streaming a job, by job id, carried across a reload since connections can't be serialized */
+        Hashmap *stashed_varlink_job_clients;
         /* When we're a system manager, this object manages the subscription from systemd-oomd to PID1 that's
          * used to report changes in ManagedOOM settings (systemd server - oomd client). When
          * we're a user manager, this object manages the client connection from the user manager to
@@ -514,8 +524,12 @@ typedef struct Manager {
         int restrict_fsaccess_link_fds[_RESTRICT_FILESYSTEM_ACCESS_LINK_MAX];
         int restrict_fsaccess_bss_map_fd;
 
-        /* Whether the ptrace seccomp filter is installed in this process; it survives execve() */
+        /* Whether the ptrace and personality seccomp filters are installed in this process; they survive
+         * execve() */
         bool restrict_fsaccess_ptrace_filter;
+        bool restrict_fsaccess_personality_filter;
+        /* The link FDs came from an older version, whose .bss layout differs from ours. */
+        bool restrict_fsaccess_foreign_bss;
 
         /* Allow users to configure a rate limit for Reload()/Reexecute() operations */
         RateLimit reload_reexec_ratelimit;
@@ -554,6 +568,14 @@ typedef struct Manager {
 static inline usec_t manager_default_timeout_abort_usec(Manager *m) {
         assert(m);
         return m->defaults.timeout_abort_set ? m->defaults.timeout_abort_usec : m->defaults.timeout_stop_usec;
+}
+
+/* Whether a new reload or reexecute request can be accepted. */
+static inline bool manager_can_reload(Manager *m) {
+        assert(m);
+        return m->objective == MANAGER_OK &&
+               !m->pending_reload_message_dbus && !m->pending_reload_message_vl &&
+               !m->pending_reexecute_message_dbus && !m->pending_reexecute_message_vl;
 }
 
 #define MANAGER_IS_SYSTEM(m) ((m)->runtime_scope == RUNTIME_SCOPE_SYSTEM)

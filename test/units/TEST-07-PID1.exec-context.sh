@@ -44,13 +44,22 @@ if [[ -z "${COVERAGE_BUILD_DIR:-}" ]]; then
     fi
 
     systemd-run --wait --pipe -p ProtectSystem=yes \
-        bash -xec "test ! -w /usr; ${boot_path:+"test ! -w $boot_path; test ! -w $esp_path;"} test -w /etc; test -w /var"
+        bash -xec "test ! -w /usr; ${boot_path:+"test ! -w $boot_path; test ! -w $esp_path;"} test -w /etc; test -w /var; test -w /run"
     systemd-run --wait --pipe -p ProtectSystem=full \
-        bash -xec "test ! -w /usr; ${boot_path:+"test ! -w $boot_path; test ! -w $esp_path;"} test ! -w /etc; test -w /var"
+        bash -xec "test ! -w /usr; ${boot_path:+"test ! -w $boot_path; test ! -w $esp_path;"} test ! -w /etc; test -w /var; test -w /run"
     systemd-run --wait --pipe -p ProtectSystem=strict \
-        bash -xec "test ! -w /; test ! -w /etc; test ! -w /var; test -w /dev; test -w /proc"
+        bash -xec "test ! -w /; test ! -w /etc; test ! -w /var; test ! -w /run; test -w /dev; test -w /proc"
     systemd-run --wait --pipe -p ProtectSystem=no \
-        bash -xec "test -w /; test -w /etc; test -w /var; test -w /dev; test -w /proc"
+        bash -xec "test -w /; test -w /etc; test -w /var; test -w /run; test -w /dev; test -w /proc"
+
+    # /run/ stays read-only under ProtectSystem=strict even when MountAPIVFS= sets up a writable tmpfs there ...
+    systemd-run --wait --pipe -p ProtectSystem=strict -p MountAPIVFS=yes \
+        bash -xec "test ! -w /run"
+    # ... but ReadWritePaths= can still make a subdirectory of /run/ writable.
+    mkdir -p /run/test-exec-run-rw
+    systemd-run --wait --pipe -p ProtectSystem=strict -p MountAPIVFS=yes -p ReadWritePaths=/run/test-exec-run-rw \
+        bash -xec "test ! -w /run; test -w /run/test-exec-run-rw"
+    rm -rf /run/test-exec-run-rw
 
     MARK="$(mktemp /root/.exec-context.XXX)"
     systemd-run --wait --pipe -p ProtectHome=yes \
@@ -242,20 +251,21 @@ if ! systemd-detect-virt -cq; then
 fi
 
 # {Cache,Configuration,Logs,Runtime,State}Directory=
+# All *Directory= directives support tuple syntax (directory:symlink:flags for
+# {Runtime,State,Cache,Logs}Directory=, directory::flags for ConfigurationDirectory=),
+# which requires an additional level of escaping for the colon character.
 ARGUMENTS=(
     -p CacheDirectory="foo/bar/baz also\ with\ spaces"
     -p CacheDirectory="foo"
     -p CacheDirectory="context"
     -p CacheDirectoryMode="0123"
     -p CacheDirectoryMode="0666"
-    -p ConfigurationDirectory="context/foo also_context/bar context/nested/baz context/semi\:colon"
+    -p ConfigurationDirectory="context/foo also_context/bar context/nested/baz context/semi\\\:colon"
     -p ConfigurationDirectoryMode="0400"
     -p LogsDirectory="context/foo"
     -p LogsDirectory=""
     -p LogsDirectory="context/a/very/nested/logs/dir"
     -p RuntimeDirectory="context/with\ spaces"
-    # Note: {Runtime,State,Cache,Logs}Directory= directives support the directory:symlink syntax, which
-    #       requires an additional level of escaping for the colon character
     -p RuntimeDirectory="also_context:a\ symlink\ with\ \\\:\ col\\\:ons\ and\ \ spaces"
     -p RuntimeDirectoryPreserve=yes
     -p StateDirectory="context"
@@ -270,8 +280,9 @@ systemd-run --wait --pipe "${ARGUMENTS[@]}" \
 systemd-run --wait --pipe "${ARGUMENTS[@]}" \
     bash -xec '[[ $CONFIGURATION_DIRECTORY == /etc/also_context/bar:/etc/context/foo:/etc/context/nested/baz:/etc/context/semi:colon ]];
                [[ $(stat -c "%a" "${CONFIGURATION_DIRECTORY%%:*}") == 400 ]]'
+# Note: the empty LogsDirectory= above resets the list, so context/foo is gone
 systemd-run --wait --pipe "${ARGUMENTS[@]}" \
-    bash -xec '[[ $LOGS_DIRECTORY == /var/log/context/a/very/nested/logs/dir:/var/log/context/foo ]];
+    bash -xec '[[ $LOGS_DIRECTORY == /var/log/context/a/very/nested/logs/dir ]];
                [[ $(stat -c "%a" "${LOGS_DIRECTORY##*:}") == 755 ]]'
 systemd-run --wait --pipe "${ARGUMENTS[@]}" \
     bash -xec '[[ $RUNTIME_DIRECTORY == "/run/also_context:/run/context/with spaces" ]];
@@ -348,6 +359,7 @@ if [[ ! -v ASAN_OPTIONS ]] && systemctl --version | grep "+BPF_FRAMEWORK" && ker
     ROOTFS="$(df --output=fstype /usr/bin | sed --quiet 2p)"
     systemd-run --wait --pipe -p RestrictFileSystems="" ls /
     systemd-run --wait --pipe -p RestrictFileSystems="$ROOTFS foo bar" ls /
+    systemd-run --wait --pipe -p RestrictFileSystems="$ROOTFS,foo,bar" ls /
     (! systemd-run --wait --pipe -p RestrictFileSystems="$ROOTFS" ls /proc)
     (! systemd-run --wait --pipe -p GCOV_ERROR_LOG=/dev/null -p RestrictFileSystems="foo" ls /)
     systemd-run --wait --pipe -p RestrictFileSystems="$ROOTFS foo bar baz proc" ls /proc
@@ -366,6 +378,66 @@ if [[ ! -v ASAN_OPTIONS ]] && systemctl --version | grep "+BPF_FRAMEWORK" && ker
     (! systemd-run --wait --pipe -p RestrictFileSystems="~proc devtmpfs sysfs" ls /proc)
     (! systemd-run --wait --pipe -p RestrictFileSystems="~proc devtmpfs sysfs" ls /dev)
     (! systemd-run --wait --pipe -p RestrictFileSystems="~proc devtmpfs sysfs" ls /sys)
+fi
+
+# Comma-separated lists in unit files
+#
+# -p arguments are split on the client side (covered by test-bus-unit-util), so load a unit file and
+# check what the manager parsed. The names are reported sorted, so the output is deterministic.
+UNIT=test-07-comma-separated-lists.service
+cat >"/run/systemd/system/$UNIT" <<EOF
+[Service]
+ExecStart=true
+SystemCallFilter=~ptrace,reboot,swapon
+SystemCallLog=ptrace,reboot swapoff
+RestrictFileSystems=~proc,sysfs,foo
+EOF
+systemctl daemon-reload
+if systemctl --version | grep "+SECCOMP"; then
+    assert_eq "$(systemctl show -P SystemCallFilter "$UNIT")" "~ptrace reboot swapon"
+    assert_eq "$(systemctl show -P SystemCallLog "$UNIT")" "ptrace reboot swapoff"
+fi
+if systemctl --version | grep "+BPF_FRAMEWORK"; then
+    assert_eq "$(systemctl show -P RestrictFileSystems "$UNIT")" "~foo proc sysfs"
+fi
+rm "/run/systemd/system/$UNIT"
+systemctl daemon-reload
+
+# RestrictAddressFamilies=
+#
+# The manager accepts address family names without the "AF_" prefix and in any case, but writes the
+# canonical names into the transient unit file. systemd-run would already canonicalize the names on
+# the client side, so talk to the manager directly to exercise the manager's own code.
+if systemctl --version | grep "+SECCOMP"; then
+    UNIT=test-07-restrict-address-families.service
+    busctl call \
+        org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+        org.freedesktop.systemd1.Manager StartTransientUnit \
+        "ssa(sv)a(sa(sv))" "$UNIT" replace 2 \
+          ExecStart "a(sasb)" 1 \
+            sleep 2 sleep infinity false \
+          RestrictAddressFamilies "(bas)" true 2 inet Unix \
+        0
+    grep "^RestrictAddressFamilies=AF_INET AF_UNIX$" "/run/systemd/transient/$UNIT" >/dev/null
+    assert_eq "$(systemctl show -P RestrictAddressFamilies "$UNIT")" "AF_INET AF_UNIX"
+    systemctl stop "$UNIT"
+
+    # An unknown name is rejected with InvalidArgs. busctl only reports the name of the error via
+    # BUSERROR=, so run it as a service and look at StatusBusError.
+    UNIT=test-07-restrict-address-families-bad.service
+    (! systemd-run --wait --pipe --unit="$UNIT" -p NotifyAccess=main \
+        busctl call \
+            org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+            org.freedesktop.systemd1.Manager StartTransientUnit \
+            "ssa(sv)a(sa(sv))" test-07-restrict-address-families-unknown.service replace 2 \
+              ExecStart "a(sasb)" 1 \
+                sleep 2 sleep infinity false \
+              RestrictAddressFamilies "(bas)" true 2 inet huddlduddl \
+            0 2>/tmp/test-07-restrict-address-families.err)
+    assert_eq "$(systemctl show -P StatusBusError "$UNIT")" org.freedesktop.DBus.Error.InvalidArgs
+    grep "Call failed: Invalid address family: huddlduddl" /tmp/test-07-restrict-address-families.err >/dev/null
+    rm /tmp/test-07-restrict-address-families.err
+    systemctl reset-failed "$UNIT"
 fi
 
 # Ensure DynamicUser=yes does not imply PrivateTmp=yes if TemporaryFileSystem=/tmp /var/tmp is set
@@ -420,6 +492,8 @@ mkdir /tmp/root
 touch /tmp/root/foo
 chmod +x /tmp/root/foo
 (! systemd-run --wait --pipe false)
+(! systemd-run --wait --unit=test-socket-stdio-no-fd -p StandardInput=socket true)
+assert_eq "$(systemctl show -P ExecMainStatus test-socket-stdio-no-fd.service)" 202
 if [[ ! -v ASAN_OPTIONS ]]; then
     # Here, -p EnvironmentFile=-/usr/lib/systemd/systemd-asan-env does not work,
     # as sd-executor loads NSS module and fails before applying the environment:
@@ -445,3 +519,40 @@ if [[ ! -v ASAN_OPTIONS ]]; then
    systemd-run --wait --pipe unshare -T true
    (! systemd-run --wait --pipe -p RestrictNamespaces=~time unshare -T true)
 fi
+
+# Tests for RootDirectory= pointing at the host root, and for RootDirectoryFileDescriptor=
+# RootDirectory=/ must be treated like any other root directory: with an implied
+# MountAPIVFS=yes, /run/ is a private tmpfs (not the host's) with the log sockets bound into it.
+rootdir_check='[[ "$(stat -fc %T /run)" == tmpfs ]] && [[ ! -e /run/test-07-rootdir-marker ]] && [[ -S /run/systemd/journal/socket ]]'
+touch /run/test-07-rootdir-marker
+ln -s / /test-07-rootdir-symlink
+
+systemd-run --wait --pipe -p RootDirectory=/ bash -xec "$rootdir_check"
+# A symlink to the root resolves to the root and behaves the same.
+systemd-run --wait --pipe -p RootDirectory=/test-07-rootdir-symlink bash -xec "$rootdir_check"
+# RootDirectoryFileDescriptor= (used by systemd-run --root-directory=), too.
+systemd-run --wait --pipe --root-directory=/ bash -xec "$rootdir_check"
+systemd-run --wait --pipe --root-directory=/test-07-rootdir-symlink bash -xec "$rootdir_check"
+
+# Combined with ProtectSystem=strict: everything below / is read-only, except for
+# the private /run/ tmpfs. Skipped in coverage builds, where ProtectSystem= is
+# forced off by a drop-in that overrides the transient setting.
+if [[ -z "${COVERAGE_BUILD_DIR:-}" ]]; then
+    systemd-run --wait --pipe -p RootDirectory=/ -p ProtectSystem=strict \
+        bash -xec '! test -w /etc && test -w /run'
+fi
+
+rm -f /run/test-07-rootdir-marker /test-07-rootdir-symlink
+
+# Check that the exec and noexec attributes are propagated to the mounts below.
+systemd-run --wait --pipe \
+    -p NoExecPaths=/root \
+    -p TemporaryFileSystem=/root/noexec \
+    -p BindPaths=/bin:/root/noexec/mnt \
+    -p TemporaryFileSystem=/root/exec \
+    -p BindPaths=/bin:/root/exec/mnt \
+    -p ExecPaths=/root/exec/mnt \
+    bash -xec '
+        (! /root/noexec/mnt/true)
+        /root/exec/mnt/true
+    '

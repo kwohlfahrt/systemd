@@ -15,13 +15,13 @@ static int track_cb_x(sd_bus_track *t, void *userdata) {
 
         log_error("TRACK CB X");
 
-        assert_se(!track_cb_called_x);
+        ASSERT_FALSE(track_cb_called_x);
         track_cb_called_x = true;
 
         /* This means b's name disappeared. Let's now disconnect, to make sure the track handling on disconnect works
          * as it should. */
 
-        assert_se(shutdown(sd_bus_get_fd(sd_bus_track_get_bus(t)), SHUT_RDWR) >= 0);
+        ASSERT_OK_ERRNO(shutdown(sd_bus_get_fd(sd_bus_track_get_bus(t)), SHUT_RDWR));
         return 1;
 }
 
@@ -29,12 +29,12 @@ static int track_cb_y(sd_bus_track *t, void *userdata) {
 
         log_error("TRACK CB Y");
 
-        assert_se(!track_cb_called_y);
+        ASSERT_FALSE(track_cb_called_y);
         track_cb_called_y = true;
 
         /* We got disconnected, let's close everything */
 
-        assert_se(sd_event_exit(sd_bus_get_event(sd_bus_track_get_bus(t)), EXIT_SUCCESS) >= 0);
+        ASSERT_OK(sd_event_exit(sd_bus_get_event(sd_bus_track_get_bus(t)), EXIT_SUCCESS));
 
         return 0;
 }
@@ -47,7 +47,7 @@ static void track_destroy_z(void *userdata) {
         track_destroy_called_z = true;
 }
 
-int main(int argc, char *argv[]) {
+TEST(track) {
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(sd_bus_track_unrefp) sd_bus_track *x = NULL, *y = NULL, *z = NULL;
         _cleanup_(sd_bus_unrefp) sd_bus *a = NULL, *b = NULL;
@@ -55,96 +55,94 @@ int main(int argc, char *argv[]) {
         const char *unique;
         int r;
 
-        test_setup_logging(LOG_INFO);
-
-        assert_se(sd_event_default(&event) >= 0);
+        ASSERT_OK(sd_event_default(&event));
 
         r = sd_bus_open_user(&a);
         if (IN_SET(r, -ECONNREFUSED, -ENOENT, -ENOMEDIUM)) {
                 r = sd_bus_open_system(&a);
                 if (IN_SET(r, -ECONNREFUSED, -ENOENT))
-                        return log_tests_skipped("Failed to connect to bus");
+                        return (void) log_tests_skipped_errno(r, "Failed to connect to bus");
                 use_system_bus = true;
         }
-        assert_se(r >= 0);
+        ASSERT_OK(r);
 
-        assert_se(sd_bus_attach_event(a, event, SD_EVENT_PRIORITY_NORMAL) >= 0);
+        ASSERT_OK(sd_bus_attach_event(a, event, SD_EVENT_PRIORITY_NORMAL));
 
         if (use_system_bus)
-                assert_se(sd_bus_open_system(&b) >= 0);
+                ASSERT_OK(sd_bus_open_system(&b));
         else
-                assert_se(sd_bus_open_user(&b) >= 0);
+                ASSERT_OK(sd_bus_open_user(&b));
 
-        assert_se(sd_bus_attach_event(b, event, SD_EVENT_PRIORITY_NORMAL) >= 0);
+        ASSERT_OK(sd_bus_attach_event(b, event, SD_EVENT_PRIORITY_NORMAL));
 
         /* Watch b's name from a */
-        assert_se(sd_bus_track_new(a, &x, track_cb_x, NULL) >= 0);
+        ASSERT_OK(sd_bus_track_new(a, &x, track_cb_x, /* userdata= */ NULL));
 
-        assert_se(sd_bus_get_unique_name(b, &unique) >= 0);
+        ASSERT_OK(sd_bus_get_unique_name(b, &unique));
 
-        assert_se(sd_bus_track_add_name(x, unique) >= 0);
+        ASSERT_OK(sd_bus_track_add_name(x, unique));
 
         /* Watch's a's own name from a */
-        assert_se(sd_bus_track_new(a, &y, track_cb_y, NULL) >= 0);
+        ASSERT_OK(sd_bus_track_new(a, &y, track_cb_y, /* userdata= */ NULL));
 
-        assert_se(sd_bus_get_unique_name(a, &unique) >= 0);
+        ASSERT_OK(sd_bus_get_unique_name(a, &unique));
 
-        assert_se(sd_bus_track_add_name(y, unique) >= 0);
+        ASSERT_OK(sd_bus_track_add_name(y, unique));
 
         /* Basic tests. */
-        assert_se(sd_bus_track_new(a, &z, track_cb_z, NULL) >= 0);
+        ASSERT_OK(sd_bus_track_new(a, &z, track_cb_z, /* userdata= */ NULL));
 
         /* non-recursive case */
-        assert_se(sd_bus_track_set_recursive(z, false) >= 0);
-        assert_se(sd_bus_track_get_recursive(z) == 0);
-        assert_se(!sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 0);
-        assert_se(sd_bus_track_remove_name(z, unique) == 0);
-        assert_se(sd_bus_track_add_name(z, unique) >= 0);
-        assert_se(sd_bus_track_add_name(z, unique) >= 0);
-        assert_se(sd_bus_track_add_name(z, unique) >= 0);
-        assert_se(sd_bus_track_set_recursive(z, true) == -EBUSY);
-        assert_se(sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 1);
-        assert_se(sd_bus_track_remove_name(z, unique) == 1);
-        assert_se(!sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 0);
-        assert_se(sd_bus_track_remove_name(z, unique) == 0);
+        ASSERT_OK(sd_bus_track_set_recursive(z, false));
+        ASSERT_OK_EQ(sd_bus_track_get_recursive(z), 0);
+        ASSERT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 0);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 0);
+        ASSERT_OK(sd_bus_track_add_name(z, unique));
+        ASSERT_OK(sd_bus_track_add_name(z, unique));
+        ASSERT_OK(sd_bus_track_add_name(z, unique));
+        ASSERT_ERROR(sd_bus_track_set_recursive(z, true), EBUSY);
+        ASSERT_NOT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 1);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 1);
+        ASSERT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 0);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 0);
 
         /* recursive case */
-        assert_se(sd_bus_track_set_recursive(z, true) >= 0);
-        assert_se(sd_bus_track_get_recursive(z) == 1);
-        assert_se(!sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 0);
-        assert_se(sd_bus_track_remove_name(z, unique) == 0);
-        assert_se(sd_bus_track_add_name(z, unique) >= 0);
-        assert_se(sd_bus_track_add_name(z, unique) >= 0);
-        assert_se(sd_bus_track_add_name(z, unique) >= 0);
-        assert_se(sd_bus_track_set_recursive(z, false) == -EBUSY);
-        assert_se(sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 3);
-        assert_se(sd_bus_track_remove_name(z, unique) == 1);
-        assert_se(sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 2);
-        assert_se(sd_bus_track_remove_name(z, unique) == 1);
-        assert_se(sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 1);
-        assert_se(sd_bus_track_remove_name(z, unique) == 1);
-        assert_se(!sd_bus_track_contains(z, unique));
-        assert_se(sd_bus_track_count_name(z, unique) == 0);
-        assert_se(sd_bus_track_remove_name(z, unique) == 0);
+        ASSERT_OK(sd_bus_track_set_recursive(z, true));
+        ASSERT_OK_EQ(sd_bus_track_get_recursive(z), 1);
+        ASSERT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 0);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 0);
+        ASSERT_OK(sd_bus_track_add_name(z, unique));
+        ASSERT_OK(sd_bus_track_add_name(z, unique));
+        ASSERT_OK(sd_bus_track_add_name(z, unique));
+        ASSERT_ERROR(sd_bus_track_set_recursive(z, false), EBUSY);
+        ASSERT_NOT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 3);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 1);
+        ASSERT_NOT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 2);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 1);
+        ASSERT_NOT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 1);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 1);
+        ASSERT_NULL(sd_bus_track_contains(z, unique));
+        ASSERT_OK_EQ(sd_bus_track_count_name(z, unique), 0);
+        ASSERT_OK_EQ(sd_bus_track_remove_name(z, unique), 0);
 
-        assert_se(sd_bus_track_set_destroy_callback(z, track_destroy_z) >= 0);
+        ASSERT_OK(sd_bus_track_set_destroy_callback(z, track_destroy_z));
         z = sd_bus_track_unref(z);
-        assert_se(track_destroy_called_z);
+        ASSERT_TRUE(track_destroy_called_z);
 
         /* Now make b's name disappear */
         sd_bus_close(b);
 
-        assert_se(sd_event_loop(event) >= 0);
+        ASSERT_OK(sd_event_loop(event));
 
-        assert_se(track_cb_called_x);
-        assert_se(track_cb_called_y);
-
-        return 0;
+        ASSERT_TRUE(track_cb_called_x);
+        ASSERT_TRUE(track_cb_called_y);
 }
+
+DEFINE_TEST_MAIN(LOG_INFO);

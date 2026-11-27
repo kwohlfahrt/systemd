@@ -453,6 +453,7 @@ Label=luks-format-copy
 UUID=7b93d1f2-595d-4ce3-b0b9-837fbd9e63b0
 Format=ext4
 Encrypt=yes
+EncryptKDF=pbkdf2
 CopyFiles=$defs:/def
 SizeMinBytes=48M
 VolumeLabel=schrupfel
@@ -551,6 +552,114 @@ $imgs/zzz8 : start=     6422488, size=      131072, type=4D21B016-B534-45C2-A9FB
 
     cryptsetup luksDump "${loop}p8" | grep 'Flags:[[:space:]]*(no flags)' >/dev/null
     losetup -d "$loop"
+}
+
+testcase_empty_force_block_device() {
+    local defs imgs loop before partition_fd
+
+    if systemd-detect-virt --quiet --container; then
+        echo "Skipping block device overwrite tests in container."
+        return
+    fi
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+
+    # Repart enforces a 32M minimum for ext4, even if SizeMaxBytes= is smaller.
+    tee "$defs/10-data.conf" <<EOF
+[Partition]
+Type=linux-generic
+Label=original
+Format=ext4
+SizeMinBytes=32M
+SizeMaxBytes=32M
+EOF
+
+    tee "$defs/20-extra.conf" <<EOF
+[Partition]
+Type=linux-generic
+Label=extra
+SizeMinBytes=32M
+SizeMaxBytes=32M
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --empty=create \
+                   --size=128M \
+                   --dry-run=no \
+                   "$imgs/force.img"
+
+    loop="$(losetup --partscan --show --find "$imgs/force.img")"
+    # shellcheck disable=SC2064
+    trap "losetup -d '$loop'; rm -rf '$defs' '$imgs'" RETURN ERR
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1" "${loop:?}p2"
+
+    # Test dry run mode
+    before="$(sfdisk -d "$loop")"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --empty=force \
+                   --discard=no \
+                   --dry-run=yes \
+                   "$loop"
+
+    assert_eq "$(sfdisk -d "$loop")" "$before"
+    assert_eq "$(blockdev --getsize64 "${loop}p1")" "$((32 * 1024 * 1024))"
+    assert_eq "$(blockdev --getsize64 "${loop}p2")" "$((32 * 1024 * 1024))"
+
+    # An open partition prevents the initial BLKRRPART, but must not prevent an offline overwrite.
+    if [[ "$OFFLINE" == yes ]]; then
+        exec {partition_fd}<"${loop}p2"
+    fi
+
+    # Recreating even the same layout must not collide with the old kernel partition devices.
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --empty=force \
+                   --discard=no \
+                   --dry-run=no \
+                   "$loop" 2>&1 | tee "$imgs/recreate.log"
+
+    if [[ "$OFFLINE" == yes ]]; then
+        exec {partition_fd}<&-
+        if built_with_musl; then
+            grep -F "Failed to reread partition table after wiping, ignoring: Resource busy" "$imgs/recreate.log"
+        else
+            grep -F "Failed to reread partition table after wiping, ignoring: Device or resource busy" "$imgs/recreate.log"
+        fi
+    fi
+
+    assert_eq "$(grep -Fc 'Informing kernel about changed partitions...' "$imgs/recreate.log")" 1
+
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop}p1" "${loop}p2"
+    assert_eq "$(sfdisk -d "$loop")" "$before"
+    assert_eq "$(blkid -p -s TYPE -o value "${loop}p1")" ext4
+    assert_eq "$(blkid -p -s LABEL -o value "${loop}p1")" original
+
+    # Also replace the layout with a partition overlapping both old partitions.
+    rm "$defs/20-extra.conf"
+    sed -i -e 's/Label=original/Label=replacement/' -e 's/32M/64M/g' "$defs/10-data.conf"
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --empty=force \
+                   --discard=no \
+                   --dry-run=no \
+                   "$loop"
+
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop}p1"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "${loop}p2"
+    assert_eq "$(blockdev --getsize64 "${loop}p1")" "$((64 * 1024 * 1024))"
+    assert_eq "$(blkid -p -s TYPE -o value "${loop}p1")" ext4
+    assert_eq "$(blkid -p -s LABEL -o value "${loop}p1")" replacement
+    assert_not_in "${loop}p2 :" "$(sfdisk -d "$loop")"
 }
 
 testcase_copy_from_grain_padding() {
@@ -713,6 +822,46 @@ EOF
     assert_in "$imgs/auto1 : start=        4096, size=       20480, type=${esp_guid}," "$output"
     assert_in "$imgs/auto2 : start=       24576, size=       20480, type=${usr_guid}," "$output"
     assert_in "$imgs/auto3 : start=       45056, size=       20480, type=${root_guid}," "$output"
+}
+
+testcase_size_auto_foreign_partitions() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** Adding a partition with --size=auto to an image with foreign partitions ***"
+
+    # --size=auto reloads the partition table, which must not lose the UUID and label of the existing
+    # partitions that have no definition.
+    truncate -s 12M "$imgs/foreign.img"
+    sfdisk "$imgs/foreign.img" <<EOF
+label: gpt
+size=10M, type=${esp_guid}, uuid=${root_uuid2}, name="foreign",
+EOF
+
+    tee "$defs/usr.conf" <<EOF
+[Partition]
+Type=usr
+Label=new
+SizeMinBytes=10M
+SizeMaxBytes=10M
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --size=auto \
+                   --dry-run=no \
+                   "$imgs/foreign.img"
+
+    output=$(sfdisk --dump "$imgs/foreign.img")
+
+    assert_in "$imgs/foreign.img1 : start=        2048, size=       20480, type=${esp_guid}, uuid=${root_uuid2}, name=\"foreign\"" "$output"
+    assert_in "$imgs/foreign.img2 : start=       22528, size=       20480, type=${usr_guid}, uuid=${usr_uuid}, name=\"new\"" "$output"
 }
 
 testcase_dropin() {
@@ -1287,7 +1436,7 @@ EOF
 }
 
 testcase_verity() {
-    local defs imgs output
+    local defs imgs output join_defs join_output join_roothash join_sig_start join_sig_size
 
     defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
     imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
@@ -1349,6 +1498,21 @@ EOF
     mkdir -p /run/verity.d
     ln -sf "$defs/verity.crt" /run/verity.d/ok.crt
 
+    # Manifests are signed with a key of their own, separate from the verity one
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$defs/manifest.key" -out "$defs/manifest.crt" -subj /CN=manifest -days 2 2>/dev/null
+
+    # Restrict the images to specific systems, if the file system supports user xattrs
+    local -a match_args=()
+    touch "$imgs/xattr-probe"
+    if setfattr -n user.probe -v 1 "$imgs/xattr-probe"; then
+        match_args=(--match-xattr-hostname='web*'
+                    --match-xattr-hostname=db1
+                    --match-xattr-machine-tags=dropped
+                    --match-xattr-machine-tags=
+                    --match-xattr-os-version='>= 40')
+    fi
+    rm -f "$imgs/xattr-probe"
+
     output=$(systemd-repart --offline="$OFFLINE" \
                             --definitions="$defs" \
                             --seed="$seed" \
@@ -1356,6 +1520,12 @@ EOF
                             --empty=create \
                             --size=auto \
                             --split=yes \
+                            --manifest=yes \
+                            --manifest-gpt=yes \
+                            --manifest-fields=size,hash,fs-uuid,fs-label,fat-serial \
+                            --manifest-private-key="$defs/manifest.key" \
+                            --manifest-certificate="$defs/manifest.crt" \
+                            "${match_args[@]}" \
                             --json=pretty \
                             --private-key="$defs/verity.key" \
                             --certificate="$defs/verity.crt" \
@@ -1374,6 +1544,105 @@ EOF
     assert_neq "$sig_split" ""
     assert_neq "$sig_split" "null"
     jq . "$sig_split" >/dev/null
+
+    # The manifest of the root partition's file system tree lists the files copied into it, and the manifest
+    # of the partition table describes the partitions, with the split artifacts as sources, hence it must
+    # verify against the directory the split artifacts are in.
+    root_manifest=$(jq -r ".[] | select(.type == \"root-${architecture}\") | .manifest_path" <<<"$output")
+    assert_eq "$root_manifest" "$imgs/verity.root-${architecture}.Uapi16Manifest"
+    # CopyFiles= places the definitions directory at the same path inside the partition
+    jq --seq -s -e ".[] | select(.name == \"${defs#/}/verity-data.conf\")" <"$root_manifest" >/dev/null
+    # Only the requested fields are included
+    jq --seq -s -e ".[] | select(.name == \"${defs#/}/verity-data.conf\") | has(\"size\") and has(\"sha256\") and (has(\"mode\") | not)" <"$root_manifest" >/dev/null
+    # In offline mode the tree is populated from a staging directory, whose file system identity has nothing
+    # to do with the one of the partition, hence it must not be recorded
+    # The root object declares the requested fields as features, minus the ones that do not apply
+    if [[ "$OFFLINE" == "yes" ]]; then
+        jq --seq -s -e '.[0] | (has("fsUUID") or has("fsLabel") or has("fatSerial")) | not' <"$root_manifest" >/dev/null
+        jq --seq -s -e '.[0].features == ["sha256","size"]' <"$root_manifest" >/dev/null
+    else
+        # FS_IOC_GETFSUUID requires kernel 6.9, fs-uuid is not declared if the UUID cannot be queried
+        jq --seq -s -e '.[0] | .features == (["fat-serial","fs-label"] + (if has("fsUUID") then ["fs-uuid"] else [] end) + ["sha256","size"])' <"$root_manifest" >/dev/null
+    fi
+    # The manifest is signed with the manifest key, not the verity key
+    systemd-manifest verify --certificate="$defs/manifest.crt" / "$root_manifest"
+    (! systemd-manifest verify --certificate="$defs/verity.crt" / "$root_manifest")
+    assert_eq "$(jq -r ".[] | select(.type == \"root-${architecture}-verity-sig\") | .manifest_path" <<<"$output")" "-"
+
+    gpt_manifest="$imgs/verity.Uapi16Manifest"
+    jq --seq -s -e '.[] | select(.mediaType == "application/vnd.uapi.16.signature") | .mechanism == "pkcs7"' <"$gpt_manifest" >/dev/null
+    # The root object declares the recorded features, which include extended attributes only if configured.
+    # The individual partition attribute flags are only included if set, as their features are listed.
+    if [[ ${#match_args[@]} -gt 0 ]]; then
+        jq --seq -s -e '.[0].features == ["gpt-disk-uuid","gpt-flag-grow-file-system","gpt-flag-no-auto","gpt-flags","gpt-label","gpt-type-uuid","gpt-uuid","read-only","sha256","size","user-xattr"]' <"$gpt_manifest" >/dev/null
+    else
+        jq --seq -s -e '.[0].features == ["gpt-disk-uuid","gpt-flag-grow-file-system","gpt-flag-no-auto","gpt-flags","gpt-label","gpt-type-uuid","gpt-uuid","read-only","sha256","size"]' <"$gpt_manifest" >/dev/null
+    fi
+    jq --seq -s -e 'all(.[]; .gptFlagNoAuto != false and .gptFlagGrowFileSystem != false and .readOnly != false)' <"$gpt_manifest" >/dev/null
+    # The image as a whole is covered too
+    jq --seq -s -e ".[] | select(.name == \"verity\") | .size == $(stat -c %s "$imgs/verity") and .sha256 == \"$(sha256sum "$imgs/verity" | cut -d' ' -f1)\"" <"$gpt_manifest" >/dev/null
+    root_split=$(jq -r ".[] | select(.type == \"root-${architecture}\") | .split_path" <<<"$output")
+    jq --seq -s -e ".[] | select(.name == \"$(basename "$root_split")\") | (.contents | length) == 1 and .contents[0].file == \"$(basename "$imgs/verity")\" and .contents[0].offset > 0 and .gptLabel != null" <"$gpt_manifest" >/dev/null
+    # The verity signature partition is described like its split artifact, i.e. without the NUL padding
+    jq --seq -s -e ".[] | select(.name == \"$(basename "$sig_split")\") | (.contents | length) == 1 and .size == $(stat -c %s "$sig_split")" <"$gpt_manifest" >/dev/null
+    systemd-manifest verify --certificate="$defs/manifest.crt" "$imgs" "$gpt_manifest"
+    (! systemd-manifest verify --certificate="$defs/verity.crt" "$imgs" "$gpt_manifest")
+
+    # A verity signature partition without any signature in it (e.g. an empty B slot) is described with
+    # its full size, rather than failing
+    mkdir "$defs/empty-sig"
+    tee "$defs/empty-sig/10-sig.conf" <<EOF
+[Partition]
+Type=root-${architecture}-verity-sig
+SplitName=-
+EOF
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs/empty-sig" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=create \
+                   --size=auto \
+                   --manifest-gpt=yes \
+                   "$imgs/empty-sig"
+    sig_size=$(sfdisk --json "$imgs/empty-sig" | jq '.partitiontable.partitions[0].size * .partitiontable.sectorsize')
+    jq --seq -s -e ".[] | select(.name == \"empty-sig.0\") | .size == $sig_size" <"$imgs/empty-sig.Uapi16Manifest" >/dev/null
+
+    # Colliding names in the partition table manifest (here: an A/B pair of root partitions with the
+    # default SplitName=) are refused before the partition table is written
+    mkdir "$defs/collide"
+    for i in a b; do
+        tee "$defs/collide/10-root-$i.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+SizeMinBytes=10M
+EOF
+    done
+    truncate -s 64M "$imgs/collide"
+    (! systemd-repart --offline="$OFFLINE" \
+                      --definitions="$defs/collide" \
+                      --seed="$seed" \
+                      --dry-run=no \
+                      --empty=allow \
+                      --manifest-gpt=yes \
+                      "$imgs/collide")
+    (! sfdisk --dump "$imgs/collide")
+    [[ ! -e "$imgs/collide.Uapi16Manifest" ]]
+
+    if [[ ${#match_args[@]} -gt 0 ]]; then
+        # The image and the split artifacts carry the requested xattrs, and the partition table manifest
+        # records them for the image and each partition, hence it verifies including the xattrs
+        for f in "$imgs/verity" "$root_split" "$sig_split"; do
+            assert_eq "$(getfattr --only-values -n user.uapi.match_hostname "$f" | tr '\0' ' ')" "web* db1"
+            assert_eq "$(getfattr --only-values -n user.uapi.match_os_version "$f")" ">= 40"
+            (! getfattr -n user.uapi.match_machine_tags "$f")
+        done
+        jq --seq -s -e '.[] | select(.name == "verity") | .extendedAttributes.user["uapi.match_os_version"].text == ">= 40" and .extendedAttributes.user["uapi.match_hostname"].base64 != null and (.extendedAttributes.user | has("uapi.match_machine_tags") | not)' <"$gpt_manifest" >/dev/null
+        jq --seq -s -e ".[] | select(.name == \"$(basename "$root_split")\") | .extendedAttributes.user[\"uapi.match_os_version\"].text == \">= 40\"" <"$gpt_manifest" >/dev/null
+        systemd-manifest verify --field=+user-xattr --certificate="$defs/manifest.crt" "$imgs" "$gpt_manifest"
+        setfattr -n user.uapi.match_os_version -v '>= 41' "$root_split"
+        (! systemd-manifest verify --field=+user-xattr --certificate="$defs/manifest.crt" "$imgs" "$gpt_manifest")
+        (! systemd-repart --match-xattr-os-version='>=' "$imgs/invalid" 2>&1) | grep -F "Invalid argument to --match-xattr-os-version=: >=" >/dev/null
+    fi
 
     # Check that offline signing works and the resulting image is valid
 
@@ -1402,6 +1671,90 @@ EOF
                    --join-signature "$offline_drh:$imgs/offline.roothash.p7s" \
                    --certificate "$defs/verity.crt" \
                    "$imgs/offline"
+
+    # A type-only verity signature partition (e.g. an empty B slot) must remain empty when a
+    # joined signature is supplied, since it has no data/hash siblings to sign.
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs/empty-sig" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=create \
+                   --size=auto \
+                   --join-signature="$offline_drh:$imgs/offline.roothash.p7s" \
+                   --certificate="$defs/verity.crt" \
+                   "$imgs/empty-sig-joined"
+
+    output=$(sfdisk --json "$imgs/empty-sig-joined")
+    sig_start=$(jq -r '.partitiontable.partitions[0].start * .partitiontable.sectorsize' <<<"$output")
+    sig_size=$(jq -r '.partitiontable.partitions[0].size * .partitiontable.sectorsize' <<<"$output")
+    cmp --bytes="$sig_size" \
+        --ignore-initial=0:"$sig_start" \
+        /dev/zero "$imgs/empty-sig-joined"
+
+    # Join a signature into an existing image with a deferred Verity=signature partition
+    # that uses a custom partition type.
+    join_defs="$imgs/join-defs"
+    mkdir "$join_defs"
+
+    tee "$join_defs/verity-data.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+CopyFiles=${defs}
+Verity=data
+VerityMatchKey=root
+Minimize=guess
+EOF
+
+    tee "$join_defs/verity-hash.conf" <<EOF
+[Partition]
+Type=root-${architecture}-verity
+Verity=hash
+VerityMatchKey=root
+Minimize=yes
+EOF
+
+    tee "$join_defs/verity-sig.conf" <<EOF
+[Partition]
+Type=linux-generic
+Verity=signature
+VerityMatchKey=root
+EOF
+
+    output=$(systemd-repart --offline="$OFFLINE" \
+                            --definitions="$join_defs" \
+                            --seed="$seed" \
+                            --dry-run=no \
+                            --empty=create \
+                            --size=auto \
+                            --json=pretty \
+                            --defer-partitions=linux-generic \
+                            "$imgs/join-source")
+
+    join_roothash=$(jq -r ".[] | select(.type == \"root-${architecture}\") | .roothash" <<<"$output")
+
+    echo -n "$join_roothash" | \
+        openssl smime -sign -in /dev/stdin \
+                      -inkey "$defs/verity.key" \
+                      -signer "$defs/verity.crt" \
+                      -noattr -binary -outform der \
+                      -out "$imgs/join.roothash.p7s"
+
+    # Exercise the inline base64 form of --join-signature.
+    join_output=$(systemd-repart --offline="$OFFLINE" \
+                                  --definitions="$join_defs" \
+                                  --seed="$seed" \
+                                  --dry-run=no \
+                                  --json=pretty \
+                                  --join-signature="$join_roothash:base64:$(base64 -w0 "$imgs/join.roothash.p7s")" \
+                                  --certificate="$defs/verity.crt" \
+                                  "$imgs/join-source")
+
+    assert_eq "$join_roothash" "$(jq -r ".[] | select(.type == \"linux-generic\") | .roothash" <<<"$join_output")"
+    join_sig_start=$(jq -r '.[] | select(.type == "linux-generic") | .offset' <<<"$join_output")
+    join_sig_size=$(jq -r '.[] | select(.type == "linux-generic") | .raw_size' <<<"$join_output")
+    dd if="$imgs/join-source" iflag=skip_bytes,count_bytes skip="$join_sig_start" count="$join_sig_size" status=none |
+        tr -d '\000' |
+        jq -e --arg roothash "$join_roothash" '.rootHash == $roothash and (.signature | type == "string" and length > 0)' >/dev/null
 
     # Check that we can dissect, mount and unmount a repart verity image. (and that the image UUID is deterministic)
 
@@ -1477,6 +1830,121 @@ EOF
     # Check that the verity block sizes are as expected
     veritysetup dump "${loop}p2" | grep 'Data block size:' | grep '4096' >/dev/null
     veritysetup dump "${loop}p2" | grep 'Hash block size:' | grep '1024' >/dev/null
+}
+
+testcase_verity_signature_reproducible() {
+    local defs imgs key output roothash deterministic=1
+    local -a sigs
+
+    # systemd-repart signs the root hash without signed attributes, so the signature only depends on the
+    # key and the root hash. An ECDSA signature also contains a nonce. systemd-repart has to derive the
+    # nonce from the key and the root hash (RFC 6979). Otherwise the signature, and with it the image,
+    # differs on every build. Build the same image twice with a P-256 key and twice with an RSA key. Check
+    # that every signature verifies against its certificate, and that the two builds with the same key
+    # have the same signature. For the RSA key, also check that `openssl smime` creates the same
+    # signature. Finally, check that systemd-repart refuses a private key that doesn't belong to the
+    # certificate.
+
+    if ! command -v mkfs.erofs >/dev/null; then
+        echo "mkfs.erofs not found, skipping."
+        return
+    fi
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout "$defs/ecdsa.key" -out "$defs/ecdsa.crt" -subj /CN=verity -days 2 2>/dev/null
+    openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$defs/rsa.key" -out "$defs/rsa.crt" -subj /CN=verity -days 2 2>/dev/null
+
+    # OpenSSL supports deterministic nonces since 3.2. With an older OpenSSL, the ECDSA signatures differ.
+    if ! openssl dgst -sha256 -sign "$defs/ecdsa.key" -sigopt nonce-type:1 -out /dev/null /dev/null; then
+        echo "OpenSSL doesn't support deterministic ECDSA nonces, not comparing the ECDSA signatures."
+        deterministic=0
+    fi
+
+    mkdir "$defs/tree"
+    echo verity >"$defs/tree/file"
+
+    tee "$defs/verity-data.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+Format=erofs
+CopyFiles=$defs/tree:/
+Verity=data
+VerityMatchKey=root
+Minimize=best
+EOF
+
+    tee "$defs/verity-hash.conf" <<EOF
+[Partition]
+Type=root-${architecture}-verity
+Verity=hash
+VerityMatchKey=root
+Minimize=best
+EOF
+
+    tee "$defs/verity-sig.conf" <<EOF
+[Partition]
+Type=root-${architecture}-verity-sig
+Verity=signature
+VerityMatchKey=root
+EOF
+
+    for key in ecdsa rsa; do
+        sigs=()
+        for i in 1 2; do
+            output=$(env SOURCE_DATE_EPOCH=0 \
+                         systemd-repart --offline="$OFFLINE" \
+                                        --definitions="$defs" \
+                                        --seed="$seed" \
+                                        --dry-run=no \
+                                        --empty=create \
+                                        --size=auto \
+                                        --split=yes \
+                                        --json=pretty \
+                                        --private-key="$defs/$key.key" \
+                                        --certificate="$defs/$key.crt" \
+                                        "$imgs/$key$i")
+            sigs+=("$(jq -r ".[] | select(.type == \"root-${architecture}-verity-sig\") | .split_path" <<<"$output")")
+        done
+
+        roothash="$(jq -r .rootHash "${sigs[0]}")"
+        assert_eq "$roothash" "$(jq -r .rootHash "${sigs[1]}")"
+        if [[ "$key" == rsa || "$deterministic" == 1 ]]; then
+            assert_eq "$(jq -r .signature "${sigs[0]}")" "$(jq -r .signature "${sigs[1]}")"
+        fi
+
+        # Check that the signature verifies against the certificate.
+        jq -r .signature "${sigs[0]}" | base64 --decode >"$imgs/$key.p7s"
+        printf '%s' "$roothash" >"$imgs/roothash"
+        openssl cms -verify -inform DER -binary -nointern -purpose any \
+                -certfile "$defs/$key.crt" -CAfile "$defs/$key.crt" \
+                -in "$imgs/$key.p7s" -content "$imgs/roothash" -out /dev/null
+    done
+
+    # A signature with an RSA key has no nonce. Check that systemd-repart creates the same signature as
+    # `openssl smime` creates for the root hash.
+    openssl smime -sign -noattr -binary -outform DER \
+            -signer "$defs/rsa.crt" -inkey "$defs/rsa.key" \
+            -in "$imgs/roothash" -out "$imgs/rsa-openssl.p7s"
+    cmp "$imgs/rsa.p7s" "$imgs/rsa-openssl.p7s"
+
+    # A private key that doesn't belong to the certificate must be refused.
+    (! systemd-repart --offline="$OFFLINE" \
+                      --definitions="$defs" \
+                      --seed="$seed" \
+                      --dry-run=no \
+                      --empty=create \
+                      --size=auto \
+                      --split=yes \
+                      --private-key="$defs/ecdsa.key" \
+                      --certificate="$defs/rsa.crt" \
+                      "$imgs/mismatch")
 }
 
 testcase_verity_hash_size_from_data_size() {
@@ -1558,11 +2026,6 @@ EOF
 
 testcase_verity_encrypt() {
     local defs imgs output loop drh hrh part_size dm_devno verity_dep
-
-    if ( . /etc/os-release && [[ "$ID" == "nura" ]] ); then
-        echo "Skipping verity+encrypt test on Nura."
-        return
-    fi
 
     defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
     imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
@@ -1705,7 +2168,7 @@ EOF
     dm_devno=$(findmnt --noheadings --output MAJ:MIN "$imgs/mnt" | tr -d ' ')
     [[ "$(dmsetup table -j "${dm_devno%%:*}" -m "${dm_devno##*:}" | cut -d' ' -f3)" == "crypt" ]]
     verity_dep=$(dmsetup deps -o devname -j "${dm_devno%%:*}" -m "${dm_devno##*:}" | sed 's/.*(\(.*\))/\1/')
-    [[ "$(dmsetup table "/dev/mapper/$verity_dep" | cut -d' ' -f3)" == "verity" ]]
+    [[ "$(dmsetup table "$verity_dep" | cut -d' ' -f3)" == "verity" ]]
 
     # The copied-in files must be intact
     cmp "$defs/verity-data.conf" "$imgs/mnt$defs/verity-data.conf"
@@ -2220,6 +2683,98 @@ EOF
     systemd-dissect -U "$imgs/mnt"
 }
 
+testcase_make_mount_nodes() {
+    local defs imgs epoch
+
+    if systemd-detect-virt --quiet --container; then
+        echo "Skipping MakeMountNodes= test in container."
+        return
+    fi
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    tee "$defs/root.conf" <<EOF
+[Partition]
+Type=root
+Format=ext4
+MakeDirectories=/existing
+MakeMountNodes=/usr /home /existing /a/b/c
+EOF
+
+    epoch=1700000000
+
+    env SOURCE_DATE_EPOCH="$epoch" \
+        systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --empty=create \
+                   --size=1G \
+                   --dry-run=no \
+                   --json=pretty \
+                   "$imgs/zzz"
+
+    systemd-dissect "$imgs/zzz" -M "$imgs/mnt"
+
+    for d in usr home existing a/b/c; do
+        assert_eq "$(stat -c %F:%a "$imgs/mnt/$d")" "directory:0"
+        assert_eq "$(stat -c %Y "$imgs/mnt/$d")" "$epoch"
+        assert_eq "$(find "$imgs/mnt/$d" -mindepth 1 | wc -l)" "0"
+    done
+
+    # Parent directories are created with the usual MakeDirectories= mode, and their mtime is clamped
+    assert_eq "$(stat -c %a "$imgs/mnt/a/b")" "755"
+    assert_eq "$(stat -c %Y "$imgs/mnt/a/b")" "$epoch"
+
+    # The immutable flag is only set when populating the mounted file system, mkfs does not carry it over
+    # from a staging directory.
+    if [[ "$OFFLINE" == "no" ]]; then
+        for d in usr home existing a/b/c; do
+            assert_in "i" "$(lsattr -d "$imgs/mnt/$d" | cut -d " " -f1)"
+        done
+        (! mkdir "$imgs/mnt/usr/foo")
+    fi
+
+    systemd-dissect -U "$imgs/mnt"
+
+    # A mount node that is not empty is refused
+    rm -f "$imgs/zzz"
+    tee "$defs/root.conf" <<EOF
+[Partition]
+Type=root
+Format=ext4
+MakeDirectories=/srv/foo
+MakeMountNodes=/srv
+EOF
+
+    (! systemd-repart --offline="$OFFLINE" \
+                      --definitions="$defs" \
+                      --empty=create \
+                      --size=1G \
+                      --dry-run=no \
+                      "$imgs/zzz")
+
+    # The root directory and nested mount nodes are refused
+    for nodes in "/" "/a /a/b" "/a/b /a"; do
+        rm -f "$imgs/zzz"
+        tee "$defs/root.conf" <<EOF
+[Partition]
+Type=root
+Format=ext4
+MakeMountNodes=$nodes
+EOF
+
+        (! systemd-repart --offline="$OFFLINE" \
+                          --definitions="$defs" \
+                          --empty=create \
+                          --size=1G \
+                          --dry-run=no \
+                          "$imgs/zzz")
+    done
+}
+
 testcase_fallback_partitions() {
     local workdir image defs
 
@@ -2296,6 +2851,135 @@ EOF
     assert_in "${image}2 : start=      286680, size=      532480, type=${esp_guid}" "$output"
 }
 
+testcase_fallback_partitions_copy_files() {
+    local workdir defs image root output
+
+    if ! command -v mtype >/dev/null; then
+        echo "Skipping fallback partition copy test, mtools is not installed."
+        return 0
+    fi
+
+    workdir="$(mktemp --directory /var/tmp/test-repart.fallback-copy.XXXXXXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${workdir:?}'" RETURN
+
+    defs="$workdir/defs"
+    image="$workdir/image.raw"
+    root="$workdir/root"
+    mkdir -p "$defs" "$root/efi/EFI/BOOT" "$root/boot/EFI/Linux"
+    echo bootloader >"$root/efi/EFI/BOOT/loader.efi"
+    echo kernel >"$root/boot/EFI/Linux/kernel.efi"
+
+    tee "$defs/10-esp.conf" <<EOF
+[Partition]
+Type=esp
+Format=vfat
+CopyFiles=/efi:/
+SizeMinBytes=10M
+SplitName=esp
+EOF
+
+    tee "$defs/20-xbootldr.conf" <<EOF
+[Partition]
+Type=xbootldr
+Format=vfat
+CopyFiles=/boot:/
+SizeMinBytes=100M
+SupplementFor=10-esp
+EOF
+
+    # Neither definition has subvolumes, but both CopyFiles= entries must survive the merge.
+    systemd-repart --offline="$OFFLINE" \
+                   --root="$root" \
+                   --definitions="$defs" \
+                   --empty=create \
+                   --size=auto \
+                   --dry-run=no \
+                   --split=yes \
+                   "$image"
+
+    output="$(sfdisk --json "$image")"
+    assert_eq "$(jq '.partitiontable.partitions | length' <<<"$output")" 1
+    assert_eq "$(jq -r '.partitiontable.partitions[0].type' <<<"$output")" "$esp_guid"
+    assert_eq "$(env MTOOLS_SKIP_CHECK=1 mtype -i "$workdir/image.esp.raw" ::/EFI/BOOT/loader.efi)" \
+        bootloader
+    assert_eq "$(env MTOOLS_SKIP_CHECK=1 mtype -i "$workdir/image.esp.raw" ::/EFI/Linux/kernel.efi)" \
+        kernel
+}
+
+testcase_fallback_partitions_subvolumes() {
+    local workdir defs image root output version
+
+    if ! command -v btrfs >/dev/null || ! command -v mkfs.btrfs >/dev/null; then
+        echo "Skipping fallback partition subvolume test, btrfs-progs is not installed."
+        return 0
+    fi
+
+    version="$(btrfs --version)"
+    version="${version%%$'\n'*}"
+    if [[ "$OFFLINE" == "yes" ]] && \
+        ! systemd-analyze compare-versions "${version#btrfs-progs }" ge v6.12; then
+        echo "Skipping offline fallback partition subvolume test, btrfs-progs is older than v6.12."
+        return 0
+    fi
+
+    if systemd-detect-virt --quiet --container; then
+        echo "Skipping fallback partition subvolume test, mounting images requires loop devices."
+        return 0
+    fi
+
+    workdir="$(mktemp --directory /var/tmp/test-repart.fallback-subvolumes.XXXXXXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${workdir:?}'" RETURN
+
+    defs="$workdir/defs"
+    image="$workdir/image.raw"
+    root="$workdir/root"
+    mkdir -p "$defs" "$root/source/from-target" "$root/source/from-supplement" "$root/extra"
+    echo target >"$root/source/from-target/file"
+    echo supplement >"$root/source/from-supplement/file"
+    echo extra >"$root/extra/extra-file"
+
+    tee "$defs/10-root.conf" <<EOF
+[Partition]
+Type=root
+Format=btrfs
+CopyFiles=/source:/
+Subvolumes=/from-target
+SizeMinBytes=256M
+EOF
+
+    tee "$defs/20-supplement.conf" <<EOF
+[Partition]
+Type=linux-generic
+Format=btrfs
+CopyFiles=/extra:/
+Subvolumes=/from-supplement
+SupplementFor=10-root
+EOF
+
+    # Both path and source-inode maps have entries from each definition when copying /source.
+    systemd-repart --offline="$OFFLINE" \
+                   --root="$root" \
+                   --definitions="$defs" \
+                   --empty=create \
+                   --size=auto \
+                   --dry-run=no \
+                   "$image"
+
+    output="$(sfdisk --json "$image")"
+    assert_eq "$(jq '.partitiontable.partitions | length' <<<"$output")" 1
+    assert_eq "$(jq -r '.partitiontable.partitions[0].type' <<<"$output")" "$root_guid"
+    # shellcheck disable=SC2016
+    systemd-dissect --read-only --with "$image" bash -eux -c '
+        btrfs subvolume show from-target
+        btrfs subvolume show from-supplement
+        cmp "$1/source/from-target/file" from-target/file
+        cmp "$1/source/from-supplement/file" from-supplement/file
+        cmp "$1/extra/extra-file" extra-file
+    ' bash "$root"
+}
+
 testcase_btrfs() {
     local defs imgs output root
 
@@ -2343,8 +3027,8 @@ EOF
     sfdisk --dump "$imgs/btrfs.img"
 
     cat "$root"/etc/fstab
-    grep -q 'UUID=[0-9a-f-]* / btrfs discard,rw,nodev,suid,exec,subvol=@,zstd:1,noatime,lazytime 0 1' "$root"/etc/fstab
-    grep -q 'UUID=[0-9a-f-]* /home btrfs discard,rw,nodev,suid,exec,subvol=@home,zstd:1,noatime,lazytime 0 1' "$root"/etc/fstab
+    grep -q 'UUID=[0-9a-f-]* / btrfs rw,nodev,suid,exec,subvol=@,zstd:1,noatime,lazytime 0 1' "$root"/etc/fstab
+    grep -q 'UUID=[0-9a-f-]* /home btrfs rw,nodev,suid,exec,subvol=@home,zstd:1,noatime,lazytime 0 1' "$root"/etc/fstab
 }
 
 testcase_btrfs_compression() {
@@ -2521,8 +3205,8 @@ testcase_varlink_subscribe_devices() {
     mark=$(expect_event "\"action\":\"add\".*\"node\":\"$loop\"" "$mark") || return 1
 
     # === Test 3: detaching the loopback produces a "remove" event ===
+    # Wait for the subscriber's event, not for /dev/loopN to disappear: the number can already be reused.
     systemd-dissect --detach "$loop"
-    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop"
     mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop\"" "$mark") || return 1
     loop=""
 
@@ -2533,7 +3217,6 @@ testcase_varlink_subscribe_devices() {
         mark=$(expect_event "\"action\":\"add\".*\"node\":\"$loop\"" "$mark") || return 1
 
         systemd-dissect --detach "$loop"
-        udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop"
         mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop\"" "$mark") || return 1
         loop=""
     done
@@ -2550,12 +3233,10 @@ testcase_varlink_subscribe_devices() {
     mark=$(expect_event "\"action\":\"add\".*\"node\":\"$loop2\"" "$mark") || return 1
 
     systemd-dissect --detach "$loop2"
-    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop2"
     mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop2\"" "$mark") || return 1
     loop2=""
 
     systemd-dissect --detach "$loop"
-    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --removed --settle "$loop"
     mark=$(expect_event "\"action\":\"remove\".*\"node\":\"$loop\"" "$mark") || return 1
     loop=""
 
@@ -3549,6 +4230,401 @@ EOF
 
     after="$(sfdisk -d "$image")"
     assert_eq "$after" "$before"
+}
+
+testcase_fixed_offset() {
+    local defs imgs output before after
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** FixedOffsetBytes= on a new disk lowers the first LBA and places the partition exactly ***"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=36K
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    tee "$defs/02-root.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+SizeMinBytes=10M
+EOF
+
+    truncate -s 64M "$imgs/fixed.img"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=require \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "first-lba: 72" "$output"
+    # The fixed offset is not rounded to the grain size, and the root partition gets the rest
+    assert_in "$imgs/fixed.img1 : start=          72, size=        2048, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+    assert_in "$imgs/fixed.img2 : start=        2120, size=      128912, type=${root_guid}," "$output"
+
+    echo "*** A second run does not change anything ***"
+
+    before="$output"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   "$imgs/fixed.img"
+    after=$(sfdisk --dump "$imgs/fixed.img")
+    assert_eq "$after" "$before"
+
+    echo "*** Space around fixed offset partitions is available to other partitions ***"
+
+    rm "$defs/02-root.conf" "$imgs/fixed.img"
+
+    tee "$defs/02-home.conf" <<EOF
+[Partition]
+Type=home
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    tee "$defs/03-fixed2.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=8M
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    truncate -s 64M "$imgs/fixed.img"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=require \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "$imgs/fixed.img1 : start=          72, size=        2048, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+    # The home partition is placed right behind the first fixed offset partition
+    assert_in "$imgs/fixed.img2 : start=        2120, size=        2048, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915," "$output"
+    assert_in "$imgs/fixed.img3 : start=       16384, size=        2048, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+
+    echo "*** The size of a fixed offset partition follows SizeMinBytes= and SizeMaxBytes= ***"
+
+    rm "$defs/02-home.conf" "$defs/03-fixed2.conf" "$imgs/fixed.img"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=3M
+SizeMinBytes=1M
+SizeMaxBytes=2M
+EOF
+
+    truncate -s 64M "$imgs/fixed.img"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=require \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "first-lba: 2048" "$output"
+    assert_in "$imgs/fixed.img1 : start=        6144, size=        4096, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+
+    echo "*** CopyBlocks= into a fixed offset partition below the default first LBA ***"
+
+    rm "$imgs/fixed.img"
+    head -c 3M /dev/urandom >"$imgs/blob"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=32K
+SizeMinBytes=3M
+SizeMaxBytes=3M
+CopyBlocks=$imgs/blob
+EOF
+
+    truncate -s 64M "$imgs/fixed.img"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=require \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "first-lba: 64" "$output"
+    assert_in "$imgs/fixed.img1 : start=          64, size=        6144, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+    dd if="$imgs/fixed.img" bs=512 skip=64 count=6144 status=none | cmp - "$imgs/blob"
+
+    echo "*** A fixed offset that is not aligned to the grain size, and the partitions behind it ***"
+
+    rm "$imgs/fixed.img"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=33K
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    tee "$defs/02-root.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+SizeMinBytes=10M
+EOF
+
+    truncate -s 64M "$imgs/fixed.img"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=require \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "first-lba: 66" "$output"
+    assert_in "$imgs/fixed.img1 : start=          66, size=        2048, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+    # The partition behind the unaligned one starts on the grain again
+    assert_in "$imgs/fixed.img2 : start=        2120, size=      128912, type=${root_guid}," "$output"
+
+    # The unaligned partition must not make a second run fail
+    before="$output"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   "$imgs/fixed.img"
+    after=$(sfdisk --dump "$imgs/fixed.img")
+    assert_eq "$after" "$before"
+
+    rm "$defs/02-root.conf" "$imgs/fixed.img"
+
+    echo "*** FixedOffsetBytes= together with --size=auto ***"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=8M
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    tee "$defs/02-root.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+SizeMinBytes=10M
+SizeMaxBytes=10M
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=create \
+                   --size=auto \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "$imgs/fixed.img1 : start=       16384, size=        2048, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+    assert_in "$imgs/fixed.img2 : start=       18432, size=       20480, type=${root_guid}," "$output"
+
+    rm "$defs/02-root.conf" "$imgs/fixed.img"
+
+    echo "*** --size=auto grows an existing image to hold a fixed offset partition ***"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=20M
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    truncate -s 8M "$imgs/fixed.img"
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   --empty=allow \
+                   --size=auto \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "$imgs/fixed.img1 : start=       40960, size=        2048, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+
+    # Without --size=auto there is no room for the partition
+    truncate -s 8M "$imgs/fixed2.img"
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=allow "$imgs/fixed2.img")
+    rm "$imgs/fixed.img" "$imgs/fixed2.img" "$defs/01-boot.conf"
+
+    # Restore the definition used by the following test cases
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=2M
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    echo "*** A fixed offset partition is placed in front of existing partitions ***"
+
+    rm -f "$imgs/fixed.img" "$imgs/blob"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=2M
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+
+    truncate -s 64M "$imgs/fixed.img"
+    sfdisk "$imgs/fixed.img" <<EOF
+label: gpt
+start=8192, size=2048, type=home
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   "$imgs/fixed.img"
+
+    output=$(sfdisk --dump "$imgs/fixed.img")
+
+    assert_in "$imgs/fixed.img1 : start=        8192, size=        2048," "$output"
+    assert_in "$imgs/fixed.img2 : start=        4096, size=        2048, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4," "$output"
+
+    echo "*** Fixed offsets that cannot be honoured are refused ***"
+
+    rm "$imgs/fixed.img"
+
+    # Not a multiple of the sector size
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=100
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=create --size=64M "$imgs/refused.img")
+
+    # Zero
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=0
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=create --size=64M "$imgs/refused.img")
+
+    # Inside the GPT header and partition entry array
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=512
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=create --size=64M "$imgs/refused.img")
+
+    # Beyond the end of the disk
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=1G
+SizeMinBytes=1M
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=create --size=64M "$imgs/refused.img")
+
+    # Overlapping fixed offset partitions
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=1M
+SizeMinBytes=5M
+SizeMaxBytes=5M
+EOF
+    tee "$defs/02-other.conf" <<EOF
+[Partition]
+Type=home
+FixedOffsetBytes=2M
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=create --size=64M "$imgs/refused.img")
+    rm "$defs/02-other.conf"
+
+    # Below the first usable LBA of an existing partition table
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=36K
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+    truncate -s 64M "$imgs/refused.img"
+    sfdisk "$imgs/refused.img" <<EOF
+label: gpt
+start=2048, size=2048, type=home
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      "$imgs/refused.img")
+
+    # Replacing an existing partition table cannot lower the first usable LBA either, and must leave
+    # the image untouched when refusing
+    before=$(sha256sum "$imgs/refused.img")
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=no \
+                      --empty=force "$imgs/refused.img" 2>&1 | tee "$imgs/refused.log")
+    grep "Use a blank device or --empty=create instead" "$imgs/refused.log" >/dev/null
+    after=$(sha256sum "$imgs/refused.img")
+    assert_eq "$before" "$after"
+    rm "$imgs/refused.img" "$imgs/refused.log"
+
+    echo "*** Unsupported combinations are refused ***"
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=linux-generic
+FixedOffsetBytes=1M
+Priority=1
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=create --size=64M "$imgs/refused.img")
+
+    tee "$defs/01-boot.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+FixedOffsetBytes=1M
+SizeMinBytes=1M
+SizeMaxBytes=1M
+EOF
+    tee "$defs/02-verity-sig.conf" <<EOF
+[Partition]
+Type=root-${architecture}-verity-sig
+SupplementFor=01-boot
+EOF
+    (! systemd-repart --offline="$OFFLINE" --definitions="$defs" --seed="$seed" --dry-run=yes \
+                      --empty=create --size=64M "$imgs/refused.img")
 }
 
 OFFLINE="yes"

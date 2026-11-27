@@ -24,7 +24,7 @@
 COMMAND(
         "systemd-resolved\0",
         "Provide name resolution with caching using DNS, mDNS, LLMNR.",
-        .man_pages = "systemd-resolved.service(8)\0",
+        .man_page = "systemd-resolved.service(8)",
         .option_namespace = "service",
         .option_groups =
                 "Options\0"
@@ -62,7 +62,7 @@ static int run(int argc, char *argv[]) {
                 uid_t uid;
                 gid_t gid;
 
-                r = get_user_creds("systemd-resolve", /* flags= */ 0, NULL, &uid, &gid, NULL, NULL);
+                r = get_user_creds("systemd-resolve", /* flags= */ 0, /* ret_username= */ NULL, &uid, &gid, /* ret_home= */ NULL, /* ret_shell= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Cannot resolve user name %s: %m", "systemd-resolve");
 

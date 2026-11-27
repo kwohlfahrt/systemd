@@ -33,7 +33,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_serialization, fclosep);
 COMMAND(
         "systemd-executor\0",
         "Sandbox and execute processes.",
-        .man_pages = "systemd(1)\0",
+        .man_page = "systemd(1)",
         .option_namespace = "systemd-executor",
 );
 
@@ -156,7 +156,7 @@ static int run(int argc, char *argv[]) {
         /* Clear ambient capabilities, so services do not inherit them implicitly. Dropping them does
          * not affect the permitted and effective sets which are important for the executor itself to
          * operate. */
-        r = capability_ambient_set_apply(0, /* also_inherit= */ false);
+        r = capability_ambient_set_apply(/* set= */ 0, /* also_inherit= */ false);
         if (r < 0)
                 log_warning_errno(r, "Failed to clear ambient capabilities, ignoring: %m");
 

@@ -56,7 +56,7 @@ void vl_on_disconnect(sd_varlink_server *server, sd_varlink *link, void *userdat
         assert(server);
         assert(link);
 
-        follow_state_free(sd_varlink_set_userdata(link, NULL));
+        follow_state_free(sd_varlink_set_userdata(link, /* userdata= */ NULL));
 }
 
 static int entry_to_json_and_send(sd_journal *j, sd_varlink *link, bool follow) {
@@ -121,7 +121,7 @@ fail:
         _cleanup_(sd_varlink_unrefp) sd_varlink *link = sd_varlink_ref(fs->link);
 
         /* drop our state before replying, so that the disconnect callback won't free it a second time */
-        follow_state_free(sd_varlink_set_userdata(link, NULL));
+        follow_state_free(sd_varlink_set_userdata(link, /* userdata= */ NULL));
 
         (void) sd_varlink_error_errno(link, r);
 
@@ -179,16 +179,24 @@ static int follow_state_setup(sd_varlink *link, sd_journal *_j /* donated! */) {
         return 0;
 }
 
+static int json_dispatch_priority(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        /* Leave the priority filter unset if the value is null. */
+        if (sd_json_variant_is_null(variant))
+                return 0;
+
+        return json_dispatch_log_level(name, variant, flags, userdata);
+}
+
 int vl_method_get_entries(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "units",     SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_strv,         offsetof(GetEntriesParameters, units),      0 },
-                { "uid",       _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,      offsetof(GetEntriesParameters, uid),        0 },
-                { "userUnits", SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_strv,         offsetof(GetEntriesParameters, user_units), 0 },
-                { "namespace", SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(GetEntriesParameters, namespace),  0 },
-                { "priority",  _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_log_level,       offsetof(GetEntriesParameters, priority),   0 },
-                { "limit",     _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,       offsetof(GetEntriesParameters, limit),      0 },
-                { "follow",    SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,      offsetof(GetEntriesParameters, follow),     0 },
+                { "units",     SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_strv,         offsetof(GetEntriesParameters, units),      SD_JSON_NULLABLE     },
+                { "uid",       _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,      offsetof(GetEntriesParameters, uid),        0                    },
+                { "userUnits", SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_strv,         offsetof(GetEntriesParameters, user_units), SD_JSON_NULLABLE     },
+                { "namespace", SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(GetEntriesParameters, namespace),  SD_JSON_NULLABLE     },
+                { "priority",  _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_priority,        offsetof(GetEntriesParameters, priority),   0                    },
+                { "limit",     _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,       offsetof(GetEntriesParameters, limit),      SD_JSON_NULL_TO_ZERO },
+                { "follow",    SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,      offsetof(GetEntriesParameters, follow),     SD_JSON_NULLABLE     },
                 {}
         };
 
@@ -217,7 +225,7 @@ int vl_method_get_entries(sd_varlink *link, sd_json_variant *parameters, sd_varl
 
         r = journal_add_unit_matches(j, MATCH_UNIT_ALL, /* mangle_flags= */ 0, p.units, p.uid, p.user_units);
         if (r == -ENODATA)
-                return sd_varlink_error(link, "io.systemd.JournalAccess.NoMatches", NULL);
+                return sd_varlink_error(link, "io.systemd.JournalAccess.NoMatches", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
@@ -251,9 +259,12 @@ int vl_method_get_entries(sd_varlink *link, sd_json_variant *parameters, sd_varl
 
         uint64_t n = p.limit == 0 ? 100 : p.limit;
 
-        r = sd_journal_previous_skip(j, n + 1);
+        /* move to exactly the oldest entry to send */
+        r = sd_journal_previous_skip(j, n);
         if (r < 0)
                 return r;
+
+        bool need_next = r == 0;
 
         /* no sentinel in follow mode: an empty backlog is fine, the stream simply stays open */
         if (!p.follow) {
@@ -264,11 +275,14 @@ int vl_method_get_entries(sd_varlink *link, sd_json_variant *parameters, sd_varl
 
         uint64_t n_sent = 0;
         for (uint64_t i = 0; i < n; i++) {
-                r = sd_journal_next(j);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
+                if (need_next) {
+                        r = sd_journal_next(j);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                break;
+                }
+                need_next = true;
 
                 r = entry_to_json_and_send(j, link, p.follow);
                 if (r < 0)

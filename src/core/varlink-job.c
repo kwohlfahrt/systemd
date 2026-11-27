@@ -2,7 +2,6 @@
 
 #include "sd-varlink.h"
 
-#include "bus-polkit.h"
 #include "job.h"
 #include "json-util.h"
 #include "locale-util.h"
@@ -10,6 +9,7 @@
 #include "selinux-access.h"
 #include "strv.h"
 #include "unit.h"
+#include "varlink-common.h"
 #include "varlink-job.h"
 
 static int activation_details_build_json(sd_json_variant **ret, const char *name, void *userdata) {
@@ -84,7 +84,7 @@ static int list_job_one_with_selinux_access_check(sd_varlink *link, Job *job) {
         if (r < 0)
                 /* If mac_selinux_unit_access_check_varlink() returned an error,
                  * it means that SELinux enforce is on. It also does all the logging(). */
-                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
 
         return list_job_one(link, job);
 }
@@ -157,7 +157,7 @@ int vl_method_list_jobs(sd_varlink *link, sd_json_variant *parameters, sd_varlin
 
         /* List all jobs */
         if (!FLAGS_SET(flags, SD_VARLINK_METHOD_MORE))
-                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, /* parameters= */ NULL);
 
         r = sd_varlink_set_sentinel(link, VARLINK_ERROR_JOB_NO_SUCH_JOB);
         if (r < 0)
@@ -199,24 +199,20 @@ int vl_method_cancel_job(sd_varlink *link, sd_json_variant *parameters, sd_varli
 
         r = mac_selinux_unit_access_check_varlink(j->unit, link, "stop");
         if (r < 0)
-                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
 
-        r = varlink_verify_polkit_async(
-                        link,
-                        manager->system_bus,
-                        "org.freedesktop.systemd1.manage-units",
-                        (const char**) STRV_MAKE(
-                                        "unit", j->unit ? j->unit->id : NULL,
-                                        "verb", "cancel",
-                                        "polkit.message", N_("Authentication is required to cancel job for unit '$(unit)'."),
-                                        "polkit.gettext_domain", GETTEXT_PACKAGE),
-                        &manager->polkit_registry);
+        const UnitPolkitDetails details = {
+                .unit = j->unit,
+                .verb = "cancel",
+                .message = N_("Authentication is required to cancel job for unit '$(unit)'."),
+        };
+        r = varlink_verify_manage_units_async(link, manager, &details);
         if (r <= 0)
                 return r;
 
         job_finish_and_invalidate(j, JOB_CANCELED, /* recursive= */ true, /* already= */ false);
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 int vl_method_clear_all_jobs(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -232,21 +228,17 @@ int vl_method_clear_all_jobs(sd_varlink *link, sd_json_variant *parameters, sd_v
 
         r = mac_selinux_access_check_varlink(link, "reload");
         if (r < 0)
-                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
 
-        r = varlink_verify_polkit_async(
-                        link,
-                        manager->system_bus,
-                        "org.freedesktop.systemd1.manage-units",
-                        (const char**) STRV_MAKE(
-                                        "verb", "clear-jobs",
-                                        "polkit.message", N_("Authentication is required to clear all pending jobs."),
-                                        "polkit.gettext_domain", GETTEXT_PACKAGE),
-                        &manager->polkit_registry);
+        const UnitPolkitDetails details = {
+                .verb = "clear-jobs",
+                .message = N_("Authentication is required to clear all pending jobs."),
+        };
+        r = varlink_verify_manage_units_async(link, manager, &details);
         if (r <= 0)
                 return r;
 
         manager_clear_jobs(manager);
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }

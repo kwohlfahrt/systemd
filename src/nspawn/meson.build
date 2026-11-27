@@ -24,7 +24,7 @@ nspawn_export_sources = files(
 nspawn_gperf_c = custom_target(
         input : 'nspawn-gperf.gperf',
         output : 'nspawn-gperf.c',
-        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
+        command : [gperf_cmdline, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += nspawn_gperf_c
 nspawn_export_sources += nspawn_gperf_c
@@ -39,7 +39,6 @@ nspawn_fuzz_template = fuzz_template + nspawn_common_template
 executables += [
         executable_template + {
                 'name' : 'systemd-nspawn',
-                'public' : true,
                 'sources' : nspawn_sources,
                 'export' : nspawn_export_sources,
                 'include_directories' : [
@@ -58,6 +57,9 @@ executables += [
         },
         nspawn_test_template + {
                 'sources' : files('test-nspawn-tables.c'),
+        },
+        nspawn_test_template + {
+                'sources' : files('test-nspawn-network.c'),
         },
         nspawn_fuzz_template + {
                 'sources' : files('fuzz-nspawn-settings.c'),

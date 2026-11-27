@@ -17,7 +17,7 @@
 #include "unit-serialize.h"
 #include "virt.h"
 
-int main(int argc, char *argv[]) {
+TEST(bpf_firewall) {
         const struct bpf_insn exit_insn[] = {
                 BPF_MOV64_IMM(BPF_REG_0, 0), /* drop */
                 BPF_EXIT_INSN()
@@ -29,33 +29,7 @@ int main(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
         Unit *u;
         char log_buf[65535];
-        struct rlimit rl;
         int r;
-
-        test_setup_logging(LOG_DEBUG);
-
-        if (detect_container() > 0)
-                return log_tests_skipped("test-bpf-firewall fails inside LXC and Docker containers: https://github.com/systemd/systemd/issues/9666");
-
-        r = bpf_program_supported();
-        if (r < 0)
-                return log_tests_skipped_errno(r, "BPF firewalling not supported");
-        ASSERT_TRUE(r);
-
-        ASSERT_OK(getrlimit(RLIMIT_MEMLOCK, &rl));
-        rl.rlim_cur = rl.rlim_max = MAX(rl.rlim_max, CAN_MEMLOCK_SIZE);
-        (void) setrlimit(RLIMIT_MEMLOCK, &rl);
-
-        if (!can_memlock())
-                return log_tests_skipped("Can't use mlock()");
-
-        r = enter_cgroup_subroot(NULL);
-        if (r == -ENOMEDIUM)
-                return log_tests_skipped("cgroupfs v2 is not mounted");
-
-        r = find_executable("ping", NULL);
-        if (r < 0)
-                return log_tests_skipped_errno(r, "Can't find ping binary: %m");
 
         _cleanup_free_ char *unit_dir = NULL;
         ASSERT_OK(get_testdata_dir("units", &unit_dir));
@@ -75,7 +49,7 @@ int main(int argc, char *argv[]) {
         /* The simple tests succeeded. Now let's try full unit-based use-case. */
 
         ASSERT_OK(manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &m));
-        ASSERT_OK(manager_startup(m, NULL, NULL, NULL, NULL));
+        ASSERT_OK(manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, /* root= */ NULL));
 
         ASSERT_NOT_NULL(u = unit_new(m, sizeof(Service)));
         ASSERT_EQ(unit_add_name(u, "foo.service"), 0);
@@ -84,12 +58,12 @@ int main(int argc, char *argv[]) {
 
         cc->ip_accounting = true;
 
-        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressAllow", 0, "10.0.1.0/24", &cc->ip_address_allow, NULL), 0);
-        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressAllow", 0, "127.0.0.2", &cc->ip_address_allow, NULL), 0);
-        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", 0, "127.0.0.3", &cc->ip_address_deny, NULL), 0);
-        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", 0, "10.0.3.2/24", &cc->ip_address_deny, NULL), 0);
-        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", 0, "127.0.0.1/25", &cc->ip_address_deny, NULL), 0);
-        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", 0, "127.0.0.4", &cc->ip_address_deny, NULL), 0);
+        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressAllow", /* ltype= */ 0, "10.0.1.0/24", &cc->ip_address_allow, /* userdata= */ NULL), 0);
+        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressAllow", /* ltype= */ 0, "127.0.0.2", &cc->ip_address_allow, /* userdata= */ NULL), 0);
+        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", /* ltype= */ 0, "127.0.0.3", &cc->ip_address_deny, /* userdata= */ NULL), 0);
+        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", /* ltype= */ 0, "10.0.3.2/24", &cc->ip_address_deny, /* userdata= */ NULL), 0);
+        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", /* ltype= */ 0, "127.0.0.1/25", &cc->ip_address_deny, /* userdata= */ NULL), 0);
+        ASSERT_EQ(config_parse_in_addr_prefixes(u->id, "filename", 1, "Service", 1, "IPAddressDeny", /* ltype= */ 0, "127.0.0.4", &cc->ip_address_deny, /* userdata= */ NULL), 0);
 
         ASSERT_EQ(set_size(cc->ip_address_allow), 2u);
         ASSERT_EQ(set_size(cc->ip_address_deny), 4u);
@@ -130,11 +104,11 @@ int main(int argc, char *argv[]) {
 
         CGroupRuntime *crt = ASSERT_PTR(unit_setup_cgroup_runtime(u));
 
-        unit_dump(u, stdout, NULL);
+        unit_dump(u, stdout, /* prefix= */ NULL);
 
         r = bpf_firewall_compile(u);
         if (IN_SET(r, -ENOTTY, -ENOSYS, -EPERM))
-                return log_tests_skipped("Kernel doesn't support the necessary bpf bits (masked out via seccomp?)");
+                return (void) log_tests_skipped("Kernel doesn't support the necessary bpf bits (masked out via seccomp?)");
         ASSERT_OK(r);
 
         ASSERT_NOT_NULL(crt->ip_bpf_ingress);
@@ -159,7 +133,7 @@ int main(int argc, char *argv[]) {
         ASSERT_OK(r);
 
         ASSERT_OK(unit_patch_contexts(u));
-        ASSERT_OK(unit_start(u, NULL));
+        ASSERT_OK(unit_start(u, /* details= */ NULL));
 
         while (!IN_SET(SERVICE(u)->state, SERVICE_DEAD, SERVICE_FAILED))
                 ASSERT_OK(sd_event_run(m->event, UINT64_MAX));
@@ -178,14 +152,14 @@ int main(int argc, char *argv[]) {
 
         cc->ip_accounting = true;
 
-        ASSERT_OK(config_parse_ip_filter_bpf_progs(u->id, "filename", 1, "Service", 1, "IPIngressFilterPath", 0, test_prog, &cc->ip_filters_ingress, u));
+        ASSERT_OK(config_parse_ip_filter_bpf_progs(u->id, "filename", 1, "Service", 1, "IPIngressFilterPath", /* ltype= */ 0, test_prog, &cc->ip_filters_ingress, u));
         ASSERT_OK(config_parse_exec(u->id, "filename", 1, "Service", 1, "ExecStart", SERVICE_EXEC_START, "-/bin/ping -c 1 127.0.0.1 -W 5", SERVICE(u)->exec_command, u));
 
         SERVICE(u)->type = SERVICE_ONESHOT;
         u->load_state = UNIT_LOADED;
 
         ASSERT_OK(unit_patch_contexts(u));
-        ASSERT_OK(unit_start(u, NULL));
+        ASSERT_OK(unit_start(u, /* details= */ NULL));
 
         while (!IN_SET(SERVICE(u)->state, SERVICE_DEAD, SERVICE_FAILED))
                 ASSERT_OK(sd_event_run(m->event, UINT64_MAX));
@@ -195,6 +169,38 @@ int main(int argc, char *argv[]) {
 
         (void) unlink(test_prog);
         ASSERT_EQ(SERVICE(u)->state, SERVICE_DEAD);
-
-        return 0;
 }
+
+static int intro(void) {
+        struct rlimit rl;
+        int r;
+
+        if (detect_container() > 0)
+                return log_tests_skipped("test-bpf-firewall fails inside LXC and Docker containers: https://github.com/systemd/systemd/issues/9666");
+
+        r = bpf_program_supported();
+        if (r < 0)
+                return log_tests_skipped_errno(r, "BPF firewalling not supported");
+        ASSERT_TRUE(r);
+
+        ASSERT_OK(getrlimit(RLIMIT_MEMLOCK, &rl));
+        rl.rlim_cur = rl.rlim_max = MAX(rl.rlim_max, CAN_MEMLOCK_SIZE);
+        (void) setrlimit(RLIMIT_MEMLOCK, &rl);
+
+        if (!can_memlock())
+                return log_tests_skipped("Can't use mlock()");
+
+        r = enter_cgroup_subroot(/* ret_cgroup= */ NULL);
+        if (r == -ENOMEDIUM)
+                return log_tests_skipped("cgroupfs v2 is not mounted");
+        if (r < 0)
+                log_debug_errno(r, "Failed to enter cgroup subroot, ignoring: %m");
+
+        r = find_executable("ping", /* ret_filename= */ NULL);
+        if (r < 0)
+                return log_tests_skipped_errno(r, "Can't find ping binary");
+
+        return EXIT_SUCCESS;
+}
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

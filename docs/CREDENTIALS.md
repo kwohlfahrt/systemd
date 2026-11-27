@@ -413,7 +413,9 @@ automatically by
 which detects the cloud environment via the SMBIOS/DMI hardware database
 (`hwdb.d/40-imds.hwdb`).
 
-At boot the `systemd-imds-import.service` runs `systemd-imds --import`, which
+At boot, `systemd-imds-import-initrd.service` in the initrd (or
+`systemd-imds-import.service` on the host, with `systemd.imds.import=1`) runs
+`systemd-imds --import`, which
 acquires data from the IMDS endpoint and writes the relevant fields as
 credentials into `/run/credstore/` (and `/run/credstore.encrypted/` for
 encrypted credentials). Because these directories are part of the credential
@@ -588,3 +590,5 @@ These directories are hence a great place to store credentials to load on the sy
 Sometimes it makes sense to conditionalize system services and invoke them only
 if the right system credential is passed to the system.
 Use the `ConditionCredential=` and `AssertCredential=` unit file settings for that.
+Like `ImportCredential=`, they also search the credential store directories described above,
+so a credential placed in e.g. `/run/credstore/` by an initrd or cloud provisioning tool also counts.

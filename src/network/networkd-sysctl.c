@@ -90,7 +90,7 @@ static int on_ringbuf_io(sd_event_source *s, int fd, uint32_t revents, void *use
         struct ring_buffer *rb = ASSERT_PTR(userdata);
         int r;
 
-        r = sym_ring_buffer__poll(rb, /* timeout_msec= */ 0);
+        r = sym_ring_buffer__poll(rb, /* timeout_ms= */ 0);
         if (r < 0 && errno != EINTR)
                 log_error_errno(errno, "Error polling ring buffer: %m");
 
@@ -114,7 +114,7 @@ int manager_install_sysctl_monitor(Manager *manager) {
         if (r < 0)
                 return log_warning_errno(r, "Failed to load libbpf, not installing sysctl monitor: %m");
 
-        r = cg_pid_get_path(0, &cgroup);
+        r = cg_pid_get_path(/* pid= */ 0, &cgroup);
         if (r < 0)
                 return log_warning_errno(r, "Failed to get cgroup path, ignoring: %m.");
 
@@ -143,7 +143,7 @@ int manager_install_sysctl_monitor(Manager *manager) {
         if (fd < 0)
                 return log_warning_errno(fd, "Failed to get fd of sysctl maps: %m");
 
-        sysctl_buffer = sym_ring_buffer__new(fd, sysctl_event_handler, &manager->sysctl_shadow, NULL);
+        sysctl_buffer = sym_ring_buffer__new(fd, sysctl_event_handler, &manager->sysctl_shadow, /* opts= */ NULL);
         if (!sysctl_buffer)
                 return log_warning_errno(errno, "Failed to create ring buffer: %m");
 
@@ -269,7 +269,7 @@ static int link_update_ipv6_sysctl(Link *link) {
                 return 0;
 
         return sysctl_write_ip_property_boolean(
-                        AF_INET6, link->ifname, "disable_ipv6", false,
+                        AF_INET6, link->ifname, "disable_ipv6", /* value= */ false,
                         manager_get_sysctl_shadow(link->manager));
 }
 
@@ -320,6 +320,32 @@ int link_get_ip_forwarding(Link *link, int family) {
         return link->manager->ip_forwarding[family == AF_INET6];
 }
 
+static int link_set_ipv6_force_forwarding(Link *link) {
+        int r, t;
+
+        assert(link);
+        assert(link->manager);
+        assert(link->network);
+
+        /* The per-interface IPv6 "forwarding" sysctl only controls host/router behaviour. Since kernel v6.17,
+         * "force_forwarding" makes the kernel forward packets received on the interface, regardless of
+         * conf/all/forwarding, like the per-interface IPv4 "forwarding" sysctl does. Use the same value for
+         * both sysctls, so IPv6Forwarding= behaves like IPv4Forwarding=. */
+        t = link_get_ip_forwarding(link, AF_INET6);
+        r = sysctl_write_ip_property_tristate(
+                        AF_INET6, link->ifname, "force_forwarding", t,
+                        manager_get_sysctl_shadow(link->manager));
+        if (r == -ENOENT) {
+                log_link_debug_errno(link, r, "The kernel does not support force_forwarding sysctl, ignoring: %m");
+                return 0;
+        }
+        if (r < 0)
+                return log_link_warning_errno(link, r, "Failed to %s IPv6 force forwarding, ignoring: %m",
+                                              enable_disable(t));
+
+        return 0;
+}
+
 static int link_set_ip_forwarding_impl(Link *link, int family) {
         int r, t;
 
@@ -329,6 +355,9 @@ static int link_set_ip_forwarding_impl(Link *link, int family) {
 
         if (!link_is_configured_for_family(link, family))
                 return 0;
+
+        if (family == AF_INET6)
+                (void) link_set_ipv6_force_forwarding(link);
 
         t = link_get_ip_forwarding(link, family);
         r = sysctl_write_ip_property_tristate(
@@ -592,7 +621,7 @@ static int link_set_ipv6_mtu_async_impl(Link *link) {
         /* If not, set up a timer event source. */
         r = event_reset_time_relative(
                         link->manager->event, &link->ipv6_mtu_wait_synced_event_source,
-                        CLOCK_BOOTTIME, 100 * USEC_PER_MSEC, 0,
+                        CLOCK_BOOTTIME, 100 * USEC_PER_MSEC, /* accuracy= */ 0,
                         ipv6_mtu_wait_synced_handler, link,
                         /* priority= */ 0, "ipv6-mtu-wait-synced", /* force_reset= */ true);
         if (r < 0)
@@ -682,7 +711,7 @@ static int link_set_ipv4_promote_secondaries(Link *link) {
          * secondary IP and when the primary one expires it relies on the kernel to promote the
          * secondary IP. See also https://github.com/systemd/systemd/issues/7163 */
         return sysctl_write_ip_property_boolean(
-                        AF_INET, link->ifname, "promote_secondaries", true,
+                        AF_INET, link->ifname, "promote_secondaries", /* value= */ true,
                         manager_get_sysctl_shadow(link->manager));
 }
 

@@ -21,6 +21,7 @@ Most generic unit settings are available for transient units.
 
 ```
 ✓ Description=
+✓ Tags=
 ✓ SourcePath=
 ✓ OnFailureJobMode=
 ✓ JobTimeoutAction=
@@ -212,6 +213,7 @@ All execution-related settings are available for transient units.
 ✓ RestrictRealtime=
 ✓ RestrictSUIDSGID=
 ✓ RestrictAddressFamilies=
+✓ IOUringFilter=
 ✓ RootHash=
 ✓ RootHashSignature=
 ✓ RootVerity=

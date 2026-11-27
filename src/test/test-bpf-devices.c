@@ -14,6 +14,10 @@
 #include "strv.h"
 #include "tests.h"
 
+static char *cgroup = NULL;
+
+STATIC_DESTRUCTOR_REGISTER(cgroup, freep);
+
 static void test_policy_closed(const char *cgroup_path, BPFProgram **installed_prog) {
         _cleanup_(bpf_program_freep) BPFProgram *prog = NULL;
         unsigned wrong = 0;
@@ -21,13 +25,13 @@ static void test_policy_closed(const char *cgroup_path, BPFProgram **installed_p
 
         log_info("/* %s */", __func__);
 
-        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_CLOSED, true);
+        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_CLOSED, /* allow_list= */ true);
         ASSERT_OK(r);
 
         r = bpf_devices_allow_list_static(prog, cgroup_path);
         ASSERT_OK(r);
 
-        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_CLOSED, true, cgroup_path, installed_prog);
+        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_CLOSED, /* allow_list= */ true, cgroup_path, installed_prog);
         ASSERT_OK(r);
 
         FOREACH_STRING(s, "/dev/null",
@@ -39,16 +43,16 @@ static void test_policy_closed(const char *cgroup_path, BPFProgram **installed_p
                           "/dev/ptmx") {
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
-                wrong += fd < 0 && errno == EPERM;
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
+                wrong += fd == -EPERM;
                 /* We ignore errors other than EPERM, e.g. ENOENT or ENXIO */
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
-                wrong += fd2 < 0 && errno == EPERM;
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
+                wrong += fd2 == -EPERM;
         }
-        assert_se(wrong == 0);
+        ASSERT_EQ(wrong, 0U);
 }
 
 static void test_policy_strict(const char *cgroup_path, BPFProgram **installed_prog) {
@@ -58,7 +62,7 @@ static void test_policy_strict(const char *cgroup_path, BPFProgram **installed_p
 
         log_info("/* %s */", __func__);
 
-        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_STRICT, true);
+        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_STRICT, /* allow_list= */ true);
         ASSERT_OK(r);
 
         r = bpf_devices_allow_list_device(prog, cgroup_path, "/dev/null", CGROUP_DEVICE_READ|CGROUP_DEVICE_WRITE);
@@ -70,19 +74,19 @@ static void test_policy_strict(const char *cgroup_path, BPFProgram **installed_p
         r = bpf_devices_allow_list_device(prog, cgroup_path, "/dev/zero", CGROUP_DEVICE_WRITE);
         ASSERT_OK(r);
 
-        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, true, cgroup_path, installed_prog);
+        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, /* allow_list= */ true, cgroup_path, installed_prog);
         ASSERT_OK(r);
 
         {
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
                 const char *s = "/dev/null";
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd < 0;
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
                 wrong += fd2 < 0;
         }
 
@@ -90,12 +94,12 @@ static void test_policy_strict(const char *cgroup_path, BPFProgram **installed_p
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
                 const char *s = "/dev/random";
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd < 0;
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
                 wrong += fd2 >= 0;
         }
 
@@ -103,12 +107,12 @@ static void test_policy_strict(const char *cgroup_path, BPFProgram **installed_p
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
                 const char *s = "/dev/zero";
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd >= 0;
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
                 wrong += fd2 < 0;
         }
 
@@ -116,16 +120,16 @@ static void test_policy_strict(const char *cgroup_path, BPFProgram **installed_p
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
                 const char *s = "/dev/full";
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd >= 0;
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
                 wrong += fd2 >= 0;
         }
 
-        assert_se(wrong == 0);
+        ASSERT_EQ(wrong, 0U);
 }
 
 static void test_policy_allow_list_major(const char *pattern, const char *cgroup_path, BPFProgram **installed_prog) {
@@ -135,13 +139,13 @@ static void test_policy_allow_list_major(const char *pattern, const char *cgroup
 
         log_info("/* %s(%s) */", __func__, pattern);
 
-        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_STRICT, true);
+        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_STRICT, /* allow_list= */ true);
         ASSERT_OK(r);
 
         r = bpf_devices_allow_list_major(prog, cgroup_path, pattern, 'c', CGROUP_DEVICE_READ|CGROUP_DEVICE_WRITE);
         ASSERT_OK(r);
 
-        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, true, cgroup_path, installed_prog);
+        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, /* allow_list= */ true, cgroup_path, installed_prog);
         ASSERT_OK(r);
 
         /* /dev/null, /dev/full have major==1, /dev/tty has major==5 */
@@ -149,12 +153,12 @@ static void test_policy_allow_list_major(const char *pattern, const char *cgroup
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
                 const char *s = "/dev/null";
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd < 0;
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
                 wrong += fd2 < 0;
         }
 
@@ -162,12 +166,12 @@ static void test_policy_allow_list_major(const char *pattern, const char *cgroup
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
                 const char *s = "/dev/full";
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd < 0;
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
                 wrong += fd2 < 0;
         }
 
@@ -175,16 +179,16 @@ static void test_policy_allow_list_major(const char *pattern, const char *cgroup
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
                 const char *s = "/dev/tty";
 
-                fd = open(s, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDONLY|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd >= 0;
 
-                fd2 = open(s, O_CLOEXEC|O_WRONLY|O_NOCTTY);
-                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(errno) : "-");
+                fd2 = xopenat(AT_FDCWD, s, O_WRONLY|O_NOCTTY);
+                log_debug("open(%s, \"w\") = %d/%s", s, fd2, fd2 < 0 ? ERRNO_NAME(fd2) : "-");
                 wrong += fd2 >= 0;
         }
 
-        assert_se(wrong == 0);
+        ASSERT_EQ(wrong, 0U);
 }
 
 static void test_policy_allow_list_major_star(char type, const char *cgroup_path, BPFProgram **installed_prog) {
@@ -194,28 +198,28 @@ static void test_policy_allow_list_major_star(char type, const char *cgroup_path
 
         log_info("/* %s(type=%c) */", __func__, type);
 
-        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_STRICT, true);
+        r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_STRICT, /* allow_list= */ true);
         ASSERT_OK(r);
 
         r = bpf_devices_allow_list_major(prog, cgroup_path, "*", type, CGROUP_DEVICE_READ|CGROUP_DEVICE_WRITE);
         ASSERT_OK(r);
 
-        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, true, cgroup_path, installed_prog);
+        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, /* allow_list= */ true, cgroup_path, installed_prog);
         ASSERT_OK(r);
 
         {
                 _cleanup_close_ int fd = -EBADF;
                 const char *s = "/dev/null";
 
-                fd = open(s, O_CLOEXEC|O_RDWR|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDWR|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 if (type == 'c')
                         wrong += fd < 0;
                 else
                         wrong += fd >= 0;
         }
 
-        assert_se(wrong == 0);
+        ASSERT_EQ(wrong, 0U);
 }
 
 static void test_policy_empty(bool add_mismatched, const char *cgroup_path, BPFProgram **installed_prog) {
@@ -228,34 +232,57 @@ static void test_policy_empty(bool add_mismatched, const char *cgroup_path, BPFP
         r = bpf_devices_cgroup_init(&prog, CGROUP_DEVICE_POLICY_STRICT, add_mismatched);
         ASSERT_OK(r);
 
-        if (add_mismatched) {
-                r = bpf_devices_allow_list_major(prog, cgroup_path, "foobarxxx", 'c', CGROUP_DEVICE_READ|CGROUP_DEVICE_WRITE);
-                assert_se(r < 0);
-        }
+        if (add_mismatched)
+                ASSERT_FAIL(bpf_devices_allow_list_major(prog, cgroup_path, "foobarxxx", 'c',
+                                                         CGROUP_DEVICE_READ|CGROUP_DEVICE_WRITE));
 
-        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, false, cgroup_path, installed_prog);
+        r = bpf_devices_apply_policy(&prog, CGROUP_DEVICE_POLICY_STRICT, /* allow_list= */ false, cgroup_path, installed_prog);
         ASSERT_OK(r);
 
         {
                 _cleanup_close_ int fd = -EBADF;
                 const char *s = "/dev/null";
 
-                fd = open(s, O_CLOEXEC|O_RDWR|O_NOCTTY);
-                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(errno) : "-");
+                fd = xopenat(AT_FDCWD, s, O_RDWR|O_NOCTTY);
+                log_debug("open(%s, \"r\") = %d/%s", s, fd, fd < 0 ? ERRNO_NAME(fd) : "-");
                 wrong += fd >= 0;
         }
 
-        assert_se(wrong == 0);
+        ASSERT_EQ(wrong, 0U);
 }
 
-int main(int argc, char *argv[]) {
-        _cleanup_free_ char *cgroup = NULL, *parent = NULL;
+TEST(bpf_devices) {
+        _cleanup_free_ char *parent = NULL;
         _cleanup_(rmdir_and_freep) char *controller_path = NULL;
         CGroupMask supported;
-        struct rlimit rl;
         int r;
 
-        test_setup_logging(LOG_DEBUG);
+        r = cg_get_path(cgroup, /* suffix= */ NULL, &controller_path);
+        ASSERT_OK(r);
+
+        _cleanup_(bpf_program_freep) BPFProgram *prog = NULL;
+
+        test_policy_closed(cgroup, &prog);
+        test_policy_strict(cgroup, &prog);
+
+        test_policy_allow_list_major("mem", cgroup, &prog);
+        test_policy_allow_list_major("1", cgroup, &prog);
+
+        test_policy_allow_list_major_star('c', cgroup, &prog);
+        test_policy_allow_list_major_star('b', cgroup, &prog);
+
+        test_policy_empty(/* add_mismatched= */ false, cgroup, &prog);
+        test_policy_empty(/* add_mismatched= */ true, cgroup, &prog);
+
+        ASSERT_OK(path_extract_directory(cgroup, &parent));
+
+        ASSERT_OK(cg_mask_supported(&supported));
+        ASSERT_OK(cg_attach(parent, /* pid= */ 0));
+}
+
+static int intro(void) {
+        struct rlimit rl;
+        int r;
 
         r = bpf_program_supported();
         if (r < 0)
@@ -275,27 +302,7 @@ int main(int argc, char *argv[]) {
         if (r < 0)
                 return log_tests_skipped_errno(r, "Failed to prepare cgroup subtree");
 
-        r = cg_get_path(cgroup, /* suffix= */ NULL, &controller_path);
-        ASSERT_OK(r);
-
-        _cleanup_(bpf_program_freep) BPFProgram *prog = NULL;
-
-        test_policy_closed(cgroup, &prog);
-        test_policy_strict(cgroup, &prog);
-
-        test_policy_allow_list_major("mem", cgroup, &prog);
-        test_policy_allow_list_major("1", cgroup, &prog);
-
-        test_policy_allow_list_major_star('c', cgroup, &prog);
-        test_policy_allow_list_major_star('b', cgroup, &prog);
-
-        test_policy_empty(false, cgroup, &prog);
-        test_policy_empty(true, cgroup, &prog);
-
-        ASSERT_OK(path_extract_directory(cgroup, &parent));
-
-        ASSERT_OK(cg_mask_supported(&supported));
-        ASSERT_OK(cg_attach(parent, 0));
-
-        return 0;
+        return EXIT_SUCCESS;
 }
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

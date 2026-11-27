@@ -27,6 +27,7 @@ typedef uint64_t nsec_t;
 
 /* Libc/Linux forward declarations */
 
+struct __kernel_timespec;
 struct dirent;
 struct ether_addr;
 struct fiemap;
@@ -37,6 +38,7 @@ struct icmp6_hdr;
 struct in_addr;
 struct in6_addr;
 struct inotify_event;
+struct io_uring_sqe;
 struct iovec;
 struct mount_attr;
 struct msghdr;
@@ -71,6 +73,7 @@ struct fdisk_context;
 struct fdisk_table;
 struct crypt_device;
 
+typedef struct bignum_st BIGNUM;
 typedef struct buf_mem_st BUF_MEM;
 typedef struct evp_pkey_st EVP_PKEY;
 typedef struct evp_md_st EVP_MD;
@@ -113,11 +116,14 @@ typedef enum UnitDependency UnitDependency;
 typedef enum UnitNameMangle UnitNameMangle;
 typedef enum UnitType UnitType;
 typedef enum WaitFlags WaitFlags;
+typedef enum XOpenFlags XOpenFlags;
 
 typedef struct Fiber Fiber;
 typedef struct FiberOps FiberOps;
 typedef struct Hashmap Hashmap;
 typedef struct HashmapBase HashmapBase;
+union io_uring_cqe32;
+union io_uring_sqe128;
 typedef struct IteratedCache IteratedCache;
 typedef struct Iterator Iterator;
 typedef struct LogContext LogContext;

@@ -98,6 +98,7 @@
 #include "rlimit-util.h"
 #include "rm-rf.h"
 #include "seccomp-util.h"
+#include "securebits-util.h"
 #include "selinux-setup.h"
 #include "selinux-util.h"
 #include "serialize.h"
@@ -117,6 +118,7 @@
 #include "unit-name.h"
 #include "user-util.h"
 #include "utf8.h"
+#include "varlink.h"
 #include "verbs.h"
 #include "version.h"
 #include "virt.h"
@@ -166,6 +168,7 @@ static char **arg_manager_environment;
 static uint64_t arg_capability_bounding_set;
 static bool arg_no_new_privs;
 static int arg_protect_system;
+static int arg_secure_bits;
 static RestrictFileSystemAccess arg_restrict_filesystem_access;
 static nsec_t arg_timer_slack_nsec;
 static Set* arg_syscall_archs;
@@ -217,7 +220,7 @@ static int manager_find_user_config_paths(char ***ret_files, char ***ret_dirs) {
         if (r < 0)
                 return r;
 
-        r = strv_extend_strv(&dirs, CONF_PATHS_STRV("systemd"), false);
+        r = strv_extend_strv(&dirs, CONF_PATHS_STRV("systemd"), /* filter_duplicates= */ false);
         if (r < 0)
                 return r;
 
@@ -270,7 +273,7 @@ static int console_setup(void) {
 
         _cleanup_close_ int tty_fd = -EBADF;
 
-        tty_fd = open_terminal("/dev/console", O_RDWR|O_NOCTTY|O_CLOEXEC);
+        tty_fd = open_terminal("/dev/console", O_RDWR|O_NOCTTY);
         if (tty_fd < 0)
                 return log_error_errno(tty_fd, "Failed to open %s: %m", "/dev/console");
 
@@ -327,7 +330,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                         return 0;
 
                 if (path_is_absolute(value))
-                        (void) parse_path_argument(value, false, &arg_early_core_pattern);
+                        (void) parse_path_argument(value, /* suppress_root= */ false, &arg_early_core_pattern);
                 else
                         log_warning("Specified core pattern '%s' is not an absolute path, ignoring.", value);
 
@@ -492,7 +495,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                (void) parse_path_argument(value, false, &arg_watchdog_device);
+                (void) parse_path_argument(value, /* suppress_root= */ false, &arg_watchdog_device);
 
         } else if (proc_cmdline_key_streq(key, "systemd.watchdog_sec")) {
 
@@ -856,6 +859,7 @@ static int parse_config_file(void) {
                 { "Manager", "NoNewPrivileges",                   config_parse_bool,                  0,                        &arg_no_new_privs                                      },
                 { "Manager", "ProtectSystem",                     config_parse_protect_system_pid1,   0,                        &arg_protect_system                                    },
                 { "Manager", "RestrictFileSystemAccess",         config_parse_restrict_filesystem_access, 0,                   &arg_restrict_filesystem_access                         },
+                { "Manager", "SecureBits",                        config_parse_exec_secure_bits,      0,                        &arg_secure_bits                                       },
 #if HAVE_SECCOMP
                 { "Manager", "SystemCallArchitectures",           config_parse_syscall_archs,         0,                        &arg_syscall_archs                                     },
 #else
@@ -1042,7 +1046,7 @@ static int redirect_telinit(char *argv[], char **args) {
 COMMAND(
         "systemd\0",
         "Start and monitor system and user services.",
-        .man_pages = "systemd(1)\0",
+        .man_page = "systemd(1)",
         .option_namespace = "systemd",
         .pager_flags = &arg_pager_flags,
 );
@@ -1228,7 +1232,7 @@ static int parse_argv(int argc, char *argv[]) {
                 /* Options not shown in --help. */
 
                 OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "crash-reboot", "BOOL", /* help= */ NULL):
-                        r = parse_boolean_argument("--crash-reboot", opts.arg, NULL);
+                        r = parse_boolean_argument("--crash-reboot", opts.arg, /* ret= */ NULL);
                         if (r < 0)
                                 return r;
                         arg_crash_action = r > 0 ? CRASH_REBOOT : CRASH_FREEZE;
@@ -1245,7 +1249,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (fd < 0)
                                 return log_error_errno(fd, "Failed to parse serialization fd \"%s\": %m", opts.arg);
 
-                        (void) fd_cloexec(fd, true);
+                        (void) fd_cloexec(fd, /* cloexec= */ true);
 
                         FILE *f = fdopen(fd, "r");
                         if (!f)
@@ -1319,7 +1323,7 @@ static int prepare_reexecute(
 
         /* Make sure nothing is really destructed when we shut down */
         m->n_reloading++;
-        bus_manager_send_reloading(m, true);
+        bus_manager_send_reloading(m, /* active= */ true);
 
         /* Only close the initramfs trust window when actually switching root.
          * During a plain daemon-reexec in the initrd, PID1 still needs to
@@ -1347,7 +1351,7 @@ static int prepare_reexecute(
         if (r < 0)
                 return log_error_errno(r, "Failed to finish serialization file: %m");
 
-        r = fd_cloexec(fileno(f), false);
+        r = fd_cloexec(fileno(f), /* cloexec= */ false);
         if (r < 0)
                 return log_error_errno(r, "Failed to disable O_CLOEXEC for serialization: %m");
 
@@ -1552,19 +1556,19 @@ static int os_release_status(void) {
 
                 if (in_initrd()) {
                         if (log_get_show_color())
-                                status_printf(NULL, 0,
+                                status_printf(/* status= */ NULL, /* flags= */ 0,
                                               ANSI_HIGHLIGHT "Booting initrd of " ANSI_NORMAL "%s" ANSI_NORMAL ANSI_HIGHLIGHT "." ANSI_NORMAL,
                                               fancy_name);
                         else
-                                status_printf(NULL, 0,
+                                status_printf(/* status= */ NULL, /* flags= */ 0,
                                               "Booting initrd of %s...", label);
                 } else {
                         if (log_get_show_color())
-                                status_printf(NULL, 0,
+                                status_printf(/* status= */ NULL, /* flags= */ 0,
                                               "\n" ANSI_HIGHLIGHT "Welcome to " ANSI_NORMAL "%s" ANSI_NORMAL ANSI_HIGHLIGHT "!" ANSI_NORMAL "\n",
                                               fancy_name);
                         else
-                                status_printf(NULL, 0,
+                                status_printf(/* status= */ NULL, /* flags= */ 0,
                                               "\nWelcome to %s!\n",
                                               label);
                 }
@@ -1573,7 +1577,7 @@ static int os_release_status(void) {
         if (support_end && os_release_support_ended(support_end, /* quiet= */ false, /* ret_eol= */ NULL) > 0)
                 /* pretty_name may include the version already, so we'll print the version only if we
                  * have it and we're not using pretty_name. */
-                status_printf(ANSI_HIGHLIGHT_RED "  !!  " ANSI_NORMAL, 0,
+                status_printf(ANSI_HIGHLIGHT_RED "  !!  " ANSI_NORMAL, /* flags= */ 0,
                               "This OS version (%s%s%s) is past its end-of-support date (%s)",
                               label,
                               (pretty_name || !version) ? "" : " version ",
@@ -1637,7 +1641,7 @@ static int write_boot_or_shutdown_osc(const char *type) {
         if (getenv_terminal_is_dumb())
                 return 0;
 
-        _cleanup_close_ int fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY|O_CLOEXEC);
+        _cleanup_close_ int fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY);
         if (fd < 0)
                 return log_debug_errno(fd, "Failed to open /dev/console to print %s OSC, ignoring: %m", type);
 
@@ -1662,7 +1666,6 @@ static int write_boot_or_shutdown_osc(const char *type) {
 }
 
 static int bump_unix_max_dgram_qlen(void) {
-        _cleanup_free_ char *qlen = NULL;
         unsigned long v;
         int r;
 
@@ -1670,14 +1673,10 @@ static int bump_unix_max_dgram_qlen(void) {
          * the value really really early during boot, so that it is actually applied to all our sockets,
          * including the $NOTIFY_SOCKET one. */
 
-        r = read_one_line_file("/proc/sys/net/unix/max_dgram_qlen", &qlen);
+        r = sysctl_read_lu("net/unix/max_dgram_qlen", &v);
         if (r < 0)
                 return log_full_errno(r == -ENOENT ? LOG_DEBUG : LOG_WARNING, r,
                                       "Failed to read AF_UNIX datagram queue length, ignoring: %m");
-
-        r = safe_atolu(qlen, &v);
-        if (r < 0)
-                return log_warning_errno(r, "Failed to parse AF_UNIX datagram queue length '%s', ignoring: %m", qlen);
 
         if (v >= DEFAULT_UNIX_MAX_DGRAM_QLEN)
                 return 0;
@@ -1707,14 +1706,18 @@ static int fixup_environment(void) {
          *
          * However if TERM was configured through the kernel command line then leave it alone. */
         _cleanup_free_ char *term = NULL;
-        r = proc_cmdline_get_key("TERM", 0, &term);
+        r = proc_cmdline_get_key("TERM", /* flags= */ 0, &term);
         if (r < 0)
                 return r;
-        if (r > 0) {
+        if (term && !term_env_valid(term)) {
+                log_warning("Invalid TERM= setting on kernel command line, ignoring.");
+                term = mfree(term);
+        }
+        if (term) {
                 /* If we pick up $TERM, then also pick up $COLORTERM, $NO_COLOR */
                 FOREACH_STRING(v, "COLORTERM", "NO_COLOR") {
                         _cleanup_free_ char *vv = NULL;
-                        r = proc_cmdline_get_key(v, 0, &vv);
+                        r = proc_cmdline_get_key(v, /* flags= */ 0, &vv);
                         if (r < 0)
                                 return r;
                         if (r > 0 && setenv(v, vv, /* overwrite= */ true) < 0)
@@ -1722,9 +1725,13 @@ static int fixup_environment(void) {
                 }
         } else {
                 /* If no $TERM is set then look for the per-tty variable instead */
-                r = proc_cmdline_get_key("systemd.tty.term.console", 0, &term);
+                r = proc_cmdline_get_key("systemd.tty.term.console", /* flags= */ 0, &term);
                 if (r < 0)
                         return r;
+                if (term && !term_env_valid(term)) {
+                        log_warning("Invalid systemd.tty.term.console= setting on kernel command line, ignoring.");
+                        term = mfree(term);
+                }
         }
 
         if (!term)
@@ -1821,8 +1828,8 @@ static int become_shutdown(int objective, int retval) {
         /* If we reboot or kexec let's set the shutdown watchdog and tell the
          * shutdown binary to repeatedly ping it.
          * Disable the pretimeout watchdog, as we do not support it from the shutdown binary. */
-        (void) watchdog_setup_pretimeout(0);
-        (void) watchdog_setup_pretimeout_governor(NULL);
+        (void) watchdog_setup_pretimeout(/* timeout= */ 0);
+        (void) watchdog_setup_pretimeout_governor(/* governor= */ NULL);
         r = watchdog_setup(watchdog_timer);
         watchdog_close(/* disarm= */ r < 0);
 
@@ -1864,12 +1871,24 @@ static int fallback_shutdown(ManagerObjective objective, int retval) {
          * This skips the cleanup systemd-shutdown normally does (unmounting file systems, detaching storage,
          * killing remaining processes, switching into the exitrd). */
 
+        bool in_container = detect_container() > 0;
+
+        /* In a container, prefer exiting over reboot(RB_POWER_OFF/RB_HALT_SYSTEM) when shutting down, so
+         * that our exit status is propagated to the container manager. (For reboots we stick to reboot(),
+         * since that is how the container manager learns that a reboot was requested.) */
+        if (in_container && IN_SET(objective, MANAGER_EXIT, MANAGER_POWEROFF, MANAGER_HALT)) {
+                log_info("Exiting container.");
+                exit(retval);
+        }
+
         switch (objective) {
 
         case MANAGER_KEXEC:
-                log_info("Rebooting with kexec.");
-                (void) kexec();
-                /* If we are still here kexec didn't work, fall back to a plain reboot. */
+                if (!in_container) {
+                        log_info("Rebooting with kexec.");
+                        (void) kexec();
+                        /* If we are still here kexec didn't work, fall back to a plain reboot. */
+                }
                 _fallthrough_;
 
         case MANAGER_REBOOT:
@@ -1878,13 +1897,7 @@ static int fallback_shutdown(ManagerObjective objective, int retval) {
                 cmd = RB_AUTOBOOT;
                 break;
 
-        case MANAGER_EXIT:
-                if (detect_container() > 0) {
-                        log_info("Exiting container.");
-                        exit(retval);
-                }
-                _fallthrough_;
-
+        case MANAGER_EXIT: /* We cannot exit() on the host, fall back to another method. */
         case MANAGER_POWEROFF:
                 log_info("Powering off.");
                 cmd = RB_POWER_OFF;
@@ -1900,6 +1913,13 @@ static int fallback_shutdown(ManagerObjective objective, int retval) {
         }
 
         (void) reboot(cmd);
+        if (ERRNO_IS_PRIVILEGE(errno) && in_container) {
+                /* If we are in a container, and we lacked CAP_SYS_BOOT just exit, this will kill our
+                 * container for good. */
+                log_info("Exiting container.");
+                exit(retval);
+        }
+
         return log_error_errno(errno, "Failed to shut down: %m");
 }
 
@@ -1909,7 +1929,7 @@ static void initialize_clock_timewarp(void) {
         /* This is called very early on, before we parse the kernel command line or otherwise figure out why
          * we are running, but only once. */
 
-        if (clock_is_localtime(NULL) > 0) {
+        if (clock_is_localtime(/* adjtime_path= */ NULL) > 0) {
                 int min;
 
                 /* The very first call of settimeofday() also does a time warp in the kernel.
@@ -1973,11 +1993,9 @@ static void cmdline_take_random_seed(void) {
                 log_warning("Random seed specified on kernel command line has size %zu, but %zu bytes required to fill entropy pool.",
                             arg_random_seed_size, suggested);
 
-        r = random_write_entropy(-1, arg_random_seed, arg_random_seed_size, true);
-        if (r < 0) {
-                log_warning_errno(r, "Failed to credit entropy specified on kernel command line, ignoring: %m");
-                return;
-        }
+        r = random_write_entropy(-1, arg_random_seed, arg_random_seed_size, /* credit= */ true);
+        if (r < 0)
+                return (void) log_warning_errno(r, "Failed to credit entropy specified on kernel command line, ignoring: %m");
 
         log_notice("Successfully credited entropy passed on kernel command line.\n"
                    "Note that the seed provided this way is accessible to unprivileged programs. "
@@ -2009,10 +2027,43 @@ static void initialize_core_pattern(bool skip_setup) {
         if (getpid_cached() != 1)
                 return;
 
-        r = write_string_file("/proc/sys/kernel/core_pattern", arg_early_core_pattern, WRITE_STRING_FILE_DISABLE_BUFFER);
+        r = sysctl_write_verify("kernel/core_pattern", arg_early_core_pattern);
         if (r < 0)
-                log_warning_errno(r, "Failed to write '%s' to /proc/sys/kernel/core_pattern, ignoring: %m",
+                log_warning_errno(r, "Failed to set kernel.core_pattern to '%s', ignoring: %m",
                                   arg_early_core_pattern);
+}
+
+/* Kernels before 6.14 don't know the exec- bits and refuse them with EPERM. */
+static const char* secure_bits_error_hint(int r) {
+        const int exec_bits = SECBIT_EXEC_RESTRICT_FILE | SECBIT_EXEC_RESTRICT_FILE_LOCKED |
+                              SECBIT_EXEC_DENY_INTERACTIVE | SECBIT_EXEC_DENY_INTERACTIVE_LOCKED;
+
+        return r == -EPERM && (arg_secure_bits & exec_bits) ? " (the exec- bits need kernel v6.14 or newer)" : "";
+}
+
+static int apply_secure_bits(void) {
+        int current, bits;
+
+        if (arg_secure_bits < 0)
+                return 0;
+
+        current = prctl_safe(PR_GET_SECUREBITS, 0, 0, 0, 0);
+        if (current < 0)
+                return current;
+
+        /* Pairs that are locked already cannot be changed anymore. */
+        bits = secure_bits_keep_locked(current, arg_secure_bits);
+        if (bits != arg_secure_bits) {
+                _cleanup_free_ char *s = NULL;
+
+                (void) secure_bits_to_string_alloc(bits, &s);
+                log_notice("Some configured secure bits are locked differently already, applying \"%s\" instead.", strempty(s));
+        }
+
+        if (bits == current)
+                return 0;
+
+        return prctl_safe(PR_SET_SECUREBITS, bits, 0, 0, 0);
 }
 
 static void apply_protect_system(bool skip_setup) {
@@ -2021,16 +2072,12 @@ static void apply_protect_system(bool skip_setup) {
         if (skip_setup || getpid_cached() != 1 || arg_protect_system == 0)
                 return;
 
-        if (arg_protect_system < 0 && !in_initrd()) {
-                log_debug("ProtectSystem=auto selected, but not running in an initrd, skipping.");
-                return;
-        }
+        if (arg_protect_system < 0 && !in_initrd())
+                return (void) log_debug("ProtectSystem=auto selected, but not running in an initrd, skipping.");
 
         r = make_mount_point("/usr");
-        if (r < 0) {
-                log_warning_errno(r, "Failed to make /usr/ a mount point, ignoring: %m");
-                return;
-        }
+        if (r < 0)
+                return (void) log_warning_errno(r, "Failed to make /usr/ a mount point, ignoring: %m");
 
         if (mount_nofollow_verbose(
                         LOG_WARNING,
@@ -2149,7 +2196,7 @@ static void reduce_vt(ManagerObjective objective) {
         if (r < 0)
                 log_debug_errno(r, "Failed to switch to VT TTY 1, ignoring: %m");
 
-        _cleanup_close_ int tty0_fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+        _cleanup_close_ int tty0_fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_NONBLOCK);
         if (tty0_fd < 0)
                 return (void) log_debug_errno(tty0_fd, "Failed to open '/dev/tty0', ignoring: %m");
 
@@ -2435,8 +2482,13 @@ static int invoke_main_loop(
                         set_manager_defaults(m);
                         set_manager_settings(m);
 
-                        update_cpu_affinity(false);
-                        update_numa_policy(false);
+                        update_cpu_affinity(/* skip_setup= */ false);
+                        update_numa_policy(/* skip_setup= */ false);
+
+                        r = apply_secure_bits();
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to set secure bits%s, ignoring: %m",
+                                                  secure_bits_error_hint(r));
 
                         if (saved_log_level >= 0)
                                 manager_override_log_level(m, saved_log_level);
@@ -2459,10 +2511,16 @@ static int invoke_main_loop(
                         manager_send_reloading(m); /* From the perspective of the manager calling us this is
                                                     * pretty much the same as a reload */
 
-                        r = prepare_reexecute(m, &arg_serialization, ret_fds, false);
+                        r = prepare_reexecute(m, &arg_serialization, ret_fds, /* switching_root= */ false);
                         if (r < 0) {
-                                *ret_error_message = "Failed to prepare for reexecution";
-                                return r;
+                                if (m->n_reloading > 0)
+                                        m->n_reloading--;
+                                log_warning_errno(r, "Failed to prepare for reexecution, continuing: %m");
+                                bus_send_pending_reexecute_error(m, r);
+                                manager_varlink_send_pending_reexecute_error(m, r);
+                                m->objective = MANAGER_OK;
+                                m->send_reloading_done = true;
+                                continue;
                         }
 
                         log_notice("Reexecuting.");
@@ -2477,10 +2535,10 @@ static int invoke_main_loop(
                         manager_send_reloading(m); /* From the perspective of the manager calling us this is
                                                     * pretty much the same as a reload */
 
-                        manager_set_switching_root(m, true);
+                        manager_set_switching_root(m, /* switching_root= */ true);
 
                         if (!m->switch_root_init) {
-                                r = prepare_reexecute(m, &arg_serialization, ret_fds, true);
+                                r = prepare_reexecute(m, &arg_serialization, ret_fds, /* switching_root= */ true);
                                 if (r < 0) {
                                         *ret_error_message = "Failed to prepare for reexecution";
                                         return r;
@@ -2500,7 +2558,7 @@ static int invoke_main_loop(
 
                 case MANAGER_SOFT_REBOOT:
                         manager_send_reloading(m);
-                        manager_set_switching_root(m, true);
+                        manager_set_switching_root(m, /* switching_root= */ true);
 
                         r = prepare_reexecute(m, &arg_serialization, ret_fds, /* switching_root= */ true);
                         if (r < 0) {
@@ -2670,6 +2728,14 @@ static int initialize_runtime(
         update_cpu_affinity(skip_setup);
         update_numa_policy(skip_setup);
 
+        r = apply_secure_bits();
+        if (r < 0) {
+                *ret_error_message = "Failed to set secure bits";
+                return log_struct_errno(LOG_EMERG, r,
+                                        LOG_MESSAGE("Failed to set secure bits%s: %m", secure_bits_error_hint(r)),
+                                        LOG_MESSAGE_ID(SD_MESSAGE_CORE_SECURE_BITS_STR));
+        }
+
         switch (arg_runtime_scope) {
 
         case RUNTIME_SCOPE_SYSTEM:
@@ -2723,7 +2789,7 @@ static int initialize_runtime(
                                                         LOG_MESSAGE_ID(SD_MESSAGE_CORE_CAPABILITY_BOUNDING_USER_STR));
                         }
 
-                        r = capability_bounding_set_drop(arg_capability_bounding_set, true);
+                        r = capability_bounding_set_drop(arg_capability_bounding_set, /* right_now= */ true);
                         if (r < 0) {
                                 *ret_error_message = "Failed to drop capability bounding set";
                                 return log_struct_errno(LOG_EMERG, r,
@@ -2785,7 +2851,7 @@ static int initialize_runtime(
         /* Clear ambient capabilities, so services do not inherit them implicitly. Dropping them does
          * not affect the permitted and effective sets which are important for the manager itself to
          * operate. */
-        r = capability_ambient_set_apply(0, /* also_inherit= */ false);
+        r = capability_ambient_set_apply(/* set= */ 0, /* also_inherit= */ false);
         if (r < 0)
                 log_warning_errno(r, "Failed to reset ambient capability set, ignoring: %m");
 
@@ -2889,7 +2955,7 @@ static int do_queue_default_job(
         }
 
         log_info("Queued %s job for default target %s.",
-                 job_type_to_string(job->type), unit_status_string(job->unit, NULL));
+                 job_type_to_string(job->type), unit_status_string(job->unit, /* ret_combined_buffer= */ NULL));
 
         return 0;
 }
@@ -2916,10 +2982,8 @@ static void fallback_rlimit_nofile(const struct rlimit *saved_rlimit_nofile) {
         /* Make sure forked processes get limits based on the original kernel setting */
 
         rl = newdup(struct rlimit, saved_rlimit_nofile, 1);
-        if (!rl) {
-                log_oom();
-                return;
-        }
+        if (!rl)
+                return (void) log_oom();
 
         /* Bump the hard limit for system services to a substantially higher value. The default
          * hard limit current kernels set is pretty low (4K), mostly for historical
@@ -2954,10 +3018,8 @@ static void fallback_rlimit_memlock(const struct rlimit *saved_rlimit_memlock) {
                 return;
 
         rl = newdup(struct rlimit, saved_rlimit_memlock, 1);
-        if (!rl) {
-                log_oom();
-                return;
-        }
+        if (!rl)
+                return (void) log_oom();
 
         if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM)  {
                 /* Raise the default limit to 8M also on old kernels and in containers (8M is the kernel
@@ -2975,7 +3037,7 @@ static void setenv_manager_environment(void) {
         STRV_FOREACH(p, arg_manager_environment) {
                 log_debug("Setting '%s' in our own environment.", *p);
 
-                r = putenv_dup(*p, true);
+                r = putenv_dup(*p, /* override= */ true);
                 if (r < 0)
                         log_warning_errno(r, "Failed to setenv \"%s\", ignoring: %m", *p);
         }
@@ -3016,6 +3078,7 @@ static void reset_arguments(void) {
         arg_capability_bounding_set = CAP_MASK_ALL;
         arg_no_new_privs = false;
         arg_protect_system = -1;
+        arg_secure_bits = -1;
         arg_restrict_filesystem_access = RESTRICT_FILESYSTEM_ACCESS_NO;
         arg_timer_slack_nsec = NSEC_INFINITY;
 
@@ -3084,7 +3147,7 @@ static int parse_configuration(const struct rlimit *saved_rlimit_nofile,
                 log_warning_errno(r, "Failed to parse config file, ignoring: %m");
 
         if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM) {
-                r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, 0);
+                r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
         }
@@ -3523,8 +3586,7 @@ static int save_env(void) {
         if (!l)
                 return log_oom();
 
-        strv_free_and_replace(saved_env, l);
-        return 0;
+        return strv_free_and_replace(saved_env, l);
 }
 
 static int run_systemd(int argc, char *argv[]) {
@@ -3973,7 +4035,7 @@ finish:
         if (getpid_cached() == 1) {
                 _cleanup_close_ int tty_fd = -EBADF;
 
-                tty_fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY|O_CLOEXEC);
+                tty_fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY);
                 if (tty_fd >= 0)
                         __sanitizer_set_report_fd((void*) (intptr_t) tty_fd);
 

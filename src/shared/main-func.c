@@ -22,8 +22,8 @@ void main_prepare(int argc, char *argv[]) {
 
 void main_finalize(int r, int exit_status) {
         if (r < 0)
-                (void) sd_notifyf(0, "ERRNO=%i", -r);
-        (void) sd_notifyf(0, "EXIT_STATUS=%i", exit_status);
+                (void) sd_notifyf(/* unset_environment= */ 0, "ERRNO=%i", -r);
+        (void) sd_notifyf(/* unset_environment= */ 0, "EXIT_STATUS=%i", exit_status);
         ask_password_agent_close();
         polkit_agent_close();
         pager_close();
@@ -57,7 +57,7 @@ static int main_fiber_trampoline(void *userdata) {
          * them apart. */
         ctx->exit_requested = sd_event_get_exit_code(event, /* ret= */ NULL) >= 0;
         if (!ctx->exit_requested)
-                (void) sd_event_exit(event, 0);
+                (void) sd_event_exit(event, /* code= */ 0);
 
         return ctx->result;
 }
@@ -85,8 +85,7 @@ int run_main_fiber(int argc, char *argv[], main_fiber_func_t func) {
 
         /* Fire-and-forget: the loop unwinds the fiber through its exit event source, and a suspended
          * fiber is one we couldn't drop a reference to anyway. */
-        r = sd_fiber_new(event, program_invocation_short_name, main_fiber_trampoline, &ctx,
-                         /* destroy= */ NULL, /* ret= */ NULL);
+        r = sd_fiber_new(event, program_invocation_short_name, main_fiber_trampoline, &ctx, /* ret= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to spawn main fiber: %m");
 

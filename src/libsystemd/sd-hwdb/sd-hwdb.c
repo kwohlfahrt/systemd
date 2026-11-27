@@ -18,6 +18,7 @@
 #include "hashmap.h"
 #include "hwdb-internal.h"
 #include "log.h"
+#include "memory-util.h"
 #include "nulstr-util.h"
 #include "string-util.h"
 
@@ -329,7 +330,7 @@ static int trie_search_f(sd_hwdb *hwdb, const char *search) {
 
                         for (; (c = prefix[p]); p++) {
                                 if (IN_SET(c, '*', '?', '['))
-                                        return trie_fnmatch_f(hwdb, node, p, &buf, search + i + p, 0);
+                                        return trie_fnmatch_f(hwdb, node, p, &buf, search + i + p, /* depth= */ 0);
                                 if (c != search[i + p])
                                         return 0;
                         }
@@ -339,7 +340,7 @@ static int trie_search_f(sd_hwdb *hwdb, const char *search) {
                 child = node_lookup_f(hwdb, node, '*');
                 if (child) {
                         linebuf_add_char(&buf, '*');
-                        err = trie_fnmatch_f(hwdb, child, 0, &buf, search + i, 0);
+                        err = trie_fnmatch_f(hwdb, child, 0, &buf, search + i, /* depth= */ 0);
                         if (err < 0)
                                 return err;
                         linebuf_rem_char(&buf);
@@ -348,7 +349,7 @@ static int trie_search_f(sd_hwdb *hwdb, const char *search) {
                 child = node_lookup_f(hwdb, node, '?');
                 if (child) {
                         linebuf_add_char(&buf, '?');
-                        err = trie_fnmatch_f(hwdb, child, 0, &buf, search + i, 0);
+                        err = trie_fnmatch_f(hwdb, child, 0, &buf, search + i, /* depth= */ 0);
                         if (err < 0)
                                 return err;
                         linebuf_rem_char(&buf);
@@ -357,7 +358,7 @@ static int trie_search_f(sd_hwdb *hwdb, const char *search) {
                 child = node_lookup_f(hwdb, node, '[');
                 if (child) {
                         linebuf_add_char(&buf, '[');
-                        err = trie_fnmatch_f(hwdb, child, 0, &buf, search + i, 0);
+                        err = trie_fnmatch_f(hwdb, child, 0, &buf, search + i, /* depth= */ 0);
                         if (err < 0)
                                 return err;
                         linebuf_rem_char(&buf);
@@ -451,14 +452,13 @@ _public_ int sd_hwdb_new_from_path(const char *path, sd_hwdb **ret) {
 }
 
 _public_ int sd_hwdb_new(sd_hwdb **ret) {
-        return hwdb_new(NULL, ret);
+        return hwdb_new(/* path= */ NULL, ret);
 }
 
 static sd_hwdb *hwdb_free(sd_hwdb *hwdb) {
         assert(hwdb);
 
-        if (hwdb->map)
-                munmap((void *)hwdb->map, hwdb->st.st_size);
+        munmap_safe((void*) hwdb->map, hwdb->st.st_size);
         safe_fclose(hwdb->f);
         ordered_hashmap_free(hwdb->properties);
         return mfree(hwdb);

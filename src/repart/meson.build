@@ -7,7 +7,6 @@ endif
 executables += [
         executable_template + {
                 'name' : 'systemd-repart',
-                'public' : true,
                 'export' : files(
                         'iso9660.c',
                         'repart.c',
@@ -17,6 +16,7 @@ executables += [
                         libblkid_cflags,
                         libcryptsetup_cflags,
                         libfdisk_cflags,
+                        libfido2_cflags,
                         libmount_cflags,
                         libopenssl_cflags,
                         tpm2_cflags,

@@ -48,7 +48,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         _cleanup_free_ PeHeader *pe_header = NULL;
         _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
 
-        if (outside_size_range(size, 0, 16 * 1024 * 1024))
+        if (outside_size_range(size, /* lower= */ 0, 16 * 1024 * 1024))
                 return 0;
 
         fuzz_setup_logging();
@@ -82,7 +82,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
                 /* uki_hash() can return partway through with some hashes already
                  * allocated; free unconditionally. */
-                (void) uki_hash(fd, sym_EVP_sha256(), hashes, &hash_size);
+                (void) uki_hash(fd, sym_EVP_sha256(), /* profile= */ 0, hashes, &hash_size);
                 free_many(hashes, _UNIFIED_SECTION_MAX);
         }
 #endif

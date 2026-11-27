@@ -66,7 +66,7 @@ _public_ sd_bus_creds* sd_bus_creds_ref(sd_bus_creds *c) {
 
         if (c->allocated) {
                 assert(c->n_ref > 0);
-                c->n_ref++;
+                ref_counter_inc(&c->n_ref);
         } else {
                 sd_bus_message *m;
 
@@ -85,10 +85,7 @@ _public_ sd_bus_creds* sd_bus_creds_unref(sd_bus_creds *c) {
                 return NULL;
 
         if (c->allocated) {
-                assert(c->n_ref > 0);
-                c->n_ref--;
-
-                if (c->n_ref == 0) {
+                if (ref_counter_dec(&c->n_ref) == 0) {
                         free(c->comm);
                         free(c->tid_comm);
                         free(c->exe);
@@ -157,7 +154,7 @@ static int bus_creds_new_from_pidref(sd_bus_creds **ret, PidRef *pidref, uint64_
         if (!c)
                 return -ENOMEM;
 
-        r = bus_creds_add_more(c, mask | SD_BUS_CREDS_AUGMENT, pidref, 0);
+        r = bus_creds_add_more(c, mask | SD_BUS_CREDS_AUGMENT, pidref, /* tid= */ 0);
         if (r < 0)
                 return r;
 
@@ -1139,7 +1136,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, PidRef *pidref, pid_t tid
         }
 
         if (missing & SD_BUS_CREDS_TTY) {
-                r = get_ctty(pidref->pid, NULL, &c->tty);
+                r = get_ctty(pidref->pid, /* ret_devnr= */ NULL, &c->tty);
                 if (r == -ENXIO) {
                         /* ENXIO means: process has no controlling TTY */
                         c->tty = NULL;

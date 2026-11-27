@@ -10,6 +10,7 @@
 #include "format-table.h"
 #include "log.h"
 #include "main-func.h"
+#include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "stat-util.h"
@@ -47,7 +48,7 @@ COMMAND(
         "systemd-vpick\0",
         "Pick entry from versioned directory.",
         .argspec = "PATH…\0",
-        .man_pages = "systemd-vpick(1)\0",
+        .man_page = "systemd-vpick(1)",
 );
 
 static const char *print_table[_PRINT_MAX] = {
@@ -140,6 +141,14 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
                         break;
 
+                OPTION_LONG("match-xattr", "BOOL", "Skip entries whose user.uapi.match_* xattrs don't match the system (default: yes)"):
+                        r = parse_boolean_argument("--match-xattr=", opts.arg, /* ret= */ NULL);
+                        if (r < 0)
+                                return r;
+
+                        SET_FLAG(arg_flags, PICK_IGNORE_XATTR_MATCH, !r);
+                        break;
+
                 OPTION_GROUP("Output"): {}
 
                 OPTION_COMMON_HELP:
@@ -223,6 +232,7 @@ static int run(int argc, char *argv[]) {
                                       .type_mask = arg_filter_type_mask,
                               },
                               /* n_filters= */ 1,
+                              /* match_root= */ NULL,
                               arg_flags,
                               &result);
                 if (r < 0)

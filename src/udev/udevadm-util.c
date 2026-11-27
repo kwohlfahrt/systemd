@@ -186,7 +186,7 @@ int udev_ping(usec_t timeout_usec, bool ignore_connection_failure) {
                 return ignore ? 0 : r;  /* nothing to do or error */
         }
 
-        r = varlink_call_and_log(link, "io.systemd.service.Ping", /* parameters= */ NULL, /* reply= */ NULL);
+        r = varlink_call_and_log(link, "io.systemd.service.Ping", /* parameters= */ NULL, /* ret_parameters= */ NULL);
         if (r < 0)
                 return r;
 
@@ -278,7 +278,7 @@ static int search_rules_file(const char *s, const char *root, ConfFile ***files,
 
         CLEANUP_ARRAY(f, n, conf_file_free_array);
 
-        r = conf_files_list_strv_full(".rules", root, CONF_FILES_REGULAR | CONF_FILES_WARN, (const char* const*) STRV_MAKE_CONST(s), &f, &n);
+        r = conf_files_list_full(".rules", root, CONF_FILES_REGULAR | CONF_FILES_WARN, s, &f, &n);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate rules files in '%s%s': %m", empty_to_root(root), skip_leading_slash(s));
 

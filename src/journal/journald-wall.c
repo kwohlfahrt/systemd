@@ -32,24 +32,20 @@ void manager_forward_wall(
                         identifier = ident_buf;
                 }
 
-                if (asprintf(&l_buf, "%s["PID_FMT"]: %s", strempty(identifier), ucred->pid, message) < 0) {
-                        log_oom();
-                        return;
-                }
+                if (asprintf(&l_buf, "%s["PID_FMT"]: %s", strempty(identifier), ucred->pid, message) < 0)
+                        return (void) log_oom();
 
                 l = l_buf;
 
         } else if (identifier) {
 
                 l = l_buf = strjoin(identifier, ": ", message);
-                if (!l_buf) {
-                        log_oom();
-                        return;
-                }
+                if (!l_buf)
+                        return (void) log_oom();
         } else
                 l = message;
 
-        r = wall(l, "systemd-journald", NULL, NULL, NULL);
+        r = wall(l, "systemd-journald", /* origin_tty= */ NULL, /* match_tty= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to send wall message: %m");
 }

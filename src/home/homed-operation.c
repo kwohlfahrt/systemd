@@ -40,7 +40,7 @@ static Operation *operation_free(Operation *o) {
                 if (o->result) {
                         /* Propagate success */
                         if (o->send_fd < 0)
-                                r = sd_bus_reply_method_return(o->message, NULL);
+                                r = sd_bus_reply_method_return(o->message, /* types= */ NULL);
                         else
                                 r = sd_bus_reply_method_return(o->message, "h", o->send_fd);
 
@@ -68,9 +68,12 @@ DEFINE_TRIVIAL_REF_UNREF_FUNC(Operation, operation, operation_free);
 void operation_result(Operation *o, int ret, const sd_bus_error *error) {
         assert(o);
 
-        if (ret >= 0)
-                o->result = true;
-        else {
+        if (ret >= 0) {
+                /* Operations might be shared between multiple homes (LockAllHomes(), DeactivateAllHomes()),
+                 * don't let a later success hide an earlier failure. */
+                if (o->result < 0)
+                        o->result = true;
+        } else {
                 o->ret = ret;
 
                 sd_bus_error_free(&o->error);

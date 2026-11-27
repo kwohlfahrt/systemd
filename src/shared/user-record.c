@@ -702,8 +702,7 @@ static int dispatch_pkcs11_uri_array(const char *name, sd_json_variant *variant,
                 }
         }
 
-        strv_free_and_replace(*l, z);
-        return 0;
+        return strv_free_and_replace(*l, z);
 }
 
 static int dispatch_pkcs11_key_data(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
@@ -721,6 +720,10 @@ static int dispatch_pkcs11_key_data(const char *name, sd_json_variant *variant, 
         r = sd_json_variant_unbase64(variant, &b, &l);
         if (r < 0)
                 return json_log(variant, flags, r, "Failed to decode encrypted PKCS#11 key: %m");
+        if (l == 0) {
+                free(b);
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Encrypted PKCS#11 key is empty.");
+        }
 
         erase_and_free(k->data);
         k->data = b;
@@ -786,6 +789,14 @@ static int dispatch_pkcs11_key(const char *name, sd_json_variant *variant, sd_js
                         return r;
                 }
 
+                /* In permissive mode missing mandatory fields are not refused by sd_json_dispatch(), but
+                 * everything else relies on them being set, hence skip such entries. */
+                if (!k->uri || !k->data || !k->hashed_password) {
+                        json_log(e, flags, 0, "PKCS#11 encrypted key lacks mandatory fields, ignoring.");
+                        pkcs11_encrypted_key_done(k);
+                        continue;
+                }
+
                 h->n_pkcs11_encrypted_key++;
         }
 
@@ -807,11 +818,13 @@ static int dispatch_fido2_hmac_credential(const char *name, sd_json_variant *var
         r = sd_json_variant_unbase64(variant, &b, &l);
         if (r < 0)
                 return json_log(variant, flags, r, "Failed to decode FIDO2 credential ID: %m");
+        if (l == 0) {
+                free(b);
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "FIDO2 credential ID is empty.");
+        }
 
-        free_and_replace(k->id, b);
         k->size = l;
-
-        return 0;
+        return free_and_replace(k->id, b);
 }
 
 static int dispatch_fido2_hmac_credential_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
@@ -857,6 +870,10 @@ static int dispatch_fido2_hmac_salt_value(const char *name, sd_json_variant *var
         r = sd_json_variant_unbase64(variant, &b, &l);
         if (r < 0)
                 return json_log(variant, flags, r, "Failed to decode FIDO2 salt: %m");
+        if (l == 0) {
+                free(b);
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "FIDO2 salt is empty.");
+        }
 
         erase_and_free(k->salt);
         k->salt = b;
@@ -903,6 +920,13 @@ static int dispatch_fido2_hmac_salt(const char *name, sd_json_variant *variant, 
                         return r;
                 }
 
+                /* See above */
+                if (!k->credential.id || !k->salt || !k->hashed_password) {
+                        json_log(e, flags, 0, "FIDO2 HMAC salt lacks mandatory fields, ignoring.");
+                        fido2_hmac_salt_done(k);
+                        continue;
+                }
+
                 h->n_fido2_hmac_salt++;
         }
 
@@ -937,6 +961,13 @@ static int dispatch_recovery_key(const char *name, sd_json_variant *variant, sd_
                 if (r < 0) {
                         recovery_key_done(k);
                         return r;
+                }
+
+                /* See above */
+                if (!k->type || !k->hashed_password) {
+                        json_log(e, flags, 0, "Recovery key lacks mandatory fields, ignoring.");
+                        recovery_key_done(k);
+                        continue;
                 }
 
                 h->n_recovery_key++;
@@ -1134,8 +1165,7 @@ static int dispatch_blob_manifest(const char *name, sd_json_variant *variant, sd
                 TAKE_PTR(hash);
         }
 
-        hashmap_free_and_replace(*ret, manifest);
-        return 0;
+        return hashmap_free_and_replace(*ret, manifest);
 }
 
 int per_machine_id_match(sd_json_variant *ids, sd_json_dispatch_flags_t flags) {
@@ -2413,7 +2443,7 @@ static int remove_self_modifiable_json_fields(UserRecord *current, UserRecord *h
         assert(h);
         assert(ret);
 
-        r = user_group_record_mangle(h->json, USER_RECORD_EXTRACT_SIGNABLE|USER_RECORD_PERMISSIVE, &v, NULL);
+        r = user_group_record_mangle(h->json, USER_RECORD_EXTRACT_SIGNABLE|USER_RECORD_PERMISSIVE, &v, /* ret_mask= */ NULL);
         if (r < 0)
                 return r;
 
@@ -2437,7 +2467,7 @@ static int remove_self_modifiable_json_fields(UserRecord *current, UserRecord *h
                         if (!sd_json_variant_is_object(e))
                                 return -EINVAL;
 
-                        r = per_machine_match(e, 0);
+                        r = per_machine_match(e, /* flags= */ 0);
                         if (r < 0)
                                 return r;
                         if (r == 0) {
@@ -2797,7 +2827,7 @@ bool record_name_matches_alias_realm(const char *name, char * const *aliases, co
         return false;
 }
 
-int suitable_blob_filename(const char *name) {
+bool suitable_blob_filename(const char *name) {
         /* Enforces filename requirements as described in docs/USER_RECORD_BULK_DIRS.md */
         return filename_is_valid(name) &&
                in_charset(name, URI_UNRESERVED) &&

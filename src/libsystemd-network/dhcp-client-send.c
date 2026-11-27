@@ -149,7 +149,7 @@ static int client_open_raw_socket(sd_dhcp_client *client) {
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(fd, SOL_SOCKET, SO_TIMESTAMP, true);
+        r = setsockopt_int(fd, SOL_SOCKET, SO_TIMESTAMP, /* value= */ true);
         if (r < 0)
                 return r;
 
@@ -157,7 +157,7 @@ static int client_open_raw_socket(sd_dhcp_client *client) {
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(fd, SOL_PACKET, PACKET_AUXDATA, true);
+        r = setsockopt_int(fd, SOL_PACKET, PACKET_AUXDATA, /* value= */ true);
         if (r < 0)
                 return r;
 
@@ -177,7 +177,6 @@ static int client_open_udp_socket(sd_dhcp_client *client) {
         int r;
 
         assert(client);
-        assert(client->lease);
 
         _cleanup_close_ int fd = RET_NERRNO(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
         if (fd < 0)
@@ -187,11 +186,11 @@ static int client_open_udp_socket(sd_dhcp_client *client) {
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, true);
+        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, /* value= */ true);
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(fd, SOL_SOCKET, SO_TIMESTAMP, true);
+        r = setsockopt_int(fd, SOL_SOCKET, SO_TIMESTAMP, /* value= */ true);
         if (r < 0)
                 return r;
 
@@ -203,14 +202,12 @@ static int client_open_udp_socket(sd_dhcp_client *client) {
         if (r < 0)
                 return r;
 
-        r = setsockopt_int(fd, IPPROTO_IP, IP_FREEBIND, true);
-        if (r < 0)
-                return r;
-
+        /* Do not bind to the leased address: a server refusing the renewal broadcasts the DHCPNAK
+         * (RFC2131, section 4.1). */
         union sockaddr_union sa = {
                 .in.sin_family = AF_INET,
                 .in.sin_port = htobe16(client->port),
-                .in.sin_addr.s_addr = client->lease->address,
+                .in.sin_addr.s_addr = INADDR_ANY,
         };
 
         if (bind(fd, &sa.sa, sizeof(sa.in)) < 0)
@@ -282,7 +279,7 @@ static int client_setup_io_event(
          * is freed when not necessary, hence the lifetime of the socket fd should not be tied to the one of
          * the event source in that case. */
         if (fd != client->socket_fd) {
-                r = sd_event_source_set_io_fd_own(s, true);
+                r = sd_event_source_set_io_fd_own(s, /* own= */ true);
                 if (r < 0)
                         return r;
         }
@@ -361,10 +358,11 @@ static int client_send_udp(
                         return fd;
         }
 
+        /* The socket is not bound to the leased address (see client_open_udp_socket()). */
         r = dhcp_message_send_udp(
                         message,
                         fd,
-                        INADDR_ANY,
+                        client->lease->address,
                         client->lease->server_address,
                         client->server_port);
         if (r < 0)

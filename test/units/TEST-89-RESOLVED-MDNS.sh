@@ -6,12 +6,6 @@ set -o pipefail
 # shellcheck source=test/units/test-control.sh
 . "$(dirname "$0")"/test-control.sh
 
-. /etc/os-release
-if [[ "${ID_LIKE:-}" == alpine ]]; then
-    # FIXME: For some reasons (maybe this test requires nss module??), the test fails on Alpine/Nura.
-    exit 77
-fi
-
 SERVICE_TYPE_COUNT=10
 SERVICE_COUNT=20
 CONTAINER_ZONE="test-$RANDOM"
@@ -122,7 +116,7 @@ run_and_check_services() {
     error_file="$(mktemp)"
     tmp_file="$(mktemp)"
     service_type="_testService$service_id._udp"
-    parameters="{ \"domain\": \"$service_type.local\", \"type\": \"\", \"ifindex\": ${BRIDGE_INDEX:?}, \"flags\": 16785432 }"
+    parameters="{ \"domain\": null, \"type\": \"$service_type\", \"ifindex\": ${BRIDGE_INDEX:?}, \"flags\": 16785432 }"
 
     # shellcheck disable=SC2064
     # Note: unregister the trap once it's fired, otherwise it'll get propagated to functions that call this
@@ -182,11 +176,16 @@ testcase_all_sequential() {
 
 testcase_all_parallel() {
     : "Test each service type (in parallel)"
+    local pid pids=() rc=0
     resolvectl flush-caches
     for id in $(seq 0 $((SERVICE_TYPE_COUNT - 1))); do
         run_and_check_services "$id" check_both &
+        pids+=("$!")
     done
-    wait
+    for pid in "${pids[@]}"; do
+        wait "$pid" || rc=1
+    done
+    return "$rc"
 }
 
 testcase_single_service_multiple_times() {
@@ -209,7 +208,7 @@ run_and_check_services_with_ifindex() {
     error_file="$(mktemp)"
     tmp_file="$(mktemp)"
     service_type="_testService$service_id._udp"
-    parameters="{ \"domain\": \"$service_type.local\", \"type\": \"\", \"ifindex\": $ifindex, \"flags\": 16785432 }"
+    parameters="{ \"domain\": \"$service_type.local\", \"type\": null, \"ifindex\": $ifindex, \"flags\": 16785432 }"
 
     # shellcheck disable=SC2064
     # Note: same as above about unregistering the trap once it's fired
@@ -237,8 +236,9 @@ run_and_check_services_with_ifindex() {
 testcase_browse_all_interfaces_ifindex_zero() {
     : "Test browsing all interfaces with ifindex=0"
     resolvectl flush-caches
-    # Using ifindex=0 should discover services on all mDNS interfaces
+    # Both zero and null should discover services on all mDNS interfaces.
     run_and_check_services_with_ifindex 0 check_both 0
+    run_and_check_services_with_ifindex 0 check_both null
 }
 
 testcase_browse_ifindex_zero_no_flap() {

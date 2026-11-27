@@ -238,7 +238,7 @@ int link_get_modem(Link *link, Modem **ret) {
         assert(ret);
 
         HASHMAP_FOREACH(modem, link->manager->modems_by_path)
-                if (modem->port_name && streq(modem->port_name, link->ifname)) {
+                if (streq_ptr(modem->port_name, link->ifname)) {
                         *ret = modem;
                         return 0;
                 }
@@ -576,8 +576,10 @@ int bearer_update_link(Bearer *b) {
                 return 0;
 
         r = link_apply_bearer_impl(link, b);
-        if (r < 0)
+        if (r < 0) {
                 link_enter_failed(link);
+                return r;
+        }
 
         /*
          * Need to bring up the interface after the modem has connected.
@@ -590,8 +592,10 @@ int bearer_update_link(Bearer *b) {
          */
 
         r = link_request_to_bring_up_or_down(link, b->connected);
-        if (r < 0)
+        if (r < 0) {
                 link_enter_failed(link);
+                return r;
+        }
 
         return 0;
 }
@@ -677,7 +681,7 @@ int config_parse_mm_allowed_auth(
         for (const char *p = rvalue;;) {
                 _cleanup_free_ char *auth = NULL;
 
-                r = extract_first_word(&p, &auth, /* separators */ NULL, /* flags */ 0);
+                r = extract_first_word(&p, &auth, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)

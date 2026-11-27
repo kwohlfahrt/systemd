@@ -6,7 +6,6 @@
 #include "bus-message-util.h"
 #include "bus-util.h"
 #include "string-util.h"
-#include "strv.h"
 
 int bus_map_id128(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *reterr_error, void *userdata) {
         sd_id128_t *p = userdata;
@@ -18,20 +17,6 @@ int bus_map_id128(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_err
         if (r < 0)
                 return bus_log_parse_error_debug(r);
 
-        return 0;
-}
-
-int bus_map_strv_sort(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *reterr_error, void *userdata) {
-        char ***p = ASSERT_PTR(userdata);
-        int r;
-
-        assert(m);
-
-        r = sd_bus_message_read_strv_extend(m, p);
-        if (r < 0)
-                return bus_log_parse_error_debug(r);
-
-        strv_sort(*p);
         return 0;
 }
 
@@ -50,7 +35,7 @@ static int map_basic(sd_bus_message *m, unsigned flags, void *userdata) {
         assert(m);
         assert(userdata);
 
-        r = sd_bus_message_peek_type(m, &type, NULL);
+        r = sd_bus_message_peek_type(m, &type, /* ret_contents= */ NULL);
         if (r < 0)
                 return bus_log_parse_error_debug(r);
 
@@ -169,7 +154,7 @@ int bus_message_map_all_properties(
                         }
 
                 if (prop) {
-                        r = sd_bus_message_peek_type(m, NULL, &contents);
+                        r = sd_bus_message_peek_type(m, /* ret_type= */ NULL, &contents);
                         if (r < 0)
                                 return bus_log_parse_error_debug(r);
 

@@ -96,31 +96,27 @@ void emergency_action(
                    EMERGENCY_ACTION_KEXEC,
                    EMERGENCY_ACTION_HALT)) {
                 u = manager_get_unit(m, SPECIAL_SHUTDOWN_TARGET);
-                if (u && unit_active_or_pending(u)) {
-                        log_notice("Shutdown is already active. Skipping emergency action request %s.",
-                                   emergency_action_table[action]);
-                        return;
-                }
+                if (u && unit_active_or_pending(u))
+                        return (void) log_notice("Shutdown is already active. Skipping emergency action request %s.",
+                                                 emergency_action_table[action]);
         }
 
-        if (FLAGS_SET(flags, EMERGENCY_ACTION_IS_WATCHDOG) && !m->service_watchdogs) {
-                log_warning("Watchdog disabled! Not acting on: %s", reason);
-                return;
-        }
+        if (FLAGS_SET(flags, EMERGENCY_ACTION_IS_WATCHDOG) && !m->service_watchdogs)
+                return (void) log_warning("Watchdog disabled! Not acting on: %s", reason);
 
         switch (action) {
 
         case EMERGENCY_ACTION_REBOOT:
                 log_and_status(m, action, flags, "Rebooting", reason);
 
-                (void) update_reboot_parameter_and_warn(reboot_arg, true);
-                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) update_reboot_parameter_and_warn(reboot_arg, /* keep= */ true);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, /* affected_jobs= */ NULL, /* ret= */ NULL);
                 break;
 
         case EMERGENCY_ACTION_REBOOT_FORCE:
                 log_and_status(m, action, flags, "Forcibly rebooting", reason);
 
-                (void) update_reboot_parameter_and_warn(reboot_arg, true);
+                (void) update_reboot_parameter_and_warn(reboot_arg, /* keep= */ true);
                 m->objective = MANAGER_REBOOT;
                 break;
 
@@ -142,7 +138,7 @@ void emergency_action(
         case EMERGENCY_ACTION_SOFT_REBOOT:
                 log_and_status(m, action, flags, "Soft-rebooting", reason);
 
-                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_SOFT_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_SOFT_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, /* affected_jobs= */ NULL, /* ret= */ NULL);
                 break;
 
         case EMERGENCY_ACTION_SOFT_REBOOT_FORCE:
@@ -162,7 +158,7 @@ void emergency_action(
 
                 if (MANAGER_IS_USER(m) || detect_container() > 0) {
                         log_and_status(m, action, flags, "Exiting", reason);
-                        (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_EXIT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                        (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_EXIT_TARGET, JOB_REPLACE_IRREVERSIBLY, /* affected_jobs= */ NULL, /* ret= */ NULL);
                         break;
                 }
 
@@ -171,7 +167,7 @@ void emergency_action(
 
         case EMERGENCY_ACTION_POWEROFF:
                 log_and_status(m, action, flags, "Powering off", reason);
-                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_POWEROFF_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_POWEROFF_TARGET, JOB_REPLACE_IRREVERSIBLY, /* affected_jobs= */ NULL, /* ret= */ NULL);
                 break;
 
         case EMERGENCY_ACTION_EXIT_FORCE:
@@ -208,7 +204,7 @@ void emergency_action(
 
         case EMERGENCY_ACTION_KEXEC:
                 log_and_status(m, action, flags, "Executing kexec", reason);
-                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_KEXEC_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_KEXEC_TARGET, JOB_REPLACE_IRREVERSIBLY, /* affected_jobs= */ NULL, /* ret= */ NULL);
                 break;
 
         case EMERGENCY_ACTION_KEXEC_FORCE:
@@ -218,7 +214,7 @@ void emergency_action(
 
         case EMERGENCY_ACTION_HALT:
                 log_and_status(m, action, flags, "Halting", reason);
-                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_HALT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
+                (void) manager_add_job_by_name_or_warn(m, JOB_START, SPECIAL_HALT_TARGET, JOB_REPLACE_IRREVERSIBLY, /* affected_jobs= */ NULL, /* ret= */ NULL);
                 break;
 
         case EMERGENCY_ACTION_HALT_FORCE:

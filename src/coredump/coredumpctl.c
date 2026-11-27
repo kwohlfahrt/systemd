@@ -6,7 +6,6 @@
 #include "sd-json.h"
 
 #include "alloc-util.h"
-#include "ansi-color.h"
 #include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
@@ -44,7 +43,8 @@ const char *arg_directory = NULL;
 char **arg_file = NULL;
 sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 PagerFlags arg_pager_flags = 0;
-int arg_legend = true;
+bool arg_legend = true;
+bool arg_full = false;
 size_t arg_rows_max = SIZE_MAX;
 const char *arg_output = NULL;
 bool arg_reverse = false;
@@ -63,7 +63,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 COMMAND(
         "coredumpctl\0",
         "List or retrieve coredumps from the journal.",
-        .man_pages = "coredumpctl(1)\0",
+        .man_page = "coredumpctl(1)",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -93,6 +93,10 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
 
                 OPTION_COMMON_NO_LEGEND:
                         arg_legend = false;
+                        break;
+
+                OPTION_COMMON_FULL:
+                        arg_full = true;
                         break;
 
                 OPTION_LONG("debugger", "DEBUGGER", "Use the given debugger"):
@@ -163,13 +167,13 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                         break;
 
                 OPTION_LONG("root", "PATH", "Operate on an alternate filesystem root"):
-                        r = parse_path_argument(opts.arg, false, &arg_root);
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
 
                 OPTION_LONG("image", "PATH", "Operate on disk image as filesystem root"):
-                        r = parse_path_argument(opts.arg, false, &arg_image);
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image);
                         if (r < 0)
                                 return r;
                         break;
@@ -295,6 +299,7 @@ static int run(int argc, char *argv[]) {
         LIBCRYPTO_NOTE(suggested);
         LIBCRYPTSETUP_NOTE(suggested);
         LIBMOUNT_NOTE(recommended);
+        TPM2_NOTE(suggested);
 
         setlocale(LC_ALL, "");
         log_setup();
@@ -331,11 +336,14 @@ static int run(int argc, char *argv[]) {
 
         r = dispatch_verb(args, NULL);
 
-        if (units_active > 0)
-                printf("%s-- Notice: %d systemd-coredump@.service %s, output may be incomplete.%s\n",
-                       ansi_highlight_red(),
-                       units_active, units_active == 1 ? "unit is running" : "units are running",
-                       ansi_normal());
+        if (units_active > 0) {
+                /* Flush stdout first, so that pending output (which may be fully buffered, e.g. when
+                 * connected to the pager) is written before the notice below. */
+                (void) fflush(stdout);
+
+                log_notice("Notice: %d systemd-coredump@.service %s, output may be incomplete.",
+                           units_active, units_active == 1 ? "unit is running" : "units are running");
+        }
 
         return r;
 }

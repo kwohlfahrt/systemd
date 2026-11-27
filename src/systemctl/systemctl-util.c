@@ -217,7 +217,7 @@ int get_unit_list(
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = sd_bus_call(bus, m, 0, &error, &reply);
+        r = sd_bus_call(bus, m, /* usec= */ 0, &error, &reply);
         if (r < 0 && (sd_bus_error_has_names(&error, SD_BUS_ERROR_UNKNOWN_METHOD,
                                                      SD_BUS_ERROR_ACCESS_DENIED))) {
                 /* Fallback to legacy ListUnitsFiltered method */
@@ -234,7 +234,7 @@ int get_unit_list(
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, 0, &error, &reply);
+                r = sd_bus_call(bus, m, /* usec= */ 0, &error, &reply);
         }
         if (r < 0)
                 return log_error_errno(r, "Failed to list units: %s", bus_error_message(&error, r));
@@ -288,7 +288,7 @@ int expand_unit_names(
                 UnitNameMangle options = UNIT_NAME_MANGLE_GLOB | (arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN);
                 char *t;
 
-                r = unit_name_mangle_with_suffix(*name, NULL, options, suffix ?: ".service", &t);
+                r = unit_name_mangle_with_suffix(*name, /* operation= */ NULL, options, suffix ?: ".service", &t);
                 if (r < 0)
                         return log_error_errno(r, "Failed to mangle name: %m");
 
@@ -306,7 +306,7 @@ int expand_unit_names(
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
                 _cleanup_free_ UnitInfo *unit_infos = NULL;
 
-                r = get_unit_list(bus, NULL, globs, &unit_infos, 0, &reply);
+                r = get_unit_list(bus, /* machine= */ NULL, globs, &unit_infos, 0, &reply);
                 if (r < 0)
                         return r;
 
@@ -332,7 +332,7 @@ int get_active_triggering_units(sd_bus *bus, const char *unit, bool ignore_maske
         assert(unit);
         assert(ret);
 
-        r = unit_name_mangle(unit, 0, &name);
+        r = unit_name_mangle(unit, /* flags= */ 0, &name);
         if (r < 0)
                 return r;
 
@@ -425,7 +425,7 @@ int need_daemon_reload(sd_bus *bus, const char *unit) {
         /* We don't use unit_dbus_path_from_name() directly since we
          * don't want to load the unit if it isn't loaded. */
 
-        r = bus_call_method(bus, bus_systemd_mgr, "GetUnit", NULL, &reply, "s", unit);
+        r = bus_call_method(bus, bus_systemd_mgr, "GetUnit", /* reterr_error= */ NULL, &reply, "s", unit);
         if (r < 0)
                 return r;
 
@@ -439,7 +439,7 @@ int need_daemon_reload(sd_bus *bus, const char *unit) {
                         path,
                         "org.freedesktop.systemd1.Unit",
                         "NeedDaemonReload",
-                        NULL,
+                        /* reterr_error= */ NULL,
                         'b', &b);
         if (r < 0)
                 return r;
@@ -470,7 +470,7 @@ int unit_file_find_path(LookupPaths *lp, const char *unit_name, char **ret_unit_
                 if (!path)
                         return log_oom();
 
-                r = chase(path, arg_root, 0, &lpath, NULL);
+                r = chase(path, arg_root, /* flags= */ 0, &lpath, /* ret_fd= */ NULL);
                 if (r == -ENOENT)
                         continue;
                 if (r == -ENOMEM)
@@ -582,7 +582,7 @@ int unit_find_paths(
                 }
         } else {
                 if (!*cached_name_map) {
-                        r = unit_file_build_name_map(lp, NULL, cached_id_map, cached_name_map, NULL);
+                        r = unit_file_build_name_map(lp, /* cache_timestamp_hash= */ NULL, cached_id_map, cached_name_map, /* path_cache= */ NULL);
                         if (r < 0)
                                 return r;
                 }
@@ -607,9 +607,9 @@ int unit_find_paths(
                 }
 
                 if (ret_dropin_paths) {
-                        r = unit_file_find_dropin_paths(arg_root, lp->search_path, NULL,
+                        r = unit_file_find_dropin_paths(arg_root, lp->search_path, /* unit_path_cache= */ NULL,
                                                         ".d", ".conf",
-                                                        NULL, names, &dropins);
+                                                        /* name= */ NULL, names, &dropins);
                         if (r < 0)
                                 return r;
                 }
@@ -733,7 +733,7 @@ int unit_exists(LookupPaths *lp, const char *unit) {
         int r;
 
         if (unit_name_is_valid(unit, UNIT_NAME_TEMPLATE))
-                return unit_find_template_path(unit, lp, NULL, NULL);
+                return unit_find_template_path(unit, lp, /* ret_fragment_path= */ NULL, /* ret_template= */ NULL);
 
         path = unit_dbus_path_from_name(unit);
         if (!path)
@@ -743,7 +743,7 @@ int unit_exists(LookupPaths *lp, const char *unit) {
         if (r < 0)
                 return r;
 
-        r = bus_map_all_properties(bus, "org.freedesktop.systemd1", path, property_map, 0, &error, &m, &info);
+        r = bus_map_all_properties(bus, "org.freedesktop.systemd1", path, property_map, /* flags= */ 0, &error, &m, &info);
         if (r < 0)
                 return log_error_errno(r, "Failed to get properties: %s", bus_error_message(&error, r));
 
@@ -757,14 +757,15 @@ int append_unit_dependencies(sd_bus *bus, char **names, char ***ret) {
         assert(ret);
 
         STRV_FOREACH(name, names) {
-                char **deps;
+                _cleanup_(unit_dependency_info_freep) UnitDependencyInfo *info = NULL;
 
                 if (strv_extend(&with_deps, *name) < 0)
                         return log_oom();
 
-                (void) unit_get_dependencies(bus, *name, &deps);
+                if (unit_get_dependencies(bus, *name, &info) < 0)
+                        continue;
 
-                if (strv_extend_strv_consume(&with_deps, deps, /* filter_duplicates= */ true) < 0)
+                if (strv_extend_strv_consume(&with_deps, TAKE_PTR(info->deps), /* filter_duplicates= */ true) < 0)
                         return log_oom();
         }
 
@@ -790,34 +791,94 @@ int maybe_extend_with_unit_dependencies(sd_bus *bus, char ***list) {
         return strv_free_and_replace(*list, list_with_deps);
 }
 
-int unit_get_dependencies(sd_bus *bus, const char *name, char ***ret) {
-        _cleanup_strv_free_ char **deps = NULL;
+UnitDependencyInfo* unit_dependency_info_free(UnitDependencyInfo *info) {
+        if (!info)
+                return NULL;
 
-        static const struct bus_properties_map map[_DEPENDENCY_MAX][7] = {
+        free(info->name);
+        strv_free(info->deps);
+        return mfree(info);
+}
+
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                unit_dependency_info_hash_ops,
+                char,
+                string_hash_func,
+                string_compare_func,
+                UnitDependencyInfo,
+                unit_dependency_info_free);
+
+static int map_active_state(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *reterr_error, void *userdata) {
+        UnitActiveState *state = ASSERT_PTR(userdata);
+        const char *s;
+        int r;
+
+        assert(m);
+
+        r = sd_bus_message_read_basic(m, 's', &s);
+        if (r < 0)
+                return r;
+
+        *state = unit_active_state_from_string(s);
+        if (*state < 0)
+                return log_debug_errno(*state, "Invalid unit state '%s'.", s);
+
+        return 0;
+}
+
+static int unit_dependency_compare(char * const *a, char * const *b) {
+        int r;
+
+        assert(a);
+        assert(b);
+
+        if (unit_name_to_type(*a) == UNIT_TARGET && unit_name_to_type(*b) != UNIT_TARGET)
+                return 1;
+        if (unit_name_to_type(*a) != UNIT_TARGET && unit_name_to_type(*b) == UNIT_TARGET)
+                return -1;
+
+        r = strcasecmp(*a, *b);
+        if (r != 0)
+                return r;
+
+        /* Unit names are case-sensitive, keep the order total so that only identical names compare equal. */
+        return strcmp(*a, *b);
+}
+
+int unit_get_dependencies(sd_bus *bus, const char *name, UnitDependencyInfo **ret) {
+        _cleanup_(unit_dependency_info_freep) UnitDependencyInfo *info = NULL;
+
+        /* The "as" properties are all stored at the same offset, i.e. merged into one strv. ActiveState
+         * comes with the same GetAll() reply, so callers that also want the state get it for free. */
+        static const struct bus_properties_map map[_DEPENDENCY_MAX][8] = {
                 [DEPENDENCY_FORWARD] = {
-                        { "Requires",    "as", NULL, 0 },
-                        { "Requisite",   "as", NULL, 0 },
-                        { "Wants",       "as", NULL, 0 },
-                        { "ConsistsOf",  "as", NULL, 0 },
-                        { "BindsTo",     "as", NULL, 0 },
-                        { "Upholds",     "as", NULL, 0 },
+                        { "Requires",    "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "Requisite",   "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "Wants",       "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "ConsistsOf",  "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "BindsTo",     "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "Upholds",     "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "ActiveState", "s",  map_active_state, offsetof(UnitDependencyInfo, active_state) },
                         {}
                 },
                 [DEPENDENCY_REVERSE] = {
-                        { "RequiredBy",  "as", NULL, 0 },
-                        { "RequisiteOf", "as", NULL, 0 },
-                        { "WantedBy",    "as", NULL, 0 },
-                        { "PartOf",      "as", NULL, 0 },
-                        { "BoundBy",     "as", NULL, 0 },
-                        { "UpheldBy",    "as", NULL, 0 },
+                        { "RequiredBy",  "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "RequisiteOf", "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "WantedBy",    "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "PartOf",      "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "BoundBy",     "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "UpheldBy",    "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "ActiveState", "s",  map_active_state, offsetof(UnitDependencyInfo, active_state) },
                         {}
                 },
                 [DEPENDENCY_AFTER] = {
-                        { "After",       "as", NULL, 0 },
+                        { "After",       "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "ActiveState", "s",  map_active_state, offsetof(UnitDependencyInfo, active_state) },
                         {}
                 },
                 [DEPENDENCY_BEFORE] = {
-                        { "Before",      "as", NULL, 0 },
+                        { "Before",      "as", NULL,             offsetof(UnitDependencyInfo, deps)         },
+                        { "ActiveState", "s",  map_active_state, offsetof(UnitDependencyInfo, active_state) },
                         {}
                 },
         };
@@ -834,20 +895,35 @@ int unit_get_dependencies(sd_bus *bus, const char *name, char ***ret) {
         if (!dbus_path)
                 return log_oom();
 
+        info = new(UnitDependencyInfo, 1);
+        if (!info)
+                return log_oom();
+
+        *info = (UnitDependencyInfo) {
+                .name = strdup(name),
+                .active_state = _UNIT_ACTIVE_STATE_INVALID,
+        };
+        if (!info->name)
+                return log_oom();
+
         r = bus_map_all_properties(bus,
                                    "org.freedesktop.systemd1",
                                    dbus_path,
                                    map[arg_dependency],
                                    BUS_MAP_STRDUP,
                                    &error,
-                                   NULL,
-                                   &deps);
+                                   /* ret_reply= */ NULL,
+                                   info);
         if (r < 0)
                 return log_error_errno(r, "Failed to get properties of %s: %s", name, bus_error_message(&error, r));
+        if (info->active_state < 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Failed to get state of %s.", name);
 
-        strv_uniq(deps); /* Sometimes a unit might have multiple deps on the other unit,
-                          * but we still want to show it just once. */
-        *ret = TAKE_PTR(deps);
+        /* Sometimes a unit might have multiple deps on the other unit, but we still want to show it just
+         * once. Then order them the way list-dependencies shows them: targets last. */
+        strv_sort_uniq_full(info->deps, unit_dependency_compare);
+
+        *ret = TAKE_PTR(info);
 
         return 0;
 }
@@ -912,6 +988,11 @@ InstallClientSide install_client_side(void) {
         if (arg_runtime_scope == RUNTIME_SCOPE_GLOBAL)
                 return INSTALL_CLIENT_SIDE_GLOBAL_SCOPE;
 
+        /* The bus API cannot request vendor operations. Checking arg_vendor after the other client-side
+         * conditions identifies operations on the running system that need a manager reload. */
+        if (arg_vendor)
+                return INSTALL_CLIENT_SIDE_VENDOR;
+
         return INSTALL_CLIENT_SIDE_NO;
 }
 
@@ -941,7 +1022,8 @@ bool show_preset_for_state(UnitFileState state) {
 
 UnitFileFlags unit_file_flags_from_args(void) {
         return (arg_runtime ? UNIT_FILE_RUNTIME : 0) |
-               (arg_force   ? UNIT_FILE_FORCE   : 0);
+               (arg_force   ? UNIT_FILE_FORCE   : 0) |
+               (arg_vendor  ? UNIT_FILE_VENDOR  : 0);
 }
 
 int mangle_names(const char *operation, char * const *original_names, char ***ret) {

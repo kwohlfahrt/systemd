@@ -2,6 +2,8 @@
 
 #include "sd-json.h"
 
+#include "iovec-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "random-util.h"
 #include "report.h"
@@ -29,19 +31,13 @@ int context_build_report(Context *context, sd_json_variant **ret) {
         r = sd_json_buildo(&report,
                            SD_JSON_BUILD_PAIR_STRING("mediaType", "application/vnd.io.systemd.report"),
                            SD_JSON_BUILD_PAIR_BASE64("reportID", report_id, sizeof(report_id)),
+                           SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(context->nonce), "nonce", JSON_BUILD_IOVEC_BASE64(context->nonce)),
                            SD_JSON_BUILD_PAIR("timestamp",
                                               SD_JSON_BUILD_STRING(FORMAT_TIMESTAMP_STYLE(ts, TIMESTAMP_UTC))),
                            SD_JSON_BUILD_PAIR("metrics",
                                               SD_JSON_BUILD_VARIANT_ARRAY(context->metrics, context->n_metrics)));
         if (r < 0)
                 return log_error_errno(r, "Failed to build JSON data: %m");
-
-        /* Normalize the report, to make signing more robust (note that we sign a specific binary formatting
-         * of it though, this is hence not load bearing, but still useful) */
-        // FIXME: this causes a test failure https://github.com/systemd/systemd/issues/42669
-        // r = sd_json_variant_normalize(&report);
-        // if (r < 0)
-        //         return log_error_errno(r, "Failed to normalize report JSON: %m");
 
         *ret = TAKE_PTR(report);
         return 0;

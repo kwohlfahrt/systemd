@@ -26,13 +26,13 @@ typedef struct Context {
 
 int x11_context_verify_and_warn(const X11Context *xc, int log_level, sd_bus_error *error);
 static inline int x11_context_verify(const X11Context *xc) {
-        return x11_context_verify_and_warn(xc, LOG_DEBUG, NULL);
+        return x11_context_verify_and_warn(xc, LOG_DEBUG, /* error= */ NULL);
 }
 X11Context *context_get_x11_context(Context *c);
 
 int vc_context_verify_and_warn(const VCContext *vc, int log_level, sd_bus_error *error);
 static inline int vc_context_verify(const VCContext *vc) {
-        return vc_context_verify_and_warn(vc, LOG_DEBUG, NULL);
+        return vc_context_verify_and_warn(vc, LOG_DEBUG, /* error= */ NULL);
 }
 
 int locale_read_data(Context *c, sd_bus_message *m);
@@ -44,5 +44,8 @@ int vconsole_write_data(Context *c);
 int x11_write_data(Context *c);
 
 bool locale_gen_check_available(void);
+const char* locale_utf8_codeset_end(const char *dot);
+int locale_strip_utf8_codeset(const char *name, char **ret);
+int locale_gen_locale_supported(const char *locale, const char *supported_file, char **ret_entry);
 int locale_gen_enable_locale(const char *locale);
 int locale_gen_run(void);

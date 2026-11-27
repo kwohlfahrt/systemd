@@ -13,6 +13,7 @@
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "fstab-util.h"
 #include "log.h"
 #include "mkdir.h"
 #include "mount-util.h"
@@ -219,7 +220,7 @@ int custom_mount_prepare_all(const char *dest, CustomMount *l, size_t n) {
 
                                 free_and_replace(m->work_dir, s);
                         } else {
-                                r = tempfn_random(m->source, NULL, &m->work_dir);
+                                r = tempfn_random(m->source, /* extra= */ NULL, &m->work_dir);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to acquire working directory: %m");
                         }
@@ -410,6 +411,7 @@ int inaccessible_mount_parse(CustomMount **l, size_t *n, const char *s) {
 int tmpfs_patch_options(
                 const char *options,
                 uid_t uid_shift,
+                uid_t uid_range,
                 const char *selinux_apifs_context,
                 char **ret) {
 
@@ -423,9 +425,60 @@ int tmpfs_patch_options(
                         return -ENOMEM;
         }
 
-        if (uid_shift != UID_INVALID)
-                if (strextendf_with_separator(&buf, ",", "uid=" UID_FMT ",gid=" UID_FMT, uid_shift, uid_shift) < 0)
+        if (uid_shift != UID_INVALID) {
+                uid_t uid = uid_shift;
+                gid_t gid = uid_shift;
+
+                if (options) {
+                        int r;
+                        _cleanup_free_ char *uid_value_str = NULL;
+
+                        r = fstab_filter_options(options, "uid\0", /* ret_namefound= */ NULL, &uid_value_str, /* ret_values= */ NULL, /* ret_filtered= */ NULL);
+                        if (r < 0)
+                                return r;
+                        if (r > 0 && uid_value_str) {
+                                if (uid_range == UID_INVALID)
+                                        return -EINVAL;
+
+                                uid_t options_uid;
+
+                                r = parse_uid(uid_value_str, &options_uid);
+                                if (r < 0)
+                                        return r;
+                                if (options_uid > UINT32_MAX - uid)
+                                        return -ERANGE;
+                                if (options_uid >= uid_range)
+                                        return -EINVAL;
+
+                                uid += options_uid;
+                        }
+
+                        _cleanup_free_ char *gid_value_str = NULL;
+
+                        r = fstab_filter_options(options, "gid\0", /* ret_namefound= */ NULL, &gid_value_str, /* ret_values= */ NULL, /* ret_filtered= */ NULL);
+                        if (r < 0)
+                                return r;
+                        if (r > 0 && gid_value_str) {
+                                if (uid_range == UID_INVALID)
+                                        return -EINVAL;
+
+                                gid_t options_gid;
+
+                                r = parse_gid(gid_value_str, &options_gid);
+                                if (r < 0)
+                                        return r;
+                                if (options_gid > UINT32_MAX - gid)
+                                        return -ERANGE;
+                                if (options_gid >= uid_range)
+                                        return -EINVAL;
+
+                                gid += options_gid;
+                        }
+                }
+
+                if (strextendf_with_separator(&buf, ",", "uid=" UID_FMT ",gid=" GID_FMT, uid, gid) < 0)
                         return -ENOMEM;
+        }
 
 #if HAVE_SELINUX
         if (selinux_apifs_context)
@@ -478,7 +531,7 @@ int mount_sysfs(const char *dest, MountSettingsMask mount_settings) {
                 extra_flags |= MS_RDONLY;
 
         r = mount_nofollow_verbose(LOG_ERR, "sysfs", full, "sysfs",
-                                   MS_NOSUID|MS_NOEXEC|MS_NODEV|extra_flags, NULL);
+                                   MS_NOSUID|MS_NOEXEC|MS_NODEV|extra_flags, /* options= */ NULL);
         if (r < 0)
                 return r;
 
@@ -495,12 +548,12 @@ int mount_sysfs(const char *dest, MountSettingsMask mount_settings) {
 
                 (void) mkdir(to, 0755);
 
-                r = mount_nofollow_verbose(LOG_ERR, from, to, NULL, MS_BIND, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, from, to, /* fstype= */ NULL, MS_BIND, /* options= */ NULL);
                 if (r < 0)
                         return r;
 
-                r = mount_nofollow_verbose(LOG_ERR, NULL, to, NULL,
-                                           MS_BIND|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_REMOUNT|extra_flags, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, /* what= */ NULL, to, /* fstype= */ NULL,
+                                           MS_BIND|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_REMOUNT|extra_flags, /* options= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -521,8 +574,8 @@ int mount_sysfs(const char *dest, MountSettingsMask mount_settings) {
                 (void) mkdir_p(x, 0755);
         }
 
-        return mount_nofollow_verbose(LOG_ERR, NULL, top, NULL,
-                                      MS_BIND|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_REMOUNT|extra_flags, NULL);
+        return mount_nofollow_verbose(LOG_ERR, /* what= */ NULL, top, /* fstype= */ NULL,
+                                      MS_BIND|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_REMOUNT|extra_flags, /* options= */ NULL);
 }
 
 #define PROC_DEFAULT_MOUNT_FLAGS (MS_NOSUID|MS_NOEXEC|MS_NODEV)
@@ -660,7 +713,7 @@ int mount_all(const char *dest,
                 if (!privileged && FLAGS_SET(m->mount_settings, MOUNT_PRIVILEGED))
                         continue;
 
-                r = chase(m->where, dest, CHASE_NONEXISTENT|CHASE_PREFIX_ROOT, &where, NULL);
+                r = chase(m->where, dest, CHASE_NONEXISTENT|CHASE_PREFIX_ROOT, &where, /* ret_fd= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve %s%s: %m", strempty(dest), m->where);
 
@@ -677,9 +730,9 @@ int mount_all(const char *dest,
                         uid_t u = (use_userns && !in_userns) ? uid_shift : UID_INVALID;
 
                         if (FLAGS_SET(m->mount_settings, MOUNT_TOUCH))
-                                r = mkdir_parents_safe(dest, where, 0755, u, u, 0);
+                                r = mkdir_parents_safe(dest, where, 0755, u, u, /* flags= */ 0);
                         else
-                                r = mkdir_p_safe(dest, where, 0755, u, u, 0);
+                                r = mkdir_p_safe(dest, where, 0755, u, u, /* flags= */ 0);
                         if (r < 0 && r != -EEXIST) {
                                 if (fatal && r != -EROFS)
                                         return log_error_errno(r, "Failed to create directory %s: %m", where);
@@ -707,9 +760,11 @@ int mount_all(const char *dest,
 
                 o = m->options;
                 if (streq_ptr(m->type, "tmpfs")) {
-                        r = tmpfs_patch_options(o, in_userns ? 0 : uid_shift, selinux_apifs_context, &options);
-                        if (r < 0)
+                        r = tmpfs_patch_options(o, in_userns ? 0 : uid_shift, UID_INVALID, selinux_apifs_context, &options);
+                        if (r == -ENOMEM)
                                 return log_oom();
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to patch options of tmpfs %s: %m", where);
                         if (r > 0)
                                 o = options;
                 }
@@ -736,7 +791,7 @@ int mount_all(const char *dest,
                          * mounts to be created within the container image before we transition into it. Note
                          * that MOUNT_IN_USERNS is run after we transitioned hence prefixing is not necessary
                          * for those. */
-                        r = chase(m->what, dest, CHASE_PREFIX_ROOT, &prefixed, NULL);
+                        r = chase(m->what, dest, CHASE_PREFIX_ROOT, &prefixed, /* ret_fd= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to resolve %s%s: %m", strempty(dest), m->what);
                 }
@@ -768,7 +823,7 @@ static int parse_mount_bind_options(const char *options, unsigned long *open_tre
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&options, &word, ",", 0);
+                r = extract_first_word(&options, &word, ",", /* flags= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to extract mount option: %m");
                 if (r == 0)
@@ -850,12 +905,12 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
                         m->source,
                         open_tree_flags);
         if (fd_clone < 0)
-                return log_error_errno(errno, "Failed to clone %s: %m", m->source);
+                return log_error_errno(fd_clone, "Failed to clone %s: %m", m->source);
 
         if (fstat(fd_clone, &source_st) < 0)
                 return log_error_errno(errno, "Failed to stat %s: %m", m->source);
 
-        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, NULL);
+        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, /* ret_fd= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to resolve %s/%s: %m", dest, m->destination);
         if (r > 0) { /* Path exists already? */
@@ -903,7 +958,7 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
         fd_clone = safe_close(fd_clone);
 
         if (m->read_only) {
-                r = bind_remount_recursive(where, MS_RDONLY, MS_RDONLY, NULL);
+                r = bind_remount_recursive(where, MS_RDONLY, MS_RDONLY, /* deny_list= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Read-only bind mount failed: %m");
         }
@@ -917,7 +972,7 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
         return 0;
 }
 
-static int mount_tmpfs(const char *dest, CustomMount *m, uid_t uid_shift, const char *selinux_apifs_context) {
+static int mount_tmpfs(const char *dest, CustomMount *m, uid_t uid_shift, uid_t uid_range, const char *selinux_apifs_context) {
         const char *options;
         _cleanup_free_ char *buf = NULL, *where = NULL;
         int r;
@@ -925,7 +980,7 @@ static int mount_tmpfs(const char *dest, CustomMount *m, uid_t uid_shift, const 
         assert(dest);
         assert(m);
 
-        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, NULL);
+        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, /* ret_fd= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to resolve %s/%s: %m", dest, m->destination);
         if (r == 0) { /* Doesn't exist yet? */
@@ -934,9 +989,12 @@ static int mount_tmpfs(const char *dest, CustomMount *m, uid_t uid_shift, const 
                         return log_error_errno(r, "Creating mount point for tmpfs %s failed: %m", where);
         }
 
-        r = tmpfs_patch_options(m->options, uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &buf);
-        if (r < 0)
+        r = tmpfs_patch_options(m->options, uid_shift == 0 ? UID_INVALID : uid_shift, uid_range, selinux_apifs_context, &buf);
+        if (r == -ENOMEM)
                 return log_oom();
+        if (r < 0)
+                return log_error_errno(r, "Failed to patch options of tmpfs %s: %m", where);
+
         options = r > 0 ? buf : m->options;
 
         return mount_nofollow_verbose(LOG_ERR, "tmpfs", where, "tmpfs", MS_NODEV|MS_STRICTATIME, options);
@@ -965,7 +1023,7 @@ static int mount_overlay(const char *dest, CustomMount *m) {
         assert(dest);
         assert(m);
 
-        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, NULL);
+        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, /* ret_fd= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to resolve %s/%s: %m", dest, m->destination);
         if (r == 0) { /* Doesn't exist yet? */
@@ -1013,15 +1071,15 @@ static int mount_inaccessible(const char *dest, CustomMount *m) {
                 return m->graceful ? 0 : r;
         }
 
-        r = mode_to_inaccessible_node(NULL, st.st_mode, &source);
+        r = mode_to_inaccessible_node(/* runtime_dir= */ NULL, st.st_mode, &source);
         if (r < 0)
                 return m->graceful ? 0 : r;
 
-        r = mount_nofollow_verbose(m->graceful ? LOG_DEBUG : LOG_ERR, source, where, NULL, MS_BIND, NULL);
+        r = mount_nofollow_verbose(m->graceful ? LOG_DEBUG : LOG_ERR, source, where, /* fstype= */ NULL, MS_BIND, /* options= */ NULL);
         if (r < 0)
                 return m->graceful ? 0 : r;
 
-        r = mount_nofollow_verbose(m->graceful ? LOG_DEBUG : LOG_ERR, NULL, where, NULL, MS_BIND|MS_RDONLY|MS_REMOUNT, NULL);
+        r = mount_nofollow_verbose(m->graceful ? LOG_DEBUG : LOG_ERR, /* what= */ NULL, where, /* fstype= */ NULL, MS_BIND|MS_RDONLY|MS_REMOUNT, /* options= */ NULL);
         if (r < 0) {
                 (void) umount_verbose(m->graceful ? LOG_DEBUG : LOG_ERR, where, UMOUNT_NOFOLLOW);
                 return m->graceful ? 0 : r;
@@ -1037,7 +1095,7 @@ static int mount_arbitrary(const char *dest, CustomMount *m) {
         assert(dest);
         assert(m);
 
-        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, NULL);
+        r = chase(m->destination, dest, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &where, /* ret_fd= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to resolve %s/%s: %m", dest, m->destination);
         if (r == 0) { /* Doesn't exist yet? */
@@ -1046,7 +1104,7 @@ static int mount_arbitrary(const char *dest, CustomMount *m) {
                         return log_error_errno(r, "Creating mount point for mount %s failed: %m", where);
         }
 
-        return mount_nofollow_verbose(LOG_ERR, m->source, where, m->type_argument, 0, m->options);
+        return mount_nofollow_verbose(LOG_ERR, m->source, where, m->type_argument, /* flags= */ 0, m->options);
 }
 
 int mount_custom(
@@ -1077,7 +1135,7 @@ int mount_custom(
                         break;
 
                 case CUSTOM_MOUNT_TMPFS:
-                        r = mount_tmpfs(dest, m, uid_shift, selinux_apifs_context);
+                        r = mount_tmpfs(dest, m, uid_shift, uid_range, selinux_apifs_context);
                         break;
 
                 case CUSTOM_MOUNT_OVERLAY:
@@ -1119,7 +1177,7 @@ static int setup_volatile_state(const char *directory) {
         /* --volatile=state means we simply overmount /var with a tmpfs, and the rest read-only. */
 
         /* First, remount the root directory. */
-        r = bind_remount_recursive(directory, MS_RDONLY, MS_RDONLY, NULL);
+        r = bind_remount_recursive(directory, MS_RDONLY, MS_RDONLY, /* deny_list= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to remount %s read-only: %m", directory);
 
@@ -1143,9 +1201,11 @@ static int setup_volatile_state_after_remount_idmap(const char *directory, uid_t
                 return log_error_errno(errno, "Failed to create %s: %m", directory);
 
         const char *options = "mode=0755" TMPFS_LIMITS_VOLATILE_STATE;
-        r = tmpfs_patch_options(options, uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &buf);
-        if (r < 0)
+        r = tmpfs_patch_options(options, uid_shift == 0 ? UID_INVALID : uid_shift, UID_INVALID, selinux_apifs_context, &buf);
+        if (r == -ENOMEM)
                 return log_oom();
+        if (r < 0)
+                return log_error_errno(r, "Failed to patch options of tmpfs %s: %m", p);
         if (r > 0)
                 options = buf;
 
@@ -1187,7 +1247,7 @@ static int setup_volatile_yes(const char *directory, uid_t uid_shift, const char
                 return log_error_errno(r, "Failed to create temporary directory: %m");
 
         const char *options = "mode=0755" TMPFS_LIMITS_ROOTFS;
-        r = tmpfs_patch_options(options, uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &buf);
+        r = tmpfs_patch_options(options, uid_shift == 0 ? UID_INVALID : uid_shift, UID_INVALID, selinux_apifs_context, &buf);
         if (r < 0)
                 goto fail;
         if (r > 0)
@@ -1217,19 +1277,19 @@ static int setup_volatile_yes(const char *directory, uid_t uid_shift, const char
                 goto fail;
         }
 
-        r = mount_nofollow_verbose(LOG_ERR, f, t, NULL, MS_BIND|MS_REC, NULL);
+        r = mount_nofollow_verbose(LOG_ERR, f, t, /* fstype= */ NULL, MS_BIND|MS_REC, /* options= */ NULL);
         if (r < 0)
                 goto fail;
 
         bind_mounted = true;
 
-        r = bind_remount_recursive(t, MS_RDONLY, MS_RDONLY, NULL);
+        r = bind_remount_recursive(t, MS_RDONLY, MS_RDONLY, /* deny_list= */ NULL);
         if (r < 0) {
                 log_error_errno(r, "Failed to remount %s read-only: %m", t);
                 goto fail;
         }
 
-        r = mount_nofollow_verbose(LOG_ERR, template, directory, NULL, MS_MOVE, NULL);
+        r = mount_nofollow_verbose(LOG_ERR, template, directory, /* fstype= */ NULL, MS_MOVE, /* options= */ NULL);
         if (r < 0)
                 goto fail;
 
@@ -1263,7 +1323,7 @@ static int setup_volatile_overlay(const char *directory, uid_t uid_shift, const 
                 return log_error_errno(r, "Failed to create temporary directory: %m");
 
         options = "mode=0755" TMPFS_LIMITS_ROOTFS;
-        r = tmpfs_patch_options(options, uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &buf);
+        r = tmpfs_patch_options(options, uid_shift == 0 ? UID_INVALID : uid_shift, UID_INVALID, selinux_apifs_context, &buf);
         if (r < 0)
                 goto finish;
         if (r > 0)
@@ -1299,7 +1359,7 @@ static int setup_volatile_overlay(const char *directory, uid_t uid_shift, const 
         }
 
         options = strjoina("lowerdir=", escaped_directory, ",upperdir=", escaped_upper, ",workdir=", escaped_work);
-        r = mount_nofollow_verbose(LOG_ERR, "overlay", directory, "overlay", 0, options);
+        r = mount_nofollow_verbose(LOG_ERR, "overlay", directory, "overlay", /* flags= */ 0, options);
 
 finish:
         if (tmpfs_mounted)
@@ -1424,7 +1484,7 @@ int setup_pivot_root(const char *directory, const char *pivot_root_new, const ch
                 return log_oom();
 
         /* Remount directory_pivot_root_new to make it movable. */
-        r = mount_nofollow_verbose(LOG_ERR, directory_pivot_root_new, directory_pivot_root_new, NULL, MS_BIND, NULL);
+        r = mount_nofollow_verbose(LOG_ERR, directory_pivot_root_new, directory_pivot_root_new, /* fstype= */ NULL, MS_BIND, /* options= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1437,17 +1497,17 @@ int setup_pivot_root(const char *directory, const char *pivot_root_new, const ch
                 if (!pivot_tmp_pivot_root_old)
                         return log_oom();
 
-                r = mount_nofollow_verbose(LOG_ERR, directory_pivot_root_new, pivot_tmp, NULL, MS_MOVE, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, directory_pivot_root_new, pivot_tmp, /* fstype= */ NULL, MS_MOVE, /* options= */ NULL);
                 if (r < 0)
                         return r;
 
-                r = mount_nofollow_verbose(LOG_ERR, directory, pivot_tmp_pivot_root_old, NULL, MS_MOVE, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, directory, pivot_tmp_pivot_root_old, /* fstype= */ NULL, MS_MOVE, /* options= */ NULL);
                 if (r < 0)
                         return r;
 
-                r = mount_nofollow_verbose(LOG_ERR, pivot_tmp, directory, NULL, MS_MOVE, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, pivot_tmp, directory, /* fstype= */ NULL, MS_MOVE, /* options= */ NULL);
         } else
-                r = mount_nofollow_verbose(LOG_ERR, directory_pivot_root_new, directory, NULL, MS_MOVE, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, directory_pivot_root_new, directory, /* fstype= */ NULL, MS_MOVE, /* options= */ NULL);
 
         if (r < 0)
                 return r;
@@ -1466,11 +1526,11 @@ int pin_fully_visible_api_fs(void) {
         (void) mkdir_p(NSPAWN_PRIVATE_FULLY_VISIBLE_PROCFS, 0755);
         (void) mkdir_p(NSPAWN_PRIVATE_FULLY_VISIBLE_SYSFS, 0755);
 
-        r = mount_follow_verbose(LOG_ERR, "proc", NSPAWN_PRIVATE_FULLY_VISIBLE_PROCFS, "proc", PROC_DEFAULT_MOUNT_FLAGS, NULL);
+        r = mount_follow_verbose(LOG_ERR, "proc", NSPAWN_PRIVATE_FULLY_VISIBLE_PROCFS, "proc", PROC_DEFAULT_MOUNT_FLAGS, /* options= */ NULL);
         if (r < 0)
                 return r;
 
-        r = mount_follow_verbose(LOG_ERR, "sysfs", NSPAWN_PRIVATE_FULLY_VISIBLE_SYSFS, "sysfs", SYS_DEFAULT_MOUNT_FLAGS, NULL);
+        r = mount_follow_verbose(LOG_ERR, "sysfs", NSPAWN_PRIVATE_FULLY_VISIBLE_SYSFS, "sysfs", SYS_DEFAULT_MOUNT_FLAGS, /* options= */ NULL);
         if (r < 0)
                 return r;
 

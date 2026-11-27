@@ -32,6 +32,7 @@ int bus_set_address_capsule_bus(sd_bus *bus, const char *capsule, int *ret_pin_f
 
 int bus_connect_system_systemd(sd_bus **ret);
 int bus_connect_user_systemd(sd_bus **ret);
+int bus_connect_user_systemd_by_uid(uid_t uid, const char *description, sd_bus **ret);
 int bus_connect_capsule_systemd(const char *capsule, sd_bus **ret);
 int bus_connect_capsule_bus(const char *capsule, sd_bus **ret);
 
@@ -59,7 +60,7 @@ int bus_track_to_strv(sd_bus_track *t, char ***ret);
 
 int bus_open_system_watch_bind_with_description(sd_bus **ret, const char *description);
 static inline int bus_open_system_watch_bind(sd_bus **ret) {
-        return bus_open_system_watch_bind_with_description(ret, NULL);
+        return bus_open_system_watch_bind_with_description(ret, /* description= */ NULL);
 }
 
 int bus_reply_pair_array(sd_bus_message *m, char * const *l);

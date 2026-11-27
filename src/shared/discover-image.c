@@ -46,7 +46,6 @@
 #include "path-lookup.h"
 #include "path-util.h"
 #include "process-util.h"
-#include "recurse-dir.h"
 #include "rm-rf.h"
 #include "runtime-scope.h"
 #include "stat-util.h"
@@ -381,13 +380,13 @@ static int image_update_quota(Image *i, int fd) {
                 return -EOPNOTSUPP;
 
         if (fd < 0) {
-                fd_close = open(i->path, O_CLOEXEC|O_DIRECTORY);
+                fd_close = xopenat(AT_FDCWD, i->path, O_DIRECTORY);
                 if (fd_close < 0)
-                        return -errno;
+                        return fd_close;
                 fd = fd_close;
         } else {
                 /* Convert from O_PATH to proper fd, if needed */
-                fd = fd_reopen_condition(fd, O_CLOEXEC|O_DIRECTORY, O_PATH, &fd_close);
+                fd = fd_reopen_condition(fd, O_DIRECTORY, O_PATH, &fd_close);
                 if (fd < 0)
                         return fd;
         }
@@ -399,7 +398,7 @@ static int image_update_quota(Image *i, int fd) {
                 return 0;
 
         BtrfsQuotaInfo quota;
-        r = btrfs_subvol_get_subtree_quota_fd(fd, 0, &quota);
+        r = btrfs_subvol_get_subtree_quota_fd(fd, /* subvol_id= */ 0, &quota);
         if (r < 0)
                 return r;
 
@@ -437,9 +436,9 @@ static int image_make(
         _cleanup_close_ int _fd = -EBADF;
         if (fd < 0) {
                 /* If we didn't get an fd passed in, then let's pin it via O_PATH now */
-                _fd = open(path, O_PATH|O_CLOEXEC);
+                _fd = xopenat(AT_FDCWD, path, O_PATH);
                 if (_fd < 0)
-                        return -errno;
+                        return _fd;
 
                 fd = _fd;
                 st = NULL; /* refresh stat() data now that we have the inode pinned */
@@ -568,7 +567,7 @@ static int image_make(
 
                                 /* It's a btrfs subvolume */
 
-                                r = btrfs_subvol_get_info_fd(fd, 0, &info);
+                                r = btrfs_subvol_get_info_fd(fd, /* subvol_id= */ 0, &info);
                                 if (r < 0)
                                         return r;
 
@@ -608,7 +607,7 @@ static int image_make(
                               path,
                               read_only || (file_attr & FS_IMMUTABLE_FL),
                               crtime,
-                              0, /* we don't use mtime of stat() here, since it's not the time of last change of the tree, but only of the top-level dir */
+                              /* mtime= */ 0, /* we don't use mtime of stat() here, since it's not the time of last change of the tree, but only of the top-level dir */
                               fh,
                               on_mount_id,
                               (uint64_t) st->st_ino,
@@ -673,7 +672,7 @@ static int image_make(
                         r = extract_image_basename(
                                         path,
                                         /* class_suffix= */ NULL,
-                                        /* format_suffix= */ NULL,
+                                        /* format_suffixes= */ NULL,
                                         &pretty_buffer,
                                         /* ret_suffix= */ NULL);
                         if (r < 0)
@@ -682,9 +681,9 @@ static int image_make(
                         pretty = pretty_buffer;
                 }
 
-                _cleanup_close_ int block_fd = fd_reopen(fd, O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOCTTY);
+                _cleanup_close_ int block_fd = fd_reopen(fd, O_RDONLY|O_NONBLOCK|O_NOCTTY);
                 if (block_fd < 0)
-                        log_debug_errno(errno, "Failed to open block device '%s', ignoring: %m", path);
+                        log_debug_errno(block_fd, "Failed to open block device '%s', ignoring: %m", path);
                 else {
                         if (!read_only) {
                                 int state = 0;
@@ -707,8 +706,8 @@ static int image_make(
                               pretty,
                               path,
                               !(st->st_mode & 0222) || read_only,
-                              0,
-                              0,
+                              /* crtime= */ 0,
+                              /* mtime= */ 0,
                               fh,
                               on_mount_id,
                               (uint64_t) st->st_ino,
@@ -878,9 +877,9 @@ int image_find(RuntimeScope scope,
 
         _cleanup_close_ int rfd = XAT_FDROOT; /* We only expect absolute paths */
         if (root) {
-                rfd = open(root, O_CLOEXEC|O_DIRECTORY|O_PATH);
+                rfd = xopenat(AT_FDCWD, root, O_DIRECTORY|O_PATH);
                 if (rfd < 0)
-                        return log_debug_errno(errno, "Failed to open root directory '%s': %m", root);
+                        return log_debug_errno(rfd, "Failed to open root directory '%s': %m", root);
         }
 
         _cleanup_strv_free_ char **search = NULL;
@@ -914,7 +913,7 @@ int image_find(RuntimeScope scope,
                         if (r < 0)
                                 return r;
 
-                        r = chaseat_prefix_root(chased_path, root, &resolved_file);
+                        r = chaseat_make_absolute(chased_path, root, &resolved_file);
                         if (r < 0)
                                 return r;
 
@@ -962,6 +961,7 @@ int image_find(RuntimeScope scope,
                                               fname_path, /* This has to be the unresolved entry with the .v suffix */
                                               &filter,
                                               /* n_filters= */ 1,
+                                              /* match_root= */ root,
                                               PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                                               &result);
                                 if (r < 0) {
@@ -1085,9 +1085,9 @@ int image_discover(
 
         _cleanup_close_ int rfd = XAT_FDROOT;  /* We only expect absolute paths */
         if (root) {
-                rfd = open(root, O_CLOEXEC|O_DIRECTORY|O_PATH);
+                rfd = xopenat(AT_FDCWD, root, O_DIRECTORY|O_PATH);
                 if (rfd < 0)
-                        return log_debug_errno(errno, "Failed to open root directory '%s': %m", root);
+                        return log_debug_errno(rfd, "Failed to open root directory '%s': %m", root);
         }
 
         _cleanup_strv_free_ char **search = NULL;
@@ -1129,7 +1129,7 @@ int image_discover(
                         if (r < 0)
                                 return r;
 
-                        r = chaseat_prefix_root(chased_path, root, &resolved_file);
+                        r = chaseat_make_absolute(chased_path, root, &resolved_file);
                         if (r < 0)
                                 return r;
 
@@ -1184,6 +1184,7 @@ int image_discover(
                                                       fname_path, /* This has to be the unresolved entry with the .v suffix */
                                                       &filter,
                                                       /* n_filters= */ 1,
+                                                      /* match_root= */ root,
                                                       PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                                                       &result);
                                         if (r < 0) {
@@ -1227,7 +1228,7 @@ int image_discover(
                                 r = extract_image_basename(
                                                 fname,
                                                 /* class_suffix= */ NULL,
-                                                /* format_suffix= */ NULL,
+                                                /* format_suffixes= */ NULL,
                                                 &pretty,
                                                 /* ret_suffix= */ NULL);
                                 if (r < 0) {
@@ -1285,85 +1286,6 @@ int image_discover(
         return 0;
 }
 
-static int unpriv_remove_cb(
-                RecurseDirEvent event,
-                const char *path,
-                int dir_fd,
-                int inode_fd,
-                const struct dirent *de,
-                const struct statx *sx,
-                void *userdata) {
-
-        int r, userns_fd = PTR_TO_FD(userdata);
-
-        assert(sx);
-
-        if (event == RECURSE_DIR_ENTER &&
-            S_ISDIR(sx->stx_mode) &&
-            uid_is_foreign(sx->stx_uid)) {
-
-                /* This is owned by the foreign UID range, and a dir, let's remove it via mountfsd userns
-                 * shenanigans. */
-
-                _cleanup_close_ int tree_fd = -EBADF;
-                r = mountfsd_mount_directory_fd(
-                                /* vl= */ NULL,
-                                inode_fd,
-                                userns_fd,
-                                DISSECT_IMAGE_FOREIGN_UID,
-                                &tree_fd);
-                if (r < 0)
-                        return r;
-
-                /* Fork off child that moves into userns and does the copying */
-                r = pidref_safe_fork_full(
-                                "rm-tree",
-                                /* stdio_fds= */ NULL,
-                                (int[]) { userns_fd, tree_fd, }, 2,
-                                FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_WAIT|FORK_REOPEN_LOG,
-                                /* ret= */ NULL);
-                if (r < 0)
-                        log_debug_errno(r, "Process that was supposed to remove subtree '%s' failed, ignoring: %m", empty_to_root(path));
-                else if (r == 0) {
-                        /* child */
-
-                        r = namespace_enter(
-                                        /* pidns_fd= */ -EBADF,
-                                        /* mntns_fd= */ -EBADF,
-                                        /* netns_fd= */ -EBADF,
-                                        userns_fd,
-                                        /* root_fd= */ -EBADF);
-                        if (r < 0) {
-                                log_debug_errno(r, "Failed to join user namespace: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        _cleanup_close_ int dfd = fd_reopen(tree_fd, O_DIRECTORY|O_CLOEXEC);
-                        if (dfd < 0) {
-                                log_error_errno(r, "Failed to reopen tree fd: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        r = rm_rf_children(dfd, REMOVE_PHYSICAL|REMOVE_SUBVOLUME|REMOVE_CHMOD, /* root_dev= */ NULL);
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to empty '%s' directory in foreign UID mode: %m", empty_to_root(path));
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        _exit(EXIT_SUCCESS);
-                }
-
-                /* Don't descent further into this one, and delete it immediately */
-                return RECURSE_DIR_UNLINK_GRACEFUL;
-        }
-
-        /* Everything else try to remove */
-        if (event == RECURSE_DIR_LEAVE)
-                return RECURSE_DIR_UNLINK_GRACEFUL;
-
-        return RECURSE_DIR_CONTINUE;
-}
-
 static int unprivileged_remove(Image *i) {
         int r;
 
@@ -1371,26 +1293,63 @@ static int unprivileged_remove(Image *i) {
 
         /* We want this to work in complex .mstack/ hierarchies, where the main directory (and maybe a .v/
          * directory below or two) might be owned by the user themselves, but some subdirs might be owned by
-         * the foreign UID range. We deal with this by recursively descending down the tree, and removing
-         * foreign-owned ranges via userns shenanigans, and the rest just like that. */
+         * the foreign UID range, and where any of them might have restrictive access modes (e.g. 0700, as
+         * many OCI layers have). We deal with this by joining a user namespace that maps our own UID to root
+         * and the foreign UID range 1:1, in which we have full access to both, and emptying the directory
+         * there. The (then empty) directory itself is removed by the caller. */
 
-        _cleanup_close_ int userns_fd = nsresource_allocate_userns(
+        /* Open the image before joining the namespace, so that we don't empty the target of a symlink */
+        _cleanup_close_ int tree_fd = xopenat(AT_FDCWD, i->path, O_PATH|O_DIRECTORY|O_NOFOLLOW);
+        if (tree_fd < 0)
+                return log_debug_errno(tree_fd, "Failed to open '%s': %m", i->path);
+
+        _cleanup_close_ int userns_fd = nsresource_allocate_userns_self(
                         /* vl= */ NULL,
                         /* name= */ NULL,
-                        /* size= */ NSRESOURCE_UIDS_64K);
+                        /* map_foreign= */ true);
         if (userns_fd < 0)
-                return log_debug_errno(userns_fd, "Failed to allocate transient user namespace: %m");
+                return log_debug_errno(userns_fd, "Failed to allocate user namespace mapping the foreign UID range: %m");
 
-        r = recurse_dir_at(
-                        AT_FDCWD,
-                        i->path,
-                        /* statx_mask= */ STATX_TYPE|STATX_UID,
-                        /* n_depth_max= */ UINT_MAX,
-                        RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE|RECURSE_DIR_SAME_MOUNT|RECURSE_DIR_INODE_FD|RECURSE_DIR_TOPLEVEL,
-                        unpriv_remove_cb,
-                        FD_TO_PTR(userns_fd));
+        /* Fork off child that moves into userns and does the removing */
+        r = pidref_safe_fork_full(
+                        "rm-tree",
+                        /* stdio_fds= */ NULL,
+                        (int[]) { userns_fd, tree_fd, }, 2,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_WAIT|FORK_REOPEN_LOG,
+                        /* ret= */ NULL);
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Process that was supposed to empty '%s' failed: %m", i->path);
+        if (r == 0) {
+                /* child */
+
+                r = namespace_enter(
+                                /* pidns_fd= */ -EBADF,
+                                /* mntns_fd= */ -EBADF,
+                                /* netns_fd= */ -EBADF,
+                                userns_fd,
+                                /* root_fd= */ -EBADF);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to join user namespace: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                /* Only now we may be able to read the directory */
+                _cleanup_close_ int dfd = fd_reopen(tree_fd, O_DIRECTORY);
+                if (dfd < 0) {
+                        log_debug_errno(dfd, "Failed to reopen '%s': %m", i->path);
+                        _exit(EXIT_FAILURE);
+                }
+
+                /* No root_dev: we want to remove nested btrfs subvolumes.
+                 * No REMOVE_CHMOD: we can access everything anyway */
+                r = rm_rf_children(TAKE_FD(dfd), REMOVE_PHYSICAL|REMOVE_SUBVOLUME, /* root_dev= */ NULL);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to empty '%s' in foreign UID mode: %m", i->path);
+                        _exit(EXIT_FAILURE);
+                }
+
+                _exit(EXIT_SUCCESS);
+        }
 
         return 0;
 }
@@ -1430,7 +1389,7 @@ int image_remove(Image *i, RuntimeScope scope) {
 
         case IMAGE_DIRECTORY:
                 /* Allow deletion of read-only directories */
-                (void) chattr_path(i->path, 0, FS_IMMUTABLE_FL);
+                (void) chattr_path(i->path, /* value= */ 0, FS_IMMUTABLE_FL);
 
                 _fallthrough_;
 
@@ -1531,7 +1490,7 @@ int image_rename(Image *i, const char *new_name, RuntimeScope scope) {
         if (r < 0)
                 return r;
 
-        r = image_find(scope, IMAGE_MACHINE, new_name, NULL, NULL);
+        r = image_find(scope, IMAGE_MACHINE, new_name, /* root= */ NULL, /* ret= */ NULL);
         if (r >= 0)
                 return -EEXIST;
         if (r != -ENOENT)
@@ -1544,7 +1503,7 @@ int image_rename(Image *i, const char *new_name, RuntimeScope scope) {
                 (void) read_attr_at(AT_FDCWD, i->path, &file_attr);
 
                 if (file_attr & FS_IMMUTABLE_FL)
-                        (void) chattr_path(i->path, 0, FS_IMMUTABLE_FL);
+                        (void) chattr_path(i->path, /* value= */ 0, FS_IMMUTABLE_FL);
 
                 _fallthrough_;
         case IMAGE_SUBVOLUME:
@@ -1718,12 +1677,7 @@ static int unprivileged_clone(Image *i, const char *new_path, bool read_only) {
 
         /* Make new image */
         _cleanup_close_ int new_fd = -EBADF;
-        r = mountfsd_make_directory(
-                        link,
-                        new_path,
-                        MODE_INVALID,
-                        /* flags= */ 0,
-                        &new_fd);
+        r = mkdir_foreign(new_path, MODE_INVALID, &new_fd);
         if (r < 0)
                 return r;
 
@@ -1773,7 +1727,7 @@ int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope sco
         if (r < 0)
                 return r;
 
-        r = image_find(scope, i->class, new_name, NULL, NULL);
+        r = image_find(scope, i->class, new_name, /* root= */ NULL, /* ret= */ NULL);
         if (r >= 0)
                 return -EEXIST;
         if (r != -ENOENT)
@@ -1912,9 +1866,9 @@ int image_read_only(Image *i, bool b, RuntimeScope scope) {
                 _cleanup_close_ int fd = -EBADF;
                 int state = b;
 
-                fd = open(i->path, O_CLOEXEC|O_RDONLY|O_NONBLOCK|O_NOCTTY);
+                fd = xopenat(AT_FDCWD, i->path, O_RDONLY|O_NONBLOCK|O_NOCTTY);
                 if (fd < 0)
-                        return -errno;
+                        return fd;
 
                 r = fd_verify_block(fd);
                 if (r < 0)
@@ -1942,11 +1896,11 @@ static int make_lock_dir(RuntimeScope scope) {
         if (r < 0)
                 return r;
 
-        _cleanup_close_ int pfd = open_mkdir_at(AT_FDCWD, p, O_CLOEXEC, 0755);
+        _cleanup_close_ int pfd = open_mkdir_at(AT_FDCWD, p, /* flags= */ 0, 0755);
         if (pfd < 0)
                 return pfd;
 
-        _cleanup_close_ int nfd = open_mkdir_at(pfd, "nspawn", O_CLOEXEC, 0755);
+        _cleanup_close_ int nfd = open_mkdir_at(pfd, "nspawn", /* flags= */ 0, 0755);
         if (nfd < 0)
                 return nfd;
 
@@ -2081,9 +2035,9 @@ int image_set_limit(Image *i, uint64_t referenced_max) {
          * we didn't use to have a concept of subtree quota, and hence
          * only modified the subvolume quota. */
 
-        (void) btrfs_qgroup_set_limit(i->path, 0, referenced_max);
-        (void) btrfs_subvol_auto_qgroup(i->path, 0, true);
-        r = btrfs_subvol_set_subtree_quota_limit(i->path, 0, referenced_max);
+        (void) btrfs_qgroup_set_limit(i->path, /* qgroupid= */ 0, referenced_max);
+        (void) btrfs_subvol_auto_qgroup(i->path, /* subvol_id= */ 0, /* create_intermediary_qgroup= */ true);
+        r = btrfs_subvol_set_subtree_quota_limit(i->path, /* subvol_id= */ 0, referenced_max);
         if (r < 0)
                 return r;
 
@@ -2137,9 +2091,9 @@ int image_get_pool_usage(RuntimeScope scope, ImageClass class, uint64_t *ret) {
         if (r < 0)
                 return r;
 
-        _cleanup_close_ int fd = open(pool, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, pool, O_RDONLY|O_DIRECTORY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         BtrfsQuotaInfo q;
         r = btrfs_subvol_get_subtree_quota_fd(fd, /* subvol_id= */ 0, &q);
@@ -2162,9 +2116,9 @@ int image_get_pool_limit(RuntimeScope scope, ImageClass class, uint64_t *ret) {
         if (r < 0)
                 return r;
 
-        _cleanup_close_ int fd = open(pool, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, pool, O_RDONLY|O_DIRECTORY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         BtrfsQuotaInfo q;
         r = btrfs_subvol_get_subtree_quota_fd(fd, /* subvol_id= */ 0, &q);
@@ -2228,7 +2182,7 @@ int image_setup_pool(RuntimeScope scope, ImageClass class, bool use_btrfs_subvol
         return 0;
 }
 
-int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_policy, RuntimeScope scope) {
+int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_policy, RuntimeScope scope, DissectImageFlags extra_flags) {
         _cleanup_(release_lock_file) LockFile global_lock = LOCK_FILE_INIT, local_lock = LOCK_FILE_INIT;
         int r;
 
@@ -2256,7 +2210,7 @@ int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_pol
                                                        i->name);
                 }
 
-                r = chase("/etc/hostname", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path, NULL);
+                r = chase("/etc/hostname", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path, /* ret_fd= */ NULL);
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to chase /etc/hostname in image %s: %m", i->name);
                 else if (r >= 0) {
@@ -2271,7 +2225,7 @@ int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_pol
                 if (r < 0)
                         log_debug_errno(r, "Failed to read machine ID in image %s, ignoring: %m", i->name);
 
-                r = chase("/etc/machine-info", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path, NULL);
+                r = chase("/etc/machine-info", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path, /* ret_fd= */ NULL);
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to chase /etc/machine-info in image %s: %m", i->name);
                 else if (r >= 0) {
@@ -2316,7 +2270,8 @@ int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_pol
                         DISSECT_IMAGE_PIN_PARTITION_DEVICES |
                         DISSECT_IMAGE_VALIDATE_OS |
                         DISSECT_IMAGE_VALIDATE_OS_EXT |
-                        DISSECT_IMAGE_ALLOW_USERSPACE_VERITY;
+                        DISSECT_IMAGE_ALLOW_USERSPACE_VERITY |
+                        extra_flags;
 
                 r = loop_device_make_by_path(
                                 i->path,
@@ -2429,7 +2384,7 @@ int image_name_lock(
         return make_lock_file(p, operation, ret);
 }
 
-bool image_in_search_path(
+int image_in_search_path(
                 RuntimeScope scope,
                 ImageClass class,
                 const char *root,
@@ -2447,16 +2402,18 @@ bool image_in_search_path(
         if (r < 0)
                 return r;
 
-        STRV_FOREACH(path, search) {
-                const char *p, *q;
-                size_t k;
+        /* The directories in the search path are relative to the root directory, while the image path
+         * starts with the root directory. */
+        const char *q = image;
+        if (!empty_or_root(root)) {
+                q = path_startswith_full(image, root, PATH_STARTSWITH_RETURN_LEADING_SLASH);
+                if (!q)
+                        return false;
+        }
 
-                if (!empty_or_root(root)) {
-                        q = path_startswith(*path, root);
-                        if (!q)
-                                continue;
-                } else
-                        q = *path;
+        STRV_FOREACH(path, search) {
+                const char *p;
+                size_t k;
 
                 p = path_startswith(q, *path);
                 if (!p)
@@ -2486,7 +2443,7 @@ bool image_is_vendor(const struct Image *i) {
 bool image_is_host(const struct Image *i) {
         assert(i);
 
-        if (i->name && streq(i->name, ".host"))
+        if (streq_ptr(i->name, ".host"))
                 return true;
 
         if (i->path && path_equal(i->path, "/"))

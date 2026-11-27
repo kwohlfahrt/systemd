@@ -153,9 +153,9 @@ static int install_context_from_cmdline(
                 return log_oom();
 
         if (arg_root) {
-                b.root_fd = open(arg_root, O_CLOEXEC|O_DIRECTORY|O_PATH);
+                b.root_fd = xopenat(AT_FDCWD, arg_root, O_DIRECTORY|O_PATH);
                 if (b.root_fd < 0)
-                        return log_error_errno(errno, "Failed to open root directory '%s': %m", arg_root);
+                        return log_error_errno(b.root_fd, "Failed to open root directory '%s': %m", arg_root);
 
                 r = strdup_to(&b.root, arg_root);
                 if (r < 0)
@@ -284,7 +284,7 @@ static int load_etc_machine_info(InstallContext *c) {
                                 c->root_fd,
                                 "/etc/machine-info",
                                 CHASE_MUST_BE_REGULAR,
-                                O_RDONLY|O_CLOEXEC,
+                                O_RDONLY,
                                 /* ret_path= */ NULL);
         if (fd == -ENOENT)
                 return 0;
@@ -514,17 +514,19 @@ static int copy_file_with_version_check(
 
         _cleanup_free_ char *t = NULL;
         _cleanup_close_ int write_fd = -EBADF;
-        write_fd = open_tmpfile_linkable_at(dest_parent_fd, dest_filename, O_WRONLY|O_CLOEXEC, &t);
+        write_fd = open_tmpfile_linkable_at(dest_parent_fd, dest_filename, O_WRONLY, &t);
         if (write_fd < 0)
                 return log_error_errno(write_fd, "Failed to open \"%s\" for writing: %m", dest_path);
 
         CLEANUP_TMPFILE_AT(dest_parent_fd, t);
 
-        /* Reset file offset before we start copying, since we copy this file multiple times, and the offset
-         * might be left at the end of the file. (Resetting before rather than after a copy attempt is safer
-         * because a previous attempt might have failed half-way, leaving the file offset at some undefined
-         * place.) */
-        r = copy_bytes(source_fd, write_fd, UINT64_MAX, COPY_SEEK0_SOURCE);
+        r = copy_bytes_offset(
+                        source_fd,
+                        /* foffset= */ &(uint64_t) { 0 },
+                        write_fd,
+                        /* toffset= */ NULL,
+                        /* max_bytes= */ UINT64_MAX,
+                        /* copy_flags= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to copy data from \"%s\" to \"%s\": %m", source_path, dest_path);
 
@@ -639,7 +641,7 @@ static int update_efi_boot_binaries(
                 if (strcaseeq_ptr(ignore_filename, de->d_name))
                         continue;
 
-                fd = xopenat_full(dirfd(d), de->d_name, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW, XO_REGULAR, /* mode= */ MODE_INVALID);
+                fd = xopenat_full(dirfd(d), de->d_name, O_RDONLY|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW, XO_REGULAR, MODE_INVALID);
                 if (fd < 0)
                         return log_error_errno(fd, "Failed to open \"%s/%s\" for reading: %m", j, de->d_name);
 
@@ -667,6 +669,7 @@ static int update_efi_boot_binaries(
 static int copy_one_file(
                 InstallContext *c,
                 const char *name,
+                bool from_image,
                 bool force) {
 
         int r, ret = 0;
@@ -684,27 +687,30 @@ static int copy_one_file(
         if (!sp)
                 return log_oom();
 
+        /* Prefer the directory we enumerated. In auto mode, retain the per-file host fallback for
+         * image entries that disappeared or are dangling symlinks. */
         _cleanup_free_ char *source_path = NULL;
         _cleanup_close_ int source_fd = -EBADF;
-        if (IN_SET(c->install_source, INSTALL_SOURCE_AUTO, INSTALL_SOURCE_IMAGE)) {
+        if (from_image) {
                 source_fd = chase_and_openat(
                                 c->root_fd,
                                 c->root_fd,
                                 sp,
                                 CHASE_MUST_BE_REGULAR,
-                                O_RDONLY|O_CLOEXEC,
+                                O_RDONLY,
                                 &source_path);
                 if (source_fd < 0 && (source_fd != -ENOENT || c->install_source != INSTALL_SOURCE_AUTO))
                         return log_error_errno(source_fd, "Failed to resolve path '%s' under directory '%s': %m", sp, c->root);
-
-                /* If we had a root directory to try, we didn't find it and we are in auto mode, retry on the host */
+                if (source_fd < 0)
+                        log_debug("'%s' not found under '%s', trying the host.",
+                                  sp, empty_to_root(c->root));
         }
         if (source_fd < 0) {
                 source_fd = chase_and_open(
                                 sp,
                                 /* root= */ NULL,
                                 CHASE_MUST_BE_REGULAR,
-                                O_RDONLY|O_CLOEXEC,
+                                O_RDONLY,
                                 &source_path);
                 if (source_fd < 0)
                         return log_error_errno(source_fd, "Failed to resolve path '%s': %m", sp);
@@ -731,7 +737,7 @@ static int copy_one_file(
         if (!dest_path)
                 return log_oom();
 
-        _cleanup_close_ int dest_fd = xopenat_full(dest_parent_fd, dest_name, O_RDONLY|O_CLOEXEC, XO_REGULAR, MODE_INVALID);
+        _cleanup_close_ int dest_fd = xopenat_full(dest_parent_fd, dest_name, O_RDONLY, XO_REGULAR, MODE_INVALID);
         if (dest_fd < 0 && dest_fd != -ENOENT)
                 return log_error_errno(dest_fd, "Failed to open '%s' under '%s/EFI/systemd' directory: %m", dest_name, j);
 
@@ -763,7 +769,7 @@ static int copy_one_file(
                          * fallback yet, LoaderInfo is unavailable, or there is a mismatch, then
                          * overwrite it with the current primary. */
                         bool should_rotate = true;
-                        _cleanup_close_ int fallback_fd = xopenat_full(dest_parent_fd, fallback_name, O_RDONLY|O_CLOEXEC, XO_REGULAR, MODE_INVALID);
+                        _cleanup_close_ int fallback_fd = xopenat_full(dest_parent_fd, fallback_name, O_RDONLY, XO_REGULAR, MODE_INVALID);
                         if (fallback_fd >= 0) {
                                 _cleanup_free_ char *loader_info = NULL, *fallback_version = NULL;
 
@@ -809,7 +815,7 @@ static int copy_one_file(
                 if (!default_dest_path)
                         return log_oom();
 
-                _cleanup_close_ int default_dest_fd = xopenat_full(default_dest_parent_fd, boot_dot_efi, O_RDONLY|O_CLOEXEC, XO_REGULAR, MODE_INVALID);
+                _cleanup_close_ int default_dest_fd = xopenat_full(default_dest_parent_fd, boot_dot_efi, O_RDONLY, XO_REGULAR, MODE_INVALID);
                 if (default_dest_fd < 0 && default_dest_fd != -ENOENT)
                         return log_error_errno(default_dest_fd, "Failed to open '%s' under '%s/EFI/BOOT' directory: %m", boot_dot_efi, j);
 
@@ -824,16 +830,44 @@ static int copy_one_file(
         return ret;
 }
 
+static int dir_has_boot_loader(DIR *d, const char *path, const char *arch) {
+        /* Checks whether the directory has the systemd-boot binary that install_binaries() is supposed to
+         * install. Only systemd-boot itself counts, not any other EFI binary that happens to match. Unless
+         * installing for all architectures, it also has to be the one for the requested architecture, i.e.
+         * the one that copy_one_file() also installs as BOOT<ARCH>.EFI, and not e.g.
+         * "systemd-boot-extrax64.efi". */
+
+        assert(d);
+        assert(path);
+
+        const char *suffix = strjoina(strempty(arch), ".efi");
+        const char *suffix_signed = strjoina(strempty(arch), ".efi.signed");
+
+        FOREACH_DIRENT(de, d, return log_error_errno(errno, "Failed to read \"%s\": %m", path)) {
+                if (!endswith_no_case(de->d_name, suffix) && !endswith_no_case(de->d_name, suffix_signed))
+                        continue;
+
+                const char *e = startswith(de->d_name, "systemd-boot");
+                if (e && (isempty(arch) || STRCASE_IN_SET(e, suffix, suffix_signed)))
+                        return true;
+        }
+
+        return false;
+}
+
 static int install_binaries(
                 InstallContext *c,
                 const char *arch) {
 
-        int r;
+        int r, ret = 0;
 
         assert(c);
 
+        const char *fn = strjoina("systemd-boot", isempty(arch) ? "*" : arch, ".efi");
+
         _cleanup_free_ char *source_path = NULL;
         _cleanup_closedir_ DIR *d = NULL;
+        bool from_image = false, found_loader = false;
         if (IN_SET(c->install_source, INSTALL_SOURCE_AUTO, INSTALL_SOURCE_IMAGE)) {
                 r = chase_and_opendirat(
                                 c->root_fd,
@@ -844,30 +878,82 @@ static int install_binaries(
                                 &d);
                 if (r < 0 && (r != -ENOENT || c->install_source != INSTALL_SOURCE_AUTO))
                         return log_error_errno(r, "Failed to resolve path '%s' under directory '%s': %m", BOOTLIBDIR, c->root);
+                if (r >= 0) {
+                        r = dir_has_boot_loader(d, source_path, arch);
+                        if (r < 0)
+                                return r;
+
+                        found_loader = r > 0;
+
+                        /* In auto mode, also try the host if the image has no boot loader for us. Without a
+                         * root directory, the image is the host, there is nothing else to try then. */
+                        from_image = found_loader || c->install_source == INSTALL_SOURCE_IMAGE || !c->root;
+                        if (!from_image)
+                                log_debug("No '%s' boot loader binary found in '%s' under '%s', trying the host.",
+                                          fn, source_path, c->root);
+                }
 
                 /* If we had a root directory to try, we didn't find it and we are in auto mode, retry on the host */
         }
-        if (!d) {
+        if (!from_image) {
+                d = safe_closedir(d);
+                _cleanup_free_ char *image_source_path = TAKE_PTR(source_path);
+
                 r = chase_and_opendir(
                                 BOOTLIBDIR,
                                 /* root= */ NULL,
                                 CHASE_MUST_BE_DIRECTORY,
                                 &source_path,
                                 &d);
+                if (r == -ENOENT && image_source_path) {
+                        /* The image's source directory lacks a suitable boot loader and the host has no
+                         * source directory at all: report the boot loader missing from the image. */
+                        if (c->graceful) {
+                                log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
+                                         "No '%s' boot loader binary found in '%s' under '%s', skipping.",
+                                         fn, image_source_path, c->root);
+                                return 0;
+                        }
+
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
+                                               "No '%s' boot loader binary found in '%s' under '%s'.",
+                                               fn, image_source_path, c->root);
+                }
                 if (r == -ENOENT && c->graceful) {
                         log_debug("Source directory '%s' does not exist, ignoring.", BOOTLIBDIR);
                         return 0;
                 }
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve path '%s': %m", BOOTLIBDIR);
+
+                r = dir_has_boot_loader(d, source_path, arch);
+                if (r < 0)
+                        return r;
+
+                found_loader = r > 0;
         }
 
-        const char *suffix = strjoina(arch, ".efi");
-        const char *suffix_signed = strjoina(arch, ".efi.signed");
+        /* An existing source directory without a suitable boot loader is no better than a missing one:
+         * don't claim success if there is nothing to install (#41312). Check this before copying anything,
+         * so that a failed installation doesn't leave other binaries behind in /EFI/systemd/, which would
+         * make systemd-boot look installed. */
+        if (!found_loader) {
+                if (c->graceful) {
+                        log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
+                                 "No '%s' boot loader binary found in '%s', skipping.", fn, source_path);
+                        return 0;
+                }
+
+                return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
+                                       "No '%s' boot loader binary found in '%s'.", fn, source_path);
+        }
+
+        rewinddir(d);
+
+        const char *suffix = strjoina(strempty(arch), ".efi");
+        const char *suffix_signed = strjoina(strempty(arch), ".efi.signed");
 
         FOREACH_DIRENT(de, d, return log_error_errno(errno, "Failed to read \"%s\": %m", source_path)) {
-                int k;
-
                 if (endswith_no_case(de->d_name, suffix)) {
                         /* skip the .efi file, if there's a .signed version of it */
                         _cleanup_free_ const char *s = strjoin(de->d_name, ".signed");
@@ -878,15 +964,15 @@ static int install_binaries(
                 } else if (!endswith_no_case(de->d_name, suffix_signed))
                         continue;
 
-                k = copy_one_file(c, de->d_name, c->operation == INSTALL_NEW);
+                r = copy_one_file(c, de->d_name, from_image, c->operation == INSTALL_NEW);
                 /* Don't propagate an error code if no update necessary, installed version already equal or
                  * newer version, or other boot loader in place. */
-                if (c->graceful && IN_SET(k, -ESTALE, -ESRCH))
+                if (c->graceful && IN_SET(r, -ESTALE, -ESRCH))
                         continue;
-                RET_GATHER(r, k);
+                RET_GATHER(ret, r);
         }
 
-        return r;
+        return ret;
 }
 
 static int install_loader_config(InstallContext *c) {
@@ -920,7 +1006,7 @@ static int install_loader_config(InstallContext *c) {
 
         _cleanup_free_ char *t = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        r = fopen_tmpfile_linkable_at(loader_dir_fd, "loader.conf", O_WRONLY|O_CLOEXEC, &t, &f);
+        r = fopen_tmpfile_linkable_at(loader_dir_fd, "loader.conf", O_WRONLY, &t, &f);
         if (r < 0)
                 return log_error_errno(r, "Failed to open '%s/loader/loader.conf' for writing: %m", j);
 
@@ -975,7 +1061,7 @@ static int install_loader_specification(InstallContext *c) {
 
         _cleanup_free_ char *t = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        r = fopen_tmpfile_linkable_at(loader_dir_fd, "entries.srel", O_WRONLY|O_CLOEXEC, &t, &f);
+        r = fopen_tmpfile_linkable_at(loader_dir_fd, "entries.srel", O_WRONLY, &t, &f);
         if (r < 0)
                 return log_error_errno(r, "Failed to open '%s/loader/entries.srel' for writing: %m", j);
 
@@ -1042,7 +1128,8 @@ static int install_entry_token(InstallContext *c) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open '%s': %m", j);
 
-        r = write_string_file_at(dfd, "entry-token", c->entry_token, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_MKDIR_0755);
+        r = write_string_file_at(dfd, "entry-token", c->entry_token,
+                WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_MKDIR_0755|WRITE_STRING_FILE_VERIFY_ON_FAILURE);
         if (r < 0)
                 return log_error_errno(r, "Failed to write entry token '%s' to '%s/entry-token': %m", c->entry_token, j);
 
@@ -1201,7 +1288,7 @@ static int install_secure_boot_auto_enroll(InstallContext *c) {
                         return log_oom();
 
                 _cleanup_free_ char *t = NULL;
-                _cleanup_close_ int fd = open_tmpfile_linkable_at(keys_fd, filename, O_WRONLY|O_CLOEXEC, &t);
+                _cleanup_close_ int fd = open_tmpfile_linkable_at(keys_fd, filename, O_WRONLY, &t);
                 if (fd < 0)
                         return log_error_errno(fd, "Failed to open secure boot auto-enrollment file for writing: %m");
 
@@ -1217,7 +1304,7 @@ static int install_secure_boot_auto_enroll(InstallContext *c) {
 
                 r = link_tmpfile_at(fd, keys_fd, t, filename, LINK_TMPFILE_SYNC);
                 if (r < 0)
-                        return log_error_errno(errno, "Failed to link secure boot auto-enrollment file: %m");
+                        return log_error_errno(r, "Failed to link secure boot auto-enrollment file: %m");
 
                 t = mfree(t); /* Disarm CLEANUP_TMPFILE_AT() */
 
@@ -1235,7 +1322,7 @@ static bool same_entry(uint16_t id, sd_id128_t uuid, const char *path) {
         sd_id128_t ouuid;
         int r;
 
-        r = efi_get_boot_option(id, NULL, &ouuid, &opath, NULL);
+        r = efi_get_boot_option(id, /* ret_title= */ NULL, &ouuid, &opath, /* ret_active= */ NULL);
         if (r < 0)
                 return false;
         if (!sd_id128_equal(uuid, ouuid))
@@ -1534,7 +1621,7 @@ static int are_we_installed(InstallContext *c) {
                         c->esp_fd,
                         "/EFI/systemd",
                         CHASE_PROHIBIT_SYMLINKS|CHASE_MUST_BE_DIRECTORY,
-                        O_RDONLY|O_CLOEXEC|O_DIRECTORY,
+                        O_RDONLY|O_DIRECTORY,
                         /* ret_path= */ NULL);
         if (fd == -ENOENT)
                 return 0;
@@ -1573,39 +1660,27 @@ static int load_secure_boot_auto_enroll(
                         return r;
         }
 
-        _cleanup_(X509_freep) X509 *certificate = NULL;
-        r = openssl_load_x509_certificate(
-                        arg_certificate_source_type,
-                        arg_certificate_source,
-                        arg_certificate,
-                        &certificate);
-        if (r < 0)
-                return log_error_errno(r, "Failed to load X.509 certificate from %s: %m", arg_certificate);
-
         if (arg_private_key_source_type == OPENSSL_KEY_SOURCE_FILE) {
                 r = parse_path_argument(arg_private_key, /* suppress_root= */ false, &arg_private_key);
                 if (r < 0)
                         return r;
         }
 
-        r = openssl_load_private_key(
+        r = openssl_load_key_pair(
                         arg_private_key_source_type,
                         arg_private_key_source,
                         arg_private_key,
-                        &(AskPasswordRequest) {
-                                .tty_fd = -EBADF,
-                                .id = "bootctl-private-key-pin",
-                                .keyring = arg_private_key,
-                                .credential = "bootctl.private-key-pin",
-                                .until = USEC_INFINITY,
-                                .hup_fd = -EBADF,
-                        },
+                        arg_certificate_source_type,
+                        arg_certificate_source,
+                        arg_certificate,
+                        /* public_key= */ NULL,
+                        ASK_PASSWORD_PRIVATE_KEY_PIN("bootctl", arg_private_key),
                         ret_private_key,
+                        ret_certificate,
+                        /* ret_public_key= */ NULL,
                         ret_ui);
         if (r < 0)
-                return log_error_errno(r, "Failed to load private key from %s: %m", arg_private_key);
-
-        *ret_certificate = TAKE_PTR(certificate);
+                return r;
 
         return 0;
 }
@@ -1806,7 +1881,7 @@ static int remove_boot_efi(InstallContext *c) {
                 if (!z)
                         return log_oom();
 
-                fd = xopenat_full(dirfd(d), de->d_name, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW, XO_REGULAR, /* mode= */ MODE_INVALID);
+                fd = xopenat_full(dirfd(d), de->d_name, O_RDONLY|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW, XO_REGULAR, MODE_INVALID);
                 if (fd == -ENOENT)
                         continue;
                 if (fd < 0)
@@ -1953,11 +2028,12 @@ static int remove_loader_variables(void) {
                        EFI_LOADER_VARIABLE_STR("LoaderEntrySysFail"),
                        EFI_LOADER_VARIABLE_STR("LoaderEntryLastBooted"),
                        EFI_LOADER_VARIABLE_STR("LoaderEntryOneShot"),
+                       EFI_LOADER_VARIABLE_STR("LoaderFactoryResetVariables"),
                        EFI_LOADER_VARIABLE_STR("LoaderSystemToken")) {
 
                 int q;
 
-                q = efi_set_variable(var, NULL, 0);
+                q = efi_set_variable(var, /* value= */ NULL, /* size= */ 0);
                 if (q == -ENOENT)
                         continue;
                 if (q < 0)
@@ -2159,9 +2235,9 @@ int vl_method_install(
                                 p.context.root = mfree(p.context.root);
                 }
         } else if (p.context.root) {
-                p.context.root_fd = open(p.context.root, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                p.context.root_fd = xopenat(AT_FDCWD, p.context.root, O_RDONLY|O_DIRECTORY);
                 if (p.context.root_fd < 0)
-                        return log_debug_errno(errno, "Failed to open '%s': %m", p.context.root);
+                        return log_debug_errno(p.context.root_fd, "Failed to open '%s': %m", p.context.root);
         } else
                 p.context.root_fd = XAT_FDROOT;
 
@@ -2180,7 +2256,7 @@ int vl_method_install(
                         &p.context.esp_uuid,
                         /* ret_devid= */ NULL);
         if (r == -ENOKEY)
-                return sd_varlink_error(link, "io.systemd.BootControl.NoESPFound", NULL);
+                return sd_varlink_error(link, "io.systemd.BootControl.NoESPFound", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
@@ -2197,9 +2273,9 @@ int vl_method_install(
 
         r = run_install(&p.context);
         if (r == -EUNATCH) /* no boot entry token is set */
-                return sd_varlink_error(link, "io.systemd.BootControl.BootEntryTokenUnavailable", NULL);
+                return sd_varlink_error(link, "io.systemd.BootControl.BootEntryTokenUnavailable", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }

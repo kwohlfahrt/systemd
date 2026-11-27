@@ -244,14 +244,11 @@ int config_parse_delegate_dns_servers(
         }
 
         /* Otherwise, add to the list */
-        for (;;) {
+        for (const char *p = rvalue;;) {
                 _cleanup_free_ char *word = NULL;
-                r = extract_first_word(&rvalue, &word, NULL, 0);
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse DNS server string '%s', ignoring.", rvalue);
-                        return 0;
-                }
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
                         break;
 
@@ -271,7 +268,7 @@ int config_parse_delegate_dns_servers(
                         continue;
 
                 /* By default, the port number is determined with the transaction feature level.
-                 * See dns_transaction_port() and dns_server_port(). */
+                 * See dns_server_transport_port() and dns_server_port(). */
                 if (IN_SET(port, 53, 853))
                         port = 0;
 
@@ -329,14 +326,11 @@ int config_parse_delegate_domains(
         }
 
         /* Otherwise, add to the list */
-        for (;;) {
+        for (const char *p = rvalue;;) {
                 _cleanup_free_ char *word = NULL;
-                r = extract_first_word(&rvalue, &word, NULL, 0);
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse search domains string '%s', ignoring.", rvalue);
-                        return 0;
-                }
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
                         break;
 

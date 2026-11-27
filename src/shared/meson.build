@@ -48,6 +48,7 @@ shared_sources = files(
         'condition.c',
         'conf-parser.c',
         'copy.c',
+        'counters-file.c',
         'coredump-util.c',
         'cpu-set-util.c',
         'creds-util.c',
@@ -55,6 +56,7 @@ shared_sources = files(
         'cryptsetup-fido2.c',
         'cryptsetup-tpm2.c',
         'cryptsetup-util.c',
+        'csi-inband-resize.c',
         'curl-util.c',
         'daemon-util.c',
         'data-fd-util.c',
@@ -63,7 +65,6 @@ shared_sources = files(
         'dissect-image.c',
         'dm-util.c',
         'dns-answer.c',
-        'dns-configuration.c',
         'dns-domain.c',
         'dns-packet.c',
         'dns-question.c',
@@ -95,7 +96,9 @@ shared_sources = files(
         'gnutls-util.c',
         'gpt.c',
         'group-record.c',
+        'hexdump.c',
         'hibernate-util.c',
+        'host-properties.c',
         'hostname-setup.c',
         'hwdb-util.c',
         'id128-print.c',
@@ -108,6 +111,7 @@ shared_sources = files(
         'install-file.c',
         'install-printf.c',
         'install.c',
+        'io-uring-filter.c',
         'ioprio-util.c',
         'ip-protocol-list.c',
         'ipvlan-util.c',
@@ -126,6 +130,7 @@ shared_sources = files(
         'libfido2-util.c',
         'libmount-util.c',
         'local-addresses.c',
+        'lock-util.c',
         'locale-setup.c',
         'log-assert-critical.c',
         'logs-show.c',
@@ -140,6 +145,7 @@ shared_sources = files(
         'machine-util.c',
         'macvlan-util.c',
         'main-func.c',
+        'manifest-util.c',
         'metrics.c',
         'microhttpd-util.c',
         'mkdir.c',
@@ -156,6 +162,7 @@ shared_sources = files(
         'nsflags.c',
         'nsresource.c',
         'numa-util.c',
+        'object-tags.c',
         'open-file.c',
         'options.c',
         'osc-context.c',
@@ -168,15 +175,19 @@ shared_sources = files(
         'password-quality-util-pwquality.c',
         'pcre2-util.c',
         'pcrextend-util.c',
+        'pe-addon.c',
         'pe-binary.c',
+        'pe-writer.c',
         'pkcs7-util.c',
         'pkcs11-util.c',
         'plymouth-util.c',
         'polkit-agent.c',
         'portable-util.c',
+        'predict-measure.c',
         'pretty-print.c',
         'printk-util.c',
         'prompt-util.c',
+        'ptybroker-client.c',
         'ptyfwd.c',
         'qmp-client.c',
         'qrcode-util.c',
@@ -203,6 +214,7 @@ shared_sources = files(
         'socket-label.c',
         'socket-netlink.c',
         'specifier.c',
+        'ssh-util.c',
         'ssl-util.c',
         'storage-util.c',
         'switch-root.c',
@@ -212,20 +224,23 @@ shared_sources = files(
         'tomoyo-util.c',
         'tpm2-util.c',
         'tpm2-event-log.c',
-        'tsm-report.c',
+        'uapi16-manifest.c',
         'udev-util.c',
         'unit-file.c',
+        'unit-result.c',
         'user-record-nss.c',
         'user-record-show.c',
         'user-record.c',
         'userdb-dropin.c',
         'userdb.c',
+        'validatefs-util.c',
         'varlink-idl-common.c',
         'varlink-io.systemd.AskPassword.c',
         'varlink-io.systemd.BootControl.c',
         'varlink-io.systemd.Credentials.c',
         'varlink-io.systemd.CryptEnroll.c',
         'varlink-io.systemd.FactoryReset.c',
+        'varlink-io.systemd.FirstBoot.c',
         'varlink-io.systemd.Hostname.c',
         'varlink-io.systemd.Import.c',
         'varlink-io.systemd.InstanceMetadata.c',
@@ -246,21 +261,27 @@ shared_sources = files(
         'varlink-io.systemd.Network.Link.c',
         'varlink-io.systemd.PCRExtend.c',
         'varlink-io.systemd.PCRLock.c',
+        'varlink-io.systemd.PTYBroker.c',
         'varlink-io.systemd.Repart.c',
         'varlink-io.systemd.Report.c',
         'varlink-io.systemd.Report.Signer.c',
         'varlink-io.systemd.Report.Uploader.c',
         'varlink-io.systemd.Resolve.c',
         'varlink-io.systemd.Resolve.Hook.c',
+        'varlink-io.systemd.Resolve.Link.c',
         'varlink-io.systemd.Resolve.Monitor.c',
+        'varlink-io.systemd.ResourceProvider.c',
         'varlink-io.systemd.Shutdown.c',
         'varlink-io.systemd.StorageProvider.c',
         'varlink-io.systemd.SysInstall.c',
         'varlink-io.systemd.SysUpdate.c',
         'varlink-io.systemd.SysUpdate.Notify.c',
+        'varlink-io.systemd.SysUpdate.Provider.c',
+        'varlink-io.systemd.Timedate.c',
         'varlink-io.systemd.Udev.c',
         'varlink-io.systemd.Unit.c',
         'varlink-io.systemd.UserDatabase.c',
+        'varlink-io.systemd.VarlinkMonitor.c',
         'varlink-io.systemd.VirtualMachineInstance.c',
         'varlink-io.systemd.oom.c',
         'varlink-io.systemd.oom.Prekill.c',
@@ -270,14 +291,16 @@ shared_sources = files(
         'vconsole-util.c',
         'verb-log-control.c',
         'verbs.c',
+        'vfat-util.c',
         'vlan-util.c',
+        'voa-util.c',
         'volatile-util.c',
         'vpick.c',
         'vsock-util.c',
         'wall.c',
         'watchdog.c',
-        'web-util.c',
         'wifi-util.c',
+        'xattr-match.c',
         'xml.c',
 )
 
@@ -288,7 +311,8 @@ endif
 syscall_list_inc = custom_target(
         input : syscall_list_txt,
         output : 'syscall-list.inc',
-        command : [files('generate-syscall-list.py'),
+        command : [python,
+                   files('generate-syscall-list.py'),
                    '@INPUT@'],
         capture : true)
 
@@ -307,8 +331,16 @@ if conf.get('HAVE_LIBBPF') == 1
         shared_sources += files('bpf-link.c')
 endif
 
-if conf.get('HAVE_TPM2') == 1
-        shared_sources += files('tpm2-report.c')
+if conf.get('ENABLE_REPORT') == 1
+        shared_sources += files('tsm-report.c')
+
+        if conf.get('HAVE_TPM2') == 1
+                shared_sources += files('tpm2-report.c')
+        endif
+endif
+
+if conf.get('HAVE_OPENSSL') == 1
+        shared_sources += files('authenticode.c')
 endif
 
 generate_ip_protocol_list = files('generate-ip-protocol-list.sh')
@@ -321,13 +353,13 @@ ip_protocol_list_txt = custom_target(
 gperf_file = custom_target(
         input : ip_protocol_list_txt,
         output : 'ip-protocol-from-name.gperf',
-        command : [generate_gperfs, 'ip_protocol', 'IPPROTO_', '@INPUT@', '<netinet/in.h>'],
+        command : [python, generate_gperfs, 'ip_protocol', 'IPPROTO_', '@INPUT@', '<netinet/in.h>'],
         capture : true)
 
 target1 = custom_target(
         input : gperf_file,
         output : 'ip-protocol-from-name.inc',
-        command : [gperf,
+        command : [gperf_cmdline,
                    '-L', 'ANSI-C', '-t', '--ignore-case',
                    '-N', 'lookup_ip_protocol',
                    '-H', 'hash_ip_protocol_name',
@@ -372,7 +404,8 @@ dns_type_list_txt = custom_target(
 gperf_file = custom_target(
         input : dns_type_list_txt,
         output : 'dns_type-from-name.gperf',
-        command : [files('generate-dns_type-gperf.py'),
+        command : [python,
+                   files('generate-dns_type-gperf.py'),
                    'dns_type',
                    'DNS_TYPE_',
                    '@INPUT@'],
@@ -381,7 +414,7 @@ gperf_file = custom_target(
 dns_type_from_name_inc = custom_target(
         input : gperf_file,
         output : 'dns_type-from-name.inc',
-        command : [gperf,
+        command : [gperf_cmdline,
                    '-L', 'ANSI-C', '-t', '--ignore-case',
                    '-N', 'lookup_dns_type',
                    '-H', 'hash_dns_type_name',
@@ -431,8 +464,8 @@ libshared_deps = [libacl_cflags,
                   libzstd_cflags,
                   tpm2_cflags]
 
-libshared_sym_path = meson.current_source_dir() / 'libshared.sym'
-libshared_build_dir = meson.current_build_dir()
+libshared_sym = files('libshared.sym')
+libshared_sym_path = relative_source_path / 'src/shared/libshared.sym'
 
 libshared_static = static_library(
         libshared_name,
@@ -451,7 +484,7 @@ libshared = shared_library(
         c_args : ['-fvisibility=default'],
         link_args : ['-shared',
                      '-Wl,--version-script=' + libshared_sym_path],
-        link_depends : libshared_sym_path,
+        link_depends : libshared_sym,
         link_whole : [libc_wrapper_static,
                       libshared_static,
                       libbasic_static,

@@ -57,8 +57,7 @@ dnsmasq_pid_file = '/run/networkd-ci/test-dnsmasq.pid'
 dnsmasq_log_file = '/run/networkd-ci/test-dnsmasq.log'
 dnsmasq_lease_file = '/run/networkd-ci/test-dnsmasq.lease'
 
-isc_dhcpd_pid_file = '/run/networkd-ci/test-isc-dhcpd.pid'
-isc_dhcpd_lease_file = '/run/networkd-ci/test-isc-dhcpd.lease'
+kea_dhcp6_unit = 'networkd-test-kea-dhcp6.service'
 
 radvd_pid_file = '/run/networkd-ci/test-radvd.pid'
 
@@ -941,16 +940,26 @@ def read_dnsmasq_log_file():
         return f.read()
 
 
-def start_isc_dhcpd(conf_file, ipv, interface='veth-peer'):
+def start_kea_dhcp6(conf_file):
+    # kea-dhcp6 does not daemonize, hence run it in a transient unit. The configuration files tell it to
+    # keep leases and the server ID in memory only. The PID file and the lock file for logging cannot be
+    # configured there, hence redirect the former to our directory and disable the latter.
     conf_file_path = os.path.join(networkd_ci_temp_dir, conf_file)
-    isc_dhcpd_command = f'dhcpd {ipv} -cf {conf_file_path} -lf {isc_dhcpd_lease_file} -pf {isc_dhcpd_pid_file} {interface}'  # fmt: skip
-    touch(isc_dhcpd_lease_file)
-    check_output(isc_dhcpd_command)
+    check_output(
+        'systemd-run',
+        f'--unit={kea_dhcp6_unit}',
+        '--service-type=exec',
+        f'--setenv=KEA_PIDFILE_DIR={networkd_ci_temp_dir}',
+        '--setenv=KEA_LOCKFILE_DIR=none',
+        'kea-dhcp6',
+        '-c',
+        conf_file_path,
+    )
 
 
-def stop_isc_dhcpd():
-    stop_by_pid_file(isc_dhcpd_pid_file)
-    rm_f(isc_dhcpd_lease_file)
+def stop_kea_dhcp6():
+    call_quiet(f'systemctl stop {kea_dhcp6_unit}')
+    call_quiet(f'systemctl reset-failed {kea_dhcp6_unit}')
 
 
 def get_dbus_link_path(link):
@@ -1228,7 +1237,7 @@ def setup_common():
 def tear_down_common():
     # 1. stop DHCP/RA servers
     stop_dnsmasq()
-    stop_isc_dhcpd()
+    stop_kea_dhcp6()
     stop_radvd()
 
     # 2. remove modules
@@ -1330,6 +1339,11 @@ class Utilities:
 
     def check_ipv6_sysctl_attr(self, link, attribute, expected):
         self.assertEqual(read_ipv6_sysctl_attr(link, attribute), expected)
+
+    def check_ipv6_force_forwarding(self, link, expected):
+        # The sysctl is available since kernel v6.17.
+        if os.path.exists('/proc/sys/net/ipv6/conf/all/force_forwarding'):
+            self.check_ipv6_sysctl_attr(link, 'force_forwarding', expected)
 
     def check_ipv6_neigh_sysctl_attr(self, link, attribute, expected):
         self.assertEqual(read_ipv6_neigh_sysctl_attr(link, attribute), expected)
@@ -2095,18 +2109,25 @@ class NetworkdNetDevTests(unittest.TestCase, Utilities):
             self.assertIn('fdb_max_learned 4 ', output)
 
     def test_bond(self):
-        copy_network_unit('25-bond.netdev', '25-bond-balanced-tlb.netdev', '25-bond-property.netdev')
+        copy_network_unit(
+            '25-bond.netdev',
+            '25-bond-balanced-tlb.netdev',
+            '25-bond-property.netdev',
+            '25-bond-lacp-passive.netdev',
+        )
         start_networkd()
 
-        self.wait_online('bond99:off', 'bond98:off', 'bond97:off', setup_state='unmanaged')
+        self.wait_online('bond99:off', 'bond98:off', 'bond97:off', 'bond96:off', setup_state='unmanaged')
         self.networkctl_check_unit('bond99', '25-bond')
         self.networkctl_check_unit('bond98', '25-bond-balanced-tlb')
         self.networkctl_check_unit('bond97', '25-bond-property')
+        self.networkctl_check_unit('bond96', '25-bond-lacp-passive')
 
         self.check_link_attr('bond99', 'bonding', 'mode', '802.3ad 4')
         self.check_link_attr('bond99', 'bonding', 'xmit_hash_policy', 'layer3+4 1')
         self.check_link_attr('bond99', 'bonding', 'miimon', '1000')
         self.check_link_attr('bond99', 'bonding', 'lacp_rate', 'fast 1')
+        self.check_link_attr('bond99', 'bonding', 'lacp_active', 'on 1')
         self.check_link_attr('bond99', 'bonding', 'updelay', '2000')
         self.check_link_attr('bond99', 'bonding', 'downdelay', '2000')
         self.check_link_attr('bond99', 'bonding', 'resend_igmp', '4')
@@ -2134,6 +2155,11 @@ class NetworkdNetDevTests(unittest.TestCase, Utilities):
 
         self.check_link_attr('bond97', 'bonding', 'arp_missed_max', '10')
         self.check_link_attr('bond97', 'bonding', 'peer_notif_delay', '300000')
+
+        output = networkctl_status('bond96')
+        print(output)
+
+        self.check_link_attr('bond96', 'bonding', 'lacp_active', 'off 0')
 
     def check_vlan(self, id, flags):
         self.wait_online('test1:degraded', 'vlan99:routable')
@@ -2667,6 +2693,16 @@ ReorderHeader=no
         self.networkctl_check_unit('wg98', '25-wireguard-23-peers', '25-wireguard-23-peers')
         self.networkctl_check_unit('wg97', '25-wireguard-no-peer', '25-wireguard-no-peer')
 
+        # The WireGuard driver disables generating an IPv6LL address every time the interface is brought
+        # up. Check that the address is generated, also after the interface is brought down and up again.
+        ipv6ll = r'inet6 fe80::[0-9a-f:]+/64'
+        self.wait_address('wg97', ipv6ll, scope='link', ipv='-6')
+        self.wait_address('wg98', ipv6ll, scope='link', ipv='-6')
+        check_output('ip link set dev wg97 down')
+        self.wait_address_dropped('wg97', ipv6ll, scope='link', ipv='-6')
+        check_output('ip link set dev wg97 up')
+        self.wait_address('wg97', ipv6ll, scope='link', ipv='-6')
+
         output = check_output('ip -4 address show dev wg99')
         print(output)
         self.assertIn('inet 192.168.124.1/24 scope global wg99', output)
@@ -2799,6 +2835,14 @@ ReorderHeader=no
         )
         networkctl_reload()
         self.wait_online('wg99:routable', 'wg98:routable', 'wg97:carrier')
+
+        # Check that the IPv6LL address is dropped when LinkLocalAddressing=no is set.
+        with open(
+            os.path.join(network_unit_dir, '25-wireguard-no-peer.network'), mode='a', encoding='utf-8'
+        ) as f:
+            f.write('\n[Network]\nLinkLocalAddressing=no\n')
+        networkctl_reload()
+        self.wait_address_dropped('wg97', ipv6ll, scope='link', ipv='-6')
 
     def test_geneve(self):
         copy_network_unit('25-geneve.netdev', '26-netdev-link-local-addressing-yes.network')
@@ -4125,8 +4169,10 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         flag4: str,
         ip4_null_16: str,
         ip4_null_24: str,
+        ip4_null_32: str,
         ip6_null_73: str,
         ip6_null_74: str,
+        ip6_null_128: str,
     ):
         output = check_output('ip address show dev dummy98')
         print(output)
@@ -4192,8 +4238,10 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         prefix24 = ip4_null_24[: -len('.1')]
         self.assertIn(f'inet {ip4_null_16}/16 brd {prefix16}.255.255 scope global subnet16', output)
         self.assertIn(f'inet {ip4_null_24}/24 brd {prefix24}.255 scope global subnet24', output)
+        self.assertIn(f'inet {ip4_null_32}/32 scope global host32', output)
         self.assertIn(f'inet6 {ip6_null_73}/73 scope global', output)
         self.assertIn(f'inet6 {ip6_null_74}/74 scope global', output)
+        self.assertIn(f'inet6 {ip6_null_128}/128 scope global', output)
 
         # invalid sections
         self.assertNotIn('10.4.4.1', output)
@@ -4220,25 +4268,33 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
 
         ip4_null_16 = None
         ip4_null_24 = None
+        ip4_null_32 = None
         output = check_output('ip -4 --json address show dev dummy98')
         for i in json.loads(output)[0]['addr_info']:
             if i['label'] == 'subnet16':
                 ip4_null_16 = i['local']
             elif i['label'] == 'subnet24':
                 ip4_null_24 = i['local']
+            elif i['label'] == 'host32':
+                ip4_null_32 = i['local']
         self.assertTrue(ip4_null_16.endswith('.0.1'))
         self.assertTrue(ip4_null_24.endswith('.1'))
+        self.assertIsNotNone(ip4_null_32)
 
         ip6_null_73 = None
         ip6_null_74 = None
+        ip6_null_128 = None
         output = check_output('ip -6 --json address show dev dummy98')
         for i in json.loads(output)[0]['addr_info']:
             if i['prefixlen'] == 73:
                 ip6_null_73 = i['local']
             elif i['prefixlen'] == 74:
                 ip6_null_74 = i['local']
+            elif i['prefixlen'] == 128 and i['local'].startswith('fd'):
+                ip6_null_128 = i['local']
         self.assertTrue(ip6_null_73.endswith(':1'))
         self.assertTrue(ip6_null_74.endswith(':1'))
+        self.assertIsNotNone(ip6_null_128)
 
         self.verify_address_static(
             label1='label1',
@@ -4266,8 +4322,10 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
             flag4=' home mngtmpaddr',
             ip4_null_16=ip4_null_16,
             ip4_null_24=ip4_null_24,
+            ip4_null_32=ip4_null_32,
             ip6_null_73=ip6_null_73,
             ip6_null_74=ip6_null_74,
+            ip6_null_128=ip6_null_128,
         )
         # nft set
         self.check_nftset('addr4', r'10\.10\.1\.1')
@@ -4305,8 +4363,10 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
             flag4=' noprefixroute',
             ip4_null_16=ip4_null_16,
             ip4_null_24=ip4_null_24,
+            ip4_null_32=ip4_null_32,
             ip6_null_73=ip6_null_73,
             ip6_null_74=ip6_null_74,
+            ip6_null_128=ip6_null_128,
         )
 
         networkctl_reconfigure('dummy98')
@@ -4337,8 +4397,10 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
             flag4=' noprefixroute',
             ip4_null_16=ip4_null_16,
             ip4_null_24=ip4_null_24,
+            ip4_null_32=ip4_null_32,
             ip6_null_73=ip6_null_73,
             ip6_null_74=ip6_null_74,
+            ip6_null_128=ip6_null_128,
         )
 
         # Tests for #20891.
@@ -4379,8 +4441,10 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
             flag4=' noprefixroute',
             ip4_null_16=ip4_null_16,
             ip4_null_24=ip4_null_24,
+            ip4_null_32=ip4_null_32,
             ip6_null_73=ip6_null_73,
             ip6_null_74=ip6_null_74,
+            ip6_null_128=ip6_null_128,
         )
 
         # test for ENOBUFS issue #17012 (with reload)
@@ -5616,6 +5680,7 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         self.wait_online('dummy98:degraded')
 
         self.check_ipv6_sysctl_attr('dummy98', 'forwarding', '1')
+        self.check_ipv6_force_forwarding('dummy98', '1')
         self.check_ipv6_sysctl_attr('dummy98', 'use_tempaddr', '1')
         self.check_ipv6_sysctl_attr('dummy98', 'dad_transmits', '3')
         self.check_ipv6_sysctl_attr('dummy98', 'hop_limit', '5')
@@ -5633,6 +5698,22 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         self.wait_online('dummy98:degraded')
 
         self.check_ipv6_sysctl_attr('dummy98', 'use_tempaddr', '2')
+
+    def test_sysctl_ipv6_force_forwarding_reset(self):
+        copy_networkd_conf_dropin('25-global-ipv6-forwarding-no.conf')
+        copy_network_unit('25-sysctl.network', '12-dummy.netdev', copy_dropins=False)
+        start_networkd()
+        self.wait_online('dummy98:degraded')
+
+        self.check_ipv6_sysctl_attr('dummy98', 'forwarding', '1')
+        self.check_ipv6_force_forwarding('dummy98', '1')
+
+        copy_network_unit('25-sysctl.network.d/25-ipv6-forwarding-unset.conf')
+        networkctl_reload()
+        self.wait_online('dummy98:degraded')
+
+        self.check_ipv6_sysctl_attr('dummy98', 'forwarding', '0')
+        self.check_ipv6_force_forwarding('dummy98', '0')
 
     def test_sysctl_disable_ipv6(self):
         copy_network_unit('25-sysctl-disable-ipv6.network', '12-dummy.netdev')
@@ -6219,6 +6300,10 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         time.sleep(1)
         output = networkctl_status('test1')
         self.assertIn('State: routable (configuring)', output)
+        self.assertIn('Configuring: static routes are not configured', output)
+        output = networkctl_json('test1')
+        check_json(output)
+        self.assertIn('"ConfiguringReasons":["static_routes"]', output)
 
         # Check if the route which needs nexthop 21 are forgotten.
         output = networkctl_json()
@@ -6229,6 +6314,13 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         # then the route requested by test1 can be configured.
         networkctl_reconfigure('dummy98')
         self.wait_online('test1:routable')
+
+        # Check if the reason is cleared once the interface is configured.
+        output = networkctl_status('test1')
+        self.assertNotIn('Configuring:', output)
+        output = networkctl_json('test1')
+        check_json(output)
+        self.assertNotIn('ConfiguringReasons', output)
 
         # Check if the requested route actually configured.
         output = check_output('ip route show 10.10.11.10')
@@ -7592,6 +7684,7 @@ class NetworkdRATests(unittest.TestCase, Utilities):
 
         # IPv6SendRA=yes implies IPv6Forwarding.
         self.check_ipv6_sysctl_attr('veth-peer', 'forwarding', '1')
+        self.check_ipv6_force_forwarding('veth-peer', '1')
 
         output = resolvectl('dns', 'veth99')
         print(output)
@@ -7785,6 +7878,126 @@ class NetworkdRATests(unittest.TestCase, Utilities):
         check_output('ip link set dev veth99 mtu 1800')
         check_output('ip link set dev veth-peer mtu 1800')
         self.check_ndisc_mtu(1700)
+
+    def test_ndisc_router_limit(self):
+        if not os.path.exists(test_ndisc_send):
+            self.skipTest(f'{test_ndisc_send} does not exist.')
+
+        copy_network_unit(
+            '25-veth.netdev',
+            '25-veth-peer-no-address.network',
+            '25-ipv6-prefix-veth-token-static.network',
+        )
+        start_networkd()
+        self.wait_online('veth-peer:degraded')
+        self.check_networkd_log('veth99: NDISC: Started IPv6 Router Solicitation client')
+
+        # See NDISC_ROUTER_MAX in networkd-ndisc.c
+        ndisc_router_max = 64
+        n_senders = ndisc_router_max + 16
+        for i in range(n_senders):
+            check_output(f'{test_ndisc_send} --interface veth-peer --type ra --lifetime 1hour --source fe80::47:{i:x}')  # fmt: skip
+
+        # Wait for networkd to process all RAs (and refuse those that are over the limit).
+        self.check_networkd_log(f'Too many routers remembered per link ({ndisc_router_max}), ignoring RA from fe80::47:{n_senders - 1:x}.')  # fmt: skip
+        # Wait for the last to-be-accepted route.
+        self.wait_route(
+            'veth99',
+            rf'default nhid [0-9]* via fe80::47:{ndisc_router_max - 1:x}',
+            ipv='-6',
+            timeout_sec=10,
+        )
+
+        output = check_output('ip -6 route show default dev veth99 proto ra')
+        print(output)
+        self.assertEqual(len(re.findall(r'via fe80::47:', output)), ndisc_router_max)
+
+        # Resend the first RA with a different MTU - since it's already present in the router hashmap the
+        # existing entry should get updated instead of rejected.
+        check_output(f'{test_ndisc_send} --interface veth-peer --type ra --lifetime 1hour --preference high --mtu 1442 --source fe80::47:0')  # fmt: skip
+        self.check_ndisc_mtu(1442)
+        self.wait_route(
+            'veth99',
+            'default nhid [0-9]* via fe80::47:0 .* pref high',
+            ipv='-6',
+            timeout_sec=10,
+        )
+
+    def test_ndisc_route_limit(self):
+        if not os.path.exists(test_ndisc_send):
+            self.skipTest(f'{test_ndisc_send} does not exist.')
+
+        copy_network_unit(
+            '25-veth.netdev',
+            '25-veth-peer-no-address.network',
+            '25-ipv6-prefix-veth-token-static.network',
+        )
+        start_networkd()
+        self.wait_online('veth-peer:degraded')
+        self.check_networkd_log('veth99: NDISC: Started IPv6 Router Solicitation client')
+
+        # A router-lifetime-zero RA is not remembered as a default router, but a Route Information Option it
+        # carries still installs a route whose gateway is the sender. NDisc routes are capped independently
+        # (NDISC_ROUTE_MAX), so this must be bounded too - otherwise the router cap could be bypassed with
+        # RIO-only RAs.
+        #
+        # See NDISC_ROUTE_MAX in networkd-ndisc.c
+        ndisc_route_max = 512
+        n_senders = ndisc_route_max + 16
+        for i in range(n_senders):
+            check_output(f'{test_ndisc_send} --interface veth-peer --type ra --route 2001:db8:47:{i:x}::/64 --route-lifetime 1hour --source fe80::47:1')  # fmt: skip
+
+        # Wait for networkd to process all RAs (and refuse those that are over the limit).
+        self.check_networkd_log(f'Too many NDisc routes per link ({ndisc_route_max}), ignoring route 2001:db8:47:{n_senders - 1:x}::/64.')  # fmt: skip
+        # Wait for the last to-be-accepted route.
+        self.wait_route(
+            'veth99',
+            rf'2001:db8:47:{ndisc_route_max - 1:x}::/64 .*via fe80::47:1',
+            ipv='-6',
+            timeout_sec=10,
+        )
+
+        output = check_output('ip -6 route show dev veth99 proto ra')
+        print(output)
+        self.assertEqual(len(re.findall(r'2001:db8:47:', output)), ndisc_route_max)
+
+        # Zero-lifetime RA with per-link parameters (MTU) from new sender must be honoured even when cap was
+        # already reached.
+        check_output(f'{test_ndisc_send} --interface veth-peer --type ra --mtu 1462 --source fe80::48:1')  # fmt: skip
+        self.check_ndisc_mtu(1462)
+
+    def test_ndisc_redirect_limit(self):
+        if not os.path.exists(test_ndisc_send):
+            self.skipTest(f'{test_ndisc_send} does not exist.')
+
+        copy_network_unit(
+            '25-veth.netdev',
+            '25-ipv6-prefix.network',
+            '25-ipv6-prefix-veth-token-static.network',
+        )
+        start_networkd()
+        # Wait until veth-peer's RA is processed, so that it is a remembered router and its redirects are
+        # accepted by ndisc_redirect_verify_sender().
+        self.check_ipv6_token_static()
+
+        # See NDISC_REDIRECT_MAX in networkd-ndisc.c.
+        ndisc_redirect_max = 64
+        n_redirects = ndisc_redirect_max + 16
+        for i in range(n_redirects):
+            check_output(f'{test_ndisc_send} --interface veth-peer --type redirect --target-address fe80::1 --redirect-destination 2002:da8:1:1::{i:x}')  # fmt: skip
+        # Wait for networkd to process all redirects (and refuse those over the limit).
+        self.check_networkd_log(f'Too many NDisc redirects per link ({ndisc_redirect_max}), ignoring redirect for 2002:da8:1:1::{n_redirects - 1:x}.')  # fmt: skip
+        # Wait for the last to-be-accepted redirect route.
+        self.wait_route(
+            'veth99',
+            rf'2002:da8:1:1::{ndisc_redirect_max - 1:x} .*proto redirect',
+            ipv='-6',
+            timeout_sec=10,
+        )
+
+        output = check_output('ip -6 route show dev veth99 proto redirect')
+        print(output)
+        self.assertEqual(len(re.findall(r'2002:da8:1:1::', output)), ndisc_redirect_max)
 
     def test_ipv6_token_prefixstable(self):
         copy_network_unit(
@@ -8426,6 +8639,8 @@ class NetworkdDHCPServerTests(unittest.TestCase, Utilities):
         output = networkctl_status('veth99')
         print(output)
         self.assertIn('Address: 10.1.1.200 (DHCPv4 via 10.1.1.1)', output)
+        self.assertIn('DHCPv4 Client State: bound', output)
+        self.assertRegex(output, r'DHCPv4 Lease Timestamp: \w{3} \d{4}-\d{2}-\d{2}')
         self.assertIn('DHCPv4 Client ID: 12:34:56:78:9a:bc', output)
 
     def test_dhcp_server_static_lease_mac_by_global(self):
@@ -8448,6 +8663,21 @@ class NetworkdDHCPServerTests(unittest.TestCase, Utilities):
         print(output)
         self.assertIn('Address: 10.1.1.200 (DHCPv4 via 10.1.1.1)', output)
         self.assertRegex(output, 'DHCPv4 Client ID: IAID:[0-9a-z]*/DUID')
+
+    def test_dhcp_server_static_lease_client_id(self):
+        copy_network_unit(
+            '25-veth.netdev',
+            '25-dhcp-client-static-lease-client-id.network',
+            '25-dhcp-server-static-lease-client-id.network',
+        )
+        start_networkd()
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+
+        output = networkctl_status('veth99')
+        print(output)
+        self.assertIn('Address: 10.1.1.201 (DHCPv4 via 10.1.1.1)', output)
+        self.assertNotIn('10.1.1.202', output)
+        self.assertIn('DHCPv4 Client ID: IAID:0x12345678/DUID', output)
 
     def test_dhcp_server_static_lease_hostname_simple(self):
         copy_network_unit(
@@ -8657,6 +8887,38 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
     def tearDown(self):
         tear_down_common()
 
+    def test_dhcp_client_ipv6_use_timezone(self):
+        copy_network_unit(
+            '25-veth.netdev',
+            '25-dhcp-server-veth-peer.network',
+            '25-dhcp-client-ipv6-timezone.network',
+        )
+
+        # Make sure the zone is not already the one the server will emit,
+        # e.g. left over from test_emit_router_timezone.
+        timedatectl('set-timezone', 'UTC')
+
+        start_networkd()
+        self.wait_online('veth-peer:carrier')
+
+        start_dnsmasq(
+            '--dhcp-option=option6:42,Europe/Berlin',
+            ra_mode='ra-stateless',
+        )
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+
+        # The DHCPv6 REPLY for INFORMATION-REQUEST may be received after the
+        # link entered the configured state, and the timezone is applied
+        # through an asynchronous call to timedated. Wait for it.
+        tz = None
+        for _ in range(100):
+            r = run(*timedatectl_cmd, 'show', '--value', '--property', 'Timezone', env=env)
+            tz = r.stdout.rstrip()
+            if tz == 'Europe/Berlin':
+                break
+            time.sleep(0.2)
+        self.assertEqual(tz, 'Europe/Berlin')
+
     def test_dhcp_client_ipv6_only(self):
         copy_network_unit(
             '25-veth.netdev',
@@ -8711,6 +8973,37 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
 
         # Check json format
         check_json(networkctl_json('veth99'))
+
+        # "networkctl renew" must request the information again.
+        stop_dnsmasq()
+        since = datetime.datetime.now()
+        start_dnsmasq(
+            '--dhcp-option=108,00:00:02:00',
+            '--dhcp-option=option6:dns-server,[2600::ee]',
+            '--dhcp-option=option6:ntp-server,[2600::fe]',
+            ra_mode='ra-stateless',
+        )
+        # The RA from the restarted dnsmasq makes networkd start the DHCPv6 client again, which is refused
+        # within the information refresh time. The information must be requested again even after that.
+        if enable_debug:
+            self.check_networkd_log("veth99: NDISC: Invoking callback for 'router' event.", since=since)
+        networkctl('renew', 'veth99')
+
+        for _ in range(100):
+            output = read_link_state_file('veth99')
+            if 'NTP=2600::fe' in output:
+                break
+            time.sleep(0.2)
+
+        print('## link state file after renew')
+        print(output)
+        self.assertIn('NTP=2600::fe', output)
+        self.assertNotIn('2600::ff', output)
+
+        print('## dnsmasq log after renew')
+        output = read_dnsmasq_log_file()
+        print(output)
+        self.assertIn('DHCPINFORMATION-REQUEST(veth-peer)', output)
 
         # solicit mode
         stop_dnsmasq()
@@ -8844,12 +9137,23 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
         print(f'DHCPv4 client state = {state}')
         self.assertEqual(state, 'selecting')
 
+        # Also verify the DHCP client states are exposed via the varlink Describe() interface.
+        # This must be checked before starting dnsmasq, as the DHCPv4 client leaves 'selecting'
+        # as soon as it receives an offer.
+        j = json.loads(networkctl_json('veth99'))
+        self.assertEqual(j['DHCPv6Client']['State'], 'stopped')
+        self.assertEqual(j['DHCPv4Client']['State'], 'selecting')
+
         start_dnsmasq('--dhcp-option=108,00:00:02:00')
         self.wait_online('veth99:routable', 'veth-peer:routable')
 
         state = get_dhcp6_client_state('veth99')
         print(f'DHCPv6 client state = {state}')
         self.assertEqual(state, 'bound')
+
+        j = json.loads(networkctl_json('veth99'))
+        self.assertEqual(j['DHCPv6Client']['State'], 'bound')
+        self.assertIn('LeaseTimestampUSec', j['DHCPv6Client']['Lease'])
 
         # DHCPv4 client will stop after an DHCPOFFER message received, so we need to wait for a while.
         for _ in range(100):
@@ -8994,6 +9298,7 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
 
         print('## json')
         j = json.loads(networkctl_json('veth99'))
+        self.assertEqual(j['DHCPv4Client']['State'], 'bound')
 
         self.assertEqual(len(j['DNS']), 2)
         for i in j['DNS']:
@@ -9140,6 +9445,7 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
 
         print('## json')
         j = json.loads(networkctl_json('veth99'))
+        self.assertEqual(j['DHCPv4Client']['State'], 'bound')
 
         self.assertEqual(len(j['DNS']), 3)
         for i in j['DNS']:
@@ -9324,6 +9630,41 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
                 break
         else:
             self.fail('Timed out waiting for DHCPRELEASE in dnsmasq log (on bringing down interface)')
+
+    def setup_veth_ns_server(self):
+        # The REQUEST message on renewal is unicast, hence the server needs to be in another network
+        # namespace, otherwise the message would not be delivered to a local address.
+        check_output('ip netns add ns-server')
+        check_output('ip link add veth99 type veth peer veth-peer')
+        check_output('ip link set veth-peer netns ns-server')
+        check_output('ip netns exec ns-server ip link set veth-peer up')
+        check_output('ip netns exec ns-server ip address add 192.168.5.1/24 dev veth-peer')
+        check_output('ip netns exec ns-server ip address add 2600::1/64 dev veth-peer')
+
+    def test_dhcp_client_renew_nak(self):
+        self.setup_veth_ns_server()
+
+        copy_network_unit('25-dhcp-client-simple-hostname.network')
+        start_dnsmasq(namespace='ns-server', ipv4_range='192.168.5.110,192.168.5.119')
+        start_networkd()
+        self.wait_online('veth99:routable')
+        self.wait_address('veth99', r'inet 192\.168\.5\.11[0-9]/24', ipv='-4')
+
+        # Restart the server with another range and without the lease, so that it refuses the renewal.
+        # It then broadcasts the DHCPNAK (RFC 2131 section 4.1).
+        stop_dnsmasq()
+        start_dnsmasq(namespace='ns-server', ipv4_range='192.168.5.120,192.168.5.129')
+
+        # T2 of the 2 minute lease is about 100 s away. Without noticing the DHCPNAK, the client would
+        # only acquire the new address after that.
+        networkctl('renew', 'veth99')
+        try:
+            self.wait_address('veth99', r'inet 192\.168\.5\.12[0-9]/24', ipv='-4', timeout_sec=30)
+            self.wait_address_dropped('veth99', r'inet 192\.168\.5\.11[0-9]/24', ipv='-4', timeout_sec=10)
+        finally:
+            output = read_dnsmasq_log_file()
+            print(output)
+        self.assertIn('DHCPNAK', output)
 
     def test_dhcp_client_ipv4_dbus_status(self):
         copy_network_unit(
@@ -9586,6 +9927,38 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
 
         check_json(networkctl_json())
 
+    def test_dhcp_client_ipv4_rfc3021(self):
+        copy_network_unit(
+            '25-veth.netdev',
+            '25-dhcp-server-veth-peer.network',
+            '25-dhcp-client-ipv4-use-routes-use-gateway.network',
+            copy_dropins=False,
+        )
+
+        start_networkd()
+        self.wait_online('veth-peer:carrier')
+        # The lower address of a /31 network is a valid host address, see RFC 3021. Announce a classless
+        # static route for a larger network whose base address is the same as the acquired address.
+        start_dnsmasq(
+            '--dhcp-host=12:34:56:78:9a:bc,192.168.5.0',
+            '--dhcp-option=option:classless-static-route,192.168.5.0/25,192.168.5.1',
+            ipv4_range='192.168.5.0,192.168.5.1,255.255.255.254',
+        )
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+
+        output = check_output('ip -4 address show dev veth99')
+        print(output)
+        self.assertIn('inet 192.168.5.0/31', output)
+
+        output = check_output('ip -4 route show dev veth99')
+        print(output)
+        # The acquired address only shadows a host route to itself, hence the gateway must be honored.
+        self.assertIn('192.168.5.0/25 via 192.168.5.1 proto dhcp src 192.168.5.0 metric 1024', output)
+        self.assertIn('192.168.5.1 proto dhcp scope link src 192.168.5.0 metric 1024', output)
+        self.assertNotIn('192.168.5.0/25 proto dhcp scope host', output)
+
+        check_json(networkctl_json())
+
     def test_dhcp_client_settings_anonymize(self):
         copy_network_unit(
             '25-veth.netdev',
@@ -9603,6 +9976,161 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
         self.assertNotIn('VendorClassIdentifier=SusantVendorTest', output)
         self.assertNotIn('test-hostname', output)
         self.assertNotIn('26:mtu', output)
+
+    def setup_dhcp_client_send_system_hostname(self, network_unit):
+        self.setup_veth_ns_server()
+
+        copy_network_unit(network_unit)
+
+        self.addCleanup(socket.sethostname, socket.gethostname())
+        socket.sethostname('test-hostname-old')
+
+        start_dnsmasq(namespace='ns-server')
+        start_networkd()
+        self.wait_online('veth99:routable')
+
+        print('## dnsmasq log')
+        output = read_dnsmasq_log_file()
+        print(output)
+        self.assertIn('client provides name: test-hostname-old', output)
+        self.assertNotIn('test-hostname-new', output)
+
+    def test_dhcp_client_send_system_hostname(self):
+        # The hostname sent by the DHCP client must follow the system hostname, and the lease must be
+        # renewed when the hostname is changed.
+        # See https://github.com/systemd/systemd/issues/36440
+        self.setup_dhcp_client_send_system_hostname('25-dhcp-client-send-system-hostname.network')
+
+        since = datetime.datetime.now()
+        socket.sethostname('test-hostname-new')
+        if enable_debug:
+            self.check_networkd_log('System hostname changed', since=since)
+
+        # The lease time is 2 minutes, hence the new hostname must be sent much earlier than on the
+        # regular renewal.
+        for _ in range(20):
+            output = read_dnsmasq_log_file()
+            if 'client provides name: test-hostname-new' in output:
+                break
+            time.sleep(0.5)
+
+        print('## dnsmasq log after hostname change')
+        print(output)
+        self.assertIn('client provides name: test-hostname-new', output)
+
+    def test_dhcp_client_send_system_hostname_no_updates(self):
+        # With SendHostnameUpdates=no, the hostname known when the interface was configured must be
+        # sent even after the system hostname is changed.
+        self.setup_dhcp_client_send_system_hostname('25-dhcp-client-send-system-hostname-no-updates.network')
+
+        socket.sethostname('test-hostname-new')
+
+        count = read_dnsmasq_log_file().count('client provides name: test-hostname-old')
+        networkctl('renew', 'veth99')
+
+        for _ in range(20):
+            output = read_dnsmasq_log_file()
+            if output.count('client provides name: test-hostname-old') > count:
+                break
+            time.sleep(0.5)
+
+        print('## dnsmasq log after renew')
+        print(output)
+        self.assertGreater(output.count('client provides name: test-hostname-old'), count)
+        self.assertNotIn('test-hostname-new', output)
+
+    def test_dhcp6_client_send_system_hostname(self):
+        # Same as test_dhcp_client_send_system_hostname, but for DHCPv6.
+        self.setup_dhcp_client_send_system_hostname('25-dhcp6-client-send-system-hostname.network')
+        self.wait_address('veth99', r'inet6 2600::[0-9a-f:]*/128', ipv='-6')
+
+        socket.sethostname('test-hostname-new')
+
+        # The lease time is 2 minutes, hence the new hostname must be sent much earlier than on the
+        # regular renewal.
+        for _ in range(20):
+            output = read_dnsmasq_log_file()
+            if 'client provides name: test-hostname-new' in output:
+                break
+            time.sleep(0.5)
+
+        print('## dnsmasq log after hostname change')
+        print(output)
+        self.assertIn('DHCPRENEW(veth-peer)', output)
+        self.assertIn('client provides name: test-hostname-new', output)
+
+    def test_dhcp6_client_renew(self):
+        # "networkctl renew" must renew the DHCPv6 lease too.
+        self.setup_dhcp_client_send_system_hostname('25-dhcp6-client-send-system-hostname.network')
+        self.wait_address('veth99', r'inet6 2600::[0-9a-f:]*/128', ipv='-6')
+
+        self.assertNotIn('DHCPRENEW(veth-peer)', read_dnsmasq_log_file())
+        networkctl('renew', 'veth99')
+
+        for _ in range(20):
+            output = read_dnsmasq_log_file()
+            if 'DHCPRENEW(veth-peer)' in output:
+                break
+            time.sleep(0.5)
+
+        print('## dnsmasq log after renew')
+        print(output)
+        self.assertIn('DHCPRENEW(veth-peer)', output)
+
+    def test_dhcp6_client_renew_on_prefix_change(self):
+        # RFC 8415 section 18.2.12: the lease must be renewed when a new prefix is announced on the link.
+        check_output('ip netns add ns-server')
+        check_output('ip link add veth99 type veth peer veth-peer')
+        check_output('ip link set veth-peer netns ns-server')
+        check_output('ip netns exec ns-server ip link set veth-peer up')
+        check_output('ip netns exec ns-server ip address add 192.168.5.1/24 dev veth-peer')
+        check_output('ip netns exec ns-server ip address add 2600::1/64 dev veth-peer')
+
+        copy_network_unit('25-dhcp6-client-renew-on-prefix-change.network')
+
+        # dnsmasq announces 2601::/64 only when veth-peer has an address in that prefix, and only in its
+        # next periodic RA, hence the short RA interval. Even so, that RA may take about 15 seconds.
+        start_dnsmasq('--dhcp-range=2601::,ra-only', '--ra-param=veth-peer,5', namespace='ns-server')
+        start_networkd()
+        self.wait_online('veth99:routable')
+        self.wait_address('veth99', r'inet6 2600::[0-9a-f:]*/128', ipv='-6')
+
+        # Periodic RAs with unchanged prefixes must not trigger a renewal. Wait for one more RA, which may
+        # take about 15 seconds, and stay well below T1 (1 minute).
+        count = read_dnsmasq_log_file().count('RTR-ADVERT(veth-peer)')
+        for _ in range(40):
+            if read_dnsmasq_log_file().count('RTR-ADVERT(veth-peer)') > count:
+                break
+            time.sleep(0.5)
+        time.sleep(1)
+
+        output = read_dnsmasq_log_file()
+        print('## dnsmasq log before adding a prefix')
+        print(output)
+        self.assertGreater(output.count('RTR-ADVERT(veth-peer)'), count)
+        self.assertNotIn('DHCPRENEW(veth-peer)', output)
+
+        since = datetime.datetime.now()
+        check_output('ip netns exec ns-server ip address add 2601::1/64 dev veth-peer')
+
+        # The lease time is 2 minutes, hence the lease must be renewed much earlier than on the regular
+        # renewal.
+        for _ in range(60):
+            output = read_dnsmasq_log_file()
+            if 'DHCPRENEW(veth-peer)' in output:
+                break
+            time.sleep(0.5)
+
+        print('## dnsmasq log after adding a prefix')
+        print(output)
+        self.assertIn('DHCPRENEW(veth-peer)', output)
+
+        # Make sure the renewal was triggered by the new prefix, not by T1.
+        if enable_debug:
+            self.check_networkd_log('New prefix 2601::/64', since=since)
+            self.check_networkd_log(
+                'Prefixes on the link changed, refreshing DHCPv6 configuration.', since=since
+            )
 
     def test_dhcp_keep_configuration_dynamic(self):
         copy_network_unit(
@@ -10297,7 +10825,7 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
         self.assertGreater(prefixInfo[0]['PreferredLifetimeUSec'], 0)
         self.assertGreater(prefixInfo[0]['ValidLifetimeUSec'], 0)
 
-    @unittest.skipUnless(shutil.which('dhcpd'), reason='dhcpd is not available')
+    @unittest.skipUnless(shutil.which('kea-dhcp6'), reason='kea-dhcp6 is not available')
     def test_dhcp6pd_no_address(self):
         # For issue #29979.
         copy_network_unit(
@@ -10308,7 +10836,7 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
 
         start_networkd()
         self.wait_online('veth-peer:routable')
-        start_isc_dhcpd(conf_file='isc-dhcpd-dhcp6pd.conf', ipv='-6')
+        start_kea_dhcp6(conf_file='kea-dhcp6-pd.conf')
         self.wait_online('veth99:degraded')
 
         print('### ip -6 address show dev veth99 scope global')
@@ -10323,7 +10851,7 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
 
         self.check_dhcp6_prefix('veth99')
 
-    @unittest.skipUnless(shutil.which('dhcpd'), reason='dhcpd is not available')
+    @unittest.skipUnless(shutil.which('kea-dhcp6'), reason='kea-dhcp6 is not available')
     def test_dhcp6pd_no_assign(self):
         # Similar to test_dhcp6pd_no_assign(), but in this case UseAddress=yes (default),
         # However, the server does not provide IA_NA. For issue #31349.
@@ -10335,7 +10863,7 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
 
         start_networkd()
         self.wait_online('veth-peer:routable')
-        start_isc_dhcpd(conf_file='isc-dhcpd-dhcp6pd-no-range.conf', ipv='-6')
+        start_kea_dhcp6(conf_file='kea-dhcp6-pd-no-range.conf')
         self.wait_online('veth99:degraded')
 
         print('### ip -6 address show dev veth99 scope global')
@@ -10350,7 +10878,7 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
 
         self.check_dhcp6_prefix('veth99')
 
-    @unittest.skipUnless(shutil.which('dhcpd'), reason='dhcpd is not available')
+    @unittest.skipUnless(shutil.which('kea-dhcp6'), reason='kea-dhcp6 is not available')
     def test_dhcp6pd(self):
         copy_network_unit(
             '25-veth.netdev',
@@ -10373,7 +10901,7 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
 
         start_networkd()
         self.wait_online('veth-peer:routable')
-        start_isc_dhcpd(conf_file='isc-dhcpd-dhcp6pd.conf', ipv='-6')
+        start_kea_dhcp6(conf_file='kea-dhcp6-pd.conf')
         self.wait_online(
             'veth99:routable',
             'test1:routable',
@@ -10617,6 +11145,40 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
         self.check_nftset('ifindex', 'dummy98')
 
         self.teardown_nftset('addr6', 'network6', 'ifindex')
+
+    @unittest.skipUnless(shutil.which('kea-dhcp6'), reason='kea-dhcp6 is not available')
+    def test_dhcp6pd_renumber(self):
+        copy_network_unit(
+            '25-veth.netdev',
+            '25-dhcp6pd-server.network',
+            '25-dhcp6pd-upstream.network',
+            '25-veth-downstream-veth97.netdev',
+            '25-dhcp-pd-downstream-veth97.network',
+            '25-dhcp-pd-downstream-veth97-peer.network',
+        )
+
+        start_networkd()
+        self.wait_online('veth-peer:routable')
+        start_kea_dhcp6(conf_file='kea-dhcp6-pd.conf')
+        self.wait_online('veth99:routable', 'veth97:routable', 'veth97-peer:routable')
+
+        # NDisc address (Token=static)
+        old_address = 'inet6 3ffe:501:ffff:[2-9a-f]08:1a:2b:3c:4e/64 (metric 256 |)scope global'
+        self.wait_address('veth97-peer', f'{old_address} dynamic', ipv='-6')
+
+        # The new invocation solicits a new lease, and the server hands out a different prefix.
+        stop_kea_dhcp6()
+        start_kea_dhcp6(conf_file='kea-dhcp6-pd-renumbered.conf')
+        restart_networkd()
+        self.wait_online('veth99:routable', 'veth97:routable', 'veth97-peer:routable')
+
+        self.wait_address(
+            'veth97-peer',
+            'inet6 3ffe:501:fffe:[2-9a-f]08:1a:2b:3c:4e/64 (metric 256 |)scope global dynamic',
+            ipv='-6',
+        )
+        # The old prefix is still announced with zero lifetimes.
+        self.wait_address('veth97-peer', f'{old_address} deprecated dynamic', ipv='-6')
 
     def verify_dhcp4_6rd(self, tunnel_name, address_prefix, address_prefix_re, border_router):
         print('### ip -4 address show dev veth-peer scope global')

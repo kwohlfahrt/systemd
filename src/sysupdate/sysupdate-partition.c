@@ -199,8 +199,8 @@ int find_suitable_partition(
                 if (smallest.partno != SIZE_MAX && smallest.size <= pinfo.size) /* already found smaller */
                         continue;
 
-                smallest = pinfo;
-                pinfo = (PartitionInfo) PARTITION_INFO_NULL;
+                partition_info_destroy(&smallest);
+                smallest = TAKE_GENERIC(pinfo, PartitionInfo, PARTITION_INFO_NULL);
         }
 
         if (smallest.partno == SIZE_MAX)
@@ -238,7 +238,7 @@ int patch_partition(
         if (r < 0)
                 return log_error_errno(r, "Failed to create fdisk context from '%s': %m", device);
 
-        assert_se((fd = sym_fdisk_get_devfd(c)) >= 0);
+        fd = ASSERT_SE_NONNEG(sym_fdisk_get_devfd(c));
 
         /* Make sure udev doesn't read the device while we make changes (this lock is released automatically
          * by the kernel when the fd is closed, i.e. when the fdisk context is freed, hence no explicit

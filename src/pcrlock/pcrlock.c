@@ -18,12 +18,15 @@
 #include "chase.h"
 #include "color-util.h"
 #include "conf-files.h"
-#include "copy.h"
 #include "creds-util.h"
 #include "crypto-util.h"
+#include "data-fd-util.h"
+#include "device-private.h"
+#include "dirent-util.h"
 #include "dlopen-note.h"
 #include "efi-api.h"
 #include "efivars.h"
+#include "env-file.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "escape.h"
@@ -56,7 +59,6 @@
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
-#include "tmpfile-util.h"
 #include "tpm2-pcr.h"
 #include "tpm2-util.h"
 #include "unaligned.h"
@@ -106,8 +108,9 @@ STATIC_DESTRUCTOR_REGISTER(arg_entry_token, freep);
 COMMAND(
         "systemd-pcrlock\0",
         "Manage a TPM2 PCR lock.",
-        .man_pages = "systemd-pcrlock(8)\0",
+        .man_page = "systemd-pcrlock(8)",
         .pager_flags = &arg_pager_flags,
+        .flags = COMMAND_EXPERIMENTAL,
 );
 
 #define PCRLOCK_SECUREBOOT_POLICY_PATH      "/var/lib/pcrlock.d/240-secureboot-policy.pcrlock.d/generated.pcrlock"
@@ -358,9 +361,7 @@ static EventLog* event_log_free(EventLog *el) {
 DEFINE_TRIVIAL_CLEANUP_FUNC(EventLog*, event_log_free);
 
 static EventLogRecord* event_log_record_new(EventLog *el) {
-        EventLogRecord *record;
-
-        record = new(EventLogRecord, 1);
+        EventLogRecord *record = new(EventLogRecord, 1);
         if (!record)
                 return NULL;
 
@@ -379,15 +380,12 @@ static EventLogRecord* event_log_record_new(EventLog *el) {
 static int event_log_add_record(
                 EventLog *el,
                 EventLogRecord **ret) {
-
-        _cleanup_(event_log_record_freep) EventLogRecord *record = NULL;
-
         assert(el);
 
         if (!GREEDY_REALLOC(el->records, el->n_records+1))
                 return -ENOMEM;
 
-        record = event_log_record_new(el);
+        EventLogRecord *record = event_log_record_new(el);
         if (!record)
                 return -ENOMEM;
 
@@ -395,8 +393,6 @@ static int event_log_add_record(
 
         if (ret)
                 *ret = record;
-
-        TAKE_PTR(record);
 
         return 0;
 }
@@ -433,7 +429,7 @@ static int event_log_add_algorithms_from_environment(EventLog *el) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&e, &word, ":", 0);
+                r = extract_first_word(&e, &word, ":", /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -693,7 +689,7 @@ static int event_log_record_extract_firmware_description(EventLogRecord *rec) {
                 if (!d)
                         return log_oom();
 
-                if (string_has_cc(d, NULL)) {
+                if (string_has_cc(d, /* ok= */ NULL)) {
                         log_warning("Unsafe EFI action string in record, ignoring.");
                         goto invalid;
                 }
@@ -762,6 +758,40 @@ static int event_log_record_extract_firmware_description(EventLogRecord *rec) {
                                         return log_oom();
 
                                 r = strextendf_with_separator(&rec->description, ", ", "systemd-stub: devicetree addon %s", s);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to format EV_EVENT_TAG description string: %m");
+                                break;
+                        }
+
+                        case TYPE1_DEVICETREE_EVENT_TAG_ID: {
+                                _cleanup_free_ char *raw = NULL, *s = NULL;
+
+                                raw = utf16_to_utf8((const char16_t*) tag->taggedEventData, tag->taggedEventDataSize);
+                                if (!raw)
+                                        return log_oom();
+
+                                s = cescape(raw);
+                                if (!s)
+                                        return log_oom();
+
+                                r = strextendf_with_separator(&rec->description, ", ", "systemd-boot: devicetree %s", s);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to format EV_EVENT_TAG description string: %m");
+                                break;
+                        }
+
+                        case TOFU_ADDON_EVENT_TAG_ID: {
+                                _cleanup_free_ char *raw = NULL, *s = NULL;
+
+                                raw = utf16_to_utf8((const char16_t*) tag->taggedEventData, tag->taggedEventDataSize);
+                                if (!raw)
+                                        return log_oom();
+
+                                s = cescape(raw);
+                                if (!s)
+                                        return log_oom();
+
+                                r = strextendf_with_separator(&rec->description, ", ", "systemd-stub: addon trusted on first use %s", s);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to format EV_EVENT_TAG description string: %m");
                                 break;
@@ -938,7 +968,40 @@ static int event_log_add_algorithms_from_record(EventLog *el, EventLogRecord *re
         return 0;
 }
 
-static int event_log_load_firmware(EventLog *el) {
+static int event_log_add_firmware_record(
+                EventLog *el,
+                const char *source,
+                uint32_t pcr,
+                uint32_t event_type,
+                const void *payload,
+                size_t payload_size,
+                EventLogRecord **ret) {
+
+        EventLogRecord *record;
+        int r;
+
+        assert(el);
+        assert(source);
+        assert(payload || payload_size == 0);
+        assert(ret);
+
+        r = event_log_add_record(el, &record);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add record to event log: %m");
+
+        record->pcr = pcr;
+        record->source = source;
+        record->firmware_event_type = event_type;
+        record->firmware_payload = memdup(payload, payload_size);
+        if (!record->firmware_payload)
+                return log_oom();
+        record->firmware_payload_size = payload_size;
+
+        *ret = record;
+        return 0;
+}
+
+static int event_log_load_firmware(EventLog *el, bool keep_no_action) {
         const TCG_EfiSpecIdEventAlgorithmSize *algorithms;
         size_t bufsize = 0, n_algorithms = 0, left = 0;
         _cleanup_free_ void *buf = NULL;
@@ -967,6 +1030,23 @@ static int event_log_load_firmware(EventLog *el) {
         r = validate_firmware_header(buf, bufsize, &algorithms, &n_algorithms, &event, &left);
         if (r < 0)
                 return r;
+
+        if (keep_no_action) {
+                /* The log header is an EV_NO_ACTION event (the Spec ID event), which carries the version
+                 * of the TCG PC Client Platform Firmware Profile Specification the log follows. Retain it if
+                 * requested. Note that unlike all other events it is in the legacy event format, and hence
+                 * comes with a single (all-zero) SHA1 digest. */
+                const TCG_PCClientPCREvent *h = buf;
+                EventLogRecord *record;
+
+                r = event_log_add_firmware_record(el, path, h->pcrIndex, h->eventType, h->event, h->eventDataSize, &record);
+                if (r < 0)
+                        return r;
+
+                r = event_log_record_add_bank(record, TPM2_ALG_SHA1, h->digest, sizeof(h->digest), /* ret= */ NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add bank to event log record: %m");
+        }
 
         for (const TCG_PCR_EVENT2 *next_event = NULL;; event = next_event) {
                 EventLogRecord *record = NULL;
@@ -997,10 +1077,13 @@ static int event_log_load_firmware(EventLog *el) {
                         el->startup_locality = ((const uint8_t*) payload)[sizeof("StartupLocality")];
                         el->startup_locality_found = true;
                         log_debug("Found StartupLocality event: %u", el->startup_locality);
-                        continue;
                 }
 
-                if (event->eventType == EV_NO_ACTION) { /* Ignore pseudo events, that don't result in a measurement */
+                /* Ignore pseudo events that don't result in a measurement, unless we are asked to keep
+                 * them. They carry information that may be useful to consumers of the event log (e.g.
+                 * verifiers of TPM2 reports), such as the StartupLocality event, which determines the
+                 * initial value of PCR 0. */
+                if (event->eventType == EV_NO_ACTION && !keep_no_action) {
                         log_debug("Skipping NO_ACTION event.");
                         continue;
                 }
@@ -1010,18 +1093,14 @@ static int event_log_load_firmware(EventLog *el) {
                         continue;
                 }
 
-                r = event_log_add_record(el, &record);
+                r = event_log_add_firmware_record(el, path, event->pcrIndex, event->eventType, payload, payload_size, &record);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to add record to event log: %m");
+                        return r;
 
-                record->pcr = event->pcrIndex;
-                record->source = path;
-                record->firmware_event_type = event->eventType;
-                record->firmware_payload = memdup(payload, payload_size);
-                if (!record->firmware_payload)
-                        return log_oom();
-                record->firmware_payload_size = payload_size;
-
+                /* validate_firmware_event() sized the digest list from the algorithms in the log header,
+                 * but a record may name the same algorithm more than once, hence make sure the walk below
+                 * covers exactly the part of the record that was checked. */
+                const uint8_t *digests_end = (const uint8_t*) payload - sizeof(uint32_t);
                 const void *ha, *ha_next = NULL;
                 ha = (const uint8_t*) event + offsetof(TCG_PCR_EVENT2, digests.digests);
                 assert(event->digests.count == n_algorithms);
@@ -1041,6 +1120,9 @@ static int event_log_load_firmware(EventLog *el) {
                         if (j >= n_algorithms)
                                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Hash algorithms in event log record not among those advertised by log header.");
 
+                        if (offsetof(TPMT_HA, digest) + algorithms[j].digestSize > (size_t) (digests_end - (const uint8_t*) ha))
+                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Digests in event log record exceed size advertised by log header.");
+
                         ha_next = (const uint8_t*) ha + offsetof(TPMT_HA, digest) + algorithms[j].digestSize;
 
                         if (!tpm2_hash_alg_to_string(hash_alg))
@@ -1056,6 +1138,9 @@ static int event_log_load_firmware(EventLog *el) {
                                 return log_error_errno(r, "Failed to add bank to event log record: %m");
                 }
 
+                if ((const uint8_t*) ha != digests_end)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Digests in event log record don't match size advertised by log header.");
+
                 /* Try to extract a descriptive text */
                 r = event_log_record_extract_firmware_description(record);
                 if (r < 0)
@@ -1070,7 +1155,26 @@ static int event_log_load_firmware(EventLog *el) {
 }
 
 static int event_log_record_parse_json(EventLogRecord *record, sd_json_variant *j) {
+        struct {
+                uint64_t pcr;
+                uint64_t nv_index;
+                sd_json_variant *digests;
+                const char *content_type;
+                sd_json_variant *content;
+        } p = {
+                .pcr = UINT64_MAX,
+                .nv_index = UINT64_MAX,
+        };
         int r;
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "pcr",          SD_JSON_VARIANT_UNSIGNED,      sd_json_dispatch_uint64,        voffsetof(p, pcr),          0                 },
+                { "nv_index",     SD_JSON_VARIANT_UNSIGNED,      sd_json_dispatch_uint64,        voffsetof(p, nv_index),     0                 },
+                { "digests",      SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_variant_noref, voffsetof(p, digests),      SD_JSON_MANDATORY },
+                { "content_type", SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string,  voffsetof(p, content_type), 0                 },
+                { "content",      _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_variant_noref, voffsetof(p, content),      0                 },
+                {}
+        };
 
         assert(record);
         assert(j);
@@ -1078,67 +1182,59 @@ static int event_log_record_parse_json(EventLogRecord *record, sd_json_variant *
         if (!sd_json_variant_is_object(j))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "record object is not an object.");
 
-        sd_json_variant *jp = sd_json_variant_by_key(j, "pcr");
-        sd_json_variant *jn = sd_json_variant_by_key(j, "nv_index");
-        if (jp) {
-                uint64_t u;
-                if (jn)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Both 'pcr' and 'nv_index' field found in TPM measurement log file entry.");
-                if (!sd_json_variant_is_unsigned(jp))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'pcr' field is not an integer.");
+        r = sd_json_dispatch(j, dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &p);
+        if (r < 0)
+                return -EBADMSG;
 
-                u = sd_json_variant_unsigned(jp);
-                if (u >= TPM2_PCRS_MAX)
+        if (p.pcr != UINT64_MAX) {
+                if (p.nv_index != UINT64_MAX)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Both 'pcr' and 'nv_index' field found in TPM measurement log file entry.");
+                if (p.pcr >= TPM2_PCRS_MAX)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'pcr' field is out of range.");
 
-                record->pcr = u;
+                record->pcr = p.pcr;
                 record->nv_index = UINT32_MAX;
         } else {
-                uint64_t u;
-
-                if (!jn)
+                if (p.nv_index == UINT64_MAX)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Neither 'pcr' nor 'nv_index' field found in TPM measurement log file entry.");
-                if (!sd_json_variant_is_unsigned(jn))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'nv_index' field is not an integer.");
-
-                u = sd_json_variant_unsigned(jn);
-                if (u >= UINT32_MAX)
+                if (p.nv_index >= UINT32_MAX)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'nv_index' field is out of range.");
 
-                record->nv_index = u;
+                record->nv_index = p.nv_index;
                 record->pcr = UINT32_MAX;
         }
 
-        sd_json_variant *x = sd_json_variant_by_key(j, "digests");
-        if (!x)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'digests' field missing from TPM measurement log file entry.");
-        if (!sd_json_variant_is_array(x))
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'digests' field is not an array.");
-
         sd_json_variant *k;
-        JSON_VARIANT_ARRAY_FOREACH(k, x) {
+        JSON_VARIANT_ARRAY_FOREACH(k, p.digests) {
                 _cleanup_free_ void *hash = NULL;
                 size_t hash_size;
-                sd_json_variant *a, *h;
+                struct {
+                        const char *hash_alg;
+                        sd_json_variant *digest;
+                } d = {};
                 int na;
 
-                a = sd_json_variant_by_key(k, "hashAlg");
-                if (!a)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'digests' field element lacks 'hashAlg' field.");
-                if (!sd_json_variant_is_string(a))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'hashAlg' field is not a string.");
+                /* The digest is only checked for supported hash algorithms */
+                static const sd_json_dispatch_field digest_dispatch_table[] = {
+                        { "hashAlg", SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string,  voffsetof(d, hash_alg), SD_JSON_MANDATORY },
+                        { "digest",  _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_variant_noref, voffsetof(d, digest),   0                 },
+                        {}
+                };
 
-                na = tpm2_hash_alg_from_string(sd_json_variant_string(a));
+                r = sd_json_dispatch(k, digest_dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &d);
+                if (r < 0)
+                        return -EBADMSG;
+
+                na = tpm2_hash_alg_from_string(d.hash_alg);
                 if (na < 0) {
-                        log_debug_errno(na, "Unsupported hash '%s' in userspace event log, ignoring: %m", sd_json_variant_string(a));
+                        log_debug_errno(na, "Unsupported hash '%s' in userspace event log, ignoring: %m", d.hash_alg);
                         continue;
                 }
 
-                h = sd_json_variant_by_key(k, "digest");
-                if (!h)
+                if (!d.digest)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'digests' field lacks 'digest' field.");
 
-                r = sd_json_variant_unhex(h, &hash, &hash_size);
+                r = sd_json_variant_unhex(d.digest, &hash, &hash_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to decode digest: %m");
 
@@ -1152,48 +1248,44 @@ static int event_log_record_parse_json(EventLogRecord *record, sd_json_variant *
                         return log_error_errno(r, "Failed to add bank to event log record: %m");
         }
 
-        const char *rectype = NULL;
-        x = sd_json_variant_by_key(j, "content_type");
-        if (!x)
+        if (!p.content_type)
                 log_debug("'content_type' missing from TPM measurement log file entry, ignoring.");
-        else {
-                if (!sd_json_variant_is_string(x))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'content_type' field is not a string.");
 
-                rectype = sd_json_variant_string(x);
-        }
+        if (streq_ptr(p.content_type, "systemd")) {
+                struct {
+                        const char *string;
+                        const char *event_type;
+                } c = {};
 
-        if (streq_ptr(rectype, "systemd")) {
-                sd_json_variant *y;
+                static const sd_json_dispatch_field content_dispatch_table[] = {
+                        { "string",    SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, voffsetof(c, string),     0 },
+                        { "eventType", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, voffsetof(c, event_type), 0 },
+                        {}
+                };
 
-                x = sd_json_variant_by_key(j, "content");
-                if (!x)
+                if (!p.content)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'content' field missing from TPM measurement log file entry.");
-                if (!sd_json_variant_is_object(x))
+                if (!sd_json_variant_is_object(p.content))
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'content' sub-object is not an object.");
 
-                y = sd_json_variant_by_key(x, "string");
-                if (y) {
-                        if (!sd_json_variant_is_string(y))
-                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'string' field is not a string.");
+                r = sd_json_dispatch(p.content, content_dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &c);
+                if (r < 0)
+                        return -EBADMSG;
 
-                        r = free_and_strdup_warn(&record->description, sd_json_variant_string(y));
+                if (c.string) {
+                        r = free_and_strdup_warn(&record->description, c.string);
                         if (r < 0)
                                 return r;
                 }
 
-                y = sd_json_variant_by_key(x, "eventType");
-                if (y) {
-                        if (!sd_json_variant_is_string(y))
-                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'eventType' field is not a string.");
-
-                        record->userspace_event_type = tpm2_userspace_event_type_from_string(sd_json_variant_string(y));
+                if (c.event_type) {
+                        record->userspace_event_type = tpm2_userspace_event_type_from_string(c.event_type);
                         if (record->userspace_event_type < 0)
-                                log_debug_errno(record->userspace_event_type, "Unknown userspace event type '%s', ignoring.", sd_json_variant_string(y));
+                                log_debug_errno(record->userspace_event_type, "Unknown userspace event type '%s', ignoring.", c.event_type);
                 }
 
                 sd_json_variant_unref(record->userspace_content);
-                record->userspace_content = sd_json_variant_ref(x);
+                record->userspace_content = sd_json_variant_ref(p.content);
         }
 
         return 0;
@@ -1265,7 +1357,7 @@ static int event_log_load_userspace(EventLog *el) {
                         continue;
                 }
 
-                r = sd_json_parse(b, 0, &j, NULL, NULL);
+                r = sd_json_parse(b, /* flags= */ 0, &j, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse local TPM measurement log file: %m");
 
@@ -1307,12 +1399,12 @@ static EventLog *event_log_new(void) {
         return TAKE_PTR(el);
 }
 
-static int event_log_load(EventLog *el) {
+static int event_log_load(EventLog *el, bool keep_fw_no_action) {
         int r;
 
         assert(el);
 
-        r = event_log_load_firmware(el);
+        r = event_log_load_firmware(el, keep_fw_no_action);
         if (r < 0)
                 return r;
 
@@ -1443,7 +1535,7 @@ static int event_log_calculate_pcrs(EventLog *el) {
                         if (!mc)
                                 return log_oom();
 
-                        if (sym_EVP_DigestInit_ex(mc, el->mds[i], NULL) != 1)
+                        if (sym_EVP_DigestInit_ex(mc, el->mds[i], /* impl= */ NULL) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize %s message digest context.", n);
 
                         if (sym_EVP_DigestUpdate(mc, reg_b->calculated.buffer, reg_b->calculated.size) != 1)
@@ -1551,13 +1643,13 @@ static int event_log_record_validate_hash_firmware(
 
         unsigned dsz = mdsz;
 
-        if (sym_EVP_Digest(hdata, hsz, payload_hash.buffer, &dsz, md, NULL) != 1)
+        if (sym_EVP_Digest(hdata, hsz, payload_hash.buffer, &dsz, md, /* impl= */ NULL) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to calculate event payload hash.");
         assert(dsz == (unsigned) mdsz);
 
         /* If this didn't match then let's try the alternative format here, if we have one, and check things then. */
         if (memcmp_nn(bank->hash.buffer, bank->hash.size, payload_hash.buffer, payload_hash.size) != 0 && hdata_alternative) {
-                if (sym_EVP_Digest(hdata_alternative, hsz_alternative, payload_hash.buffer, &dsz, md, NULL) != 1)
+                if (sym_EVP_Digest(hdata_alternative, hsz_alternative, payload_hash.buffer, &dsz, md, /* impl= */ NULL) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to calculate event payload hash.");
                 assert(dsz == (unsigned) mdsz);
         }
@@ -1609,7 +1701,7 @@ static int event_log_record_validate_hash_userspace(
         if (!payload_hash)
                 return log_oom();
 
-        if (sym_EVP_Digest(s, strlen(s), payload_hash, &payload_hash_size, md, NULL) != 1)
+        if (sym_EVP_Digest(s, strlen(s), payload_hash, &payload_hash_size, md, /* impl= */ NULL) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to calculate event payload hash.");
 
         assert((int) payload_hash_size == mdsz);
@@ -1742,7 +1834,7 @@ static int event_log_add_component_file(EventLog *el, EventLogComponent *compone
         _cleanup_(event_log_component_variant_freep) EventLogComponentVariant *variant = NULL;
         _cleanup_free_ char *fname = NULL, *id = NULL, *path_copy = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
-        sd_json_variant *records;
+        sd_json_variant *records = NULL;
         const char *e;
         int r;
 
@@ -1775,7 +1867,7 @@ static int event_log_add_component_file(EventLog *el, EventLogComponent *compone
                         /* flags= */ 0,
                         &j,
                         /* reterr_line= */ NULL,
-                        /* ret_column= */ NULL);
+                        /* reterr_column= */ NULL);
         if (r < 0) {
                 log_warning_errno(r, "Failed to parse component file %s, ignoring: %m", path);
                 return 0;
@@ -1800,12 +1892,22 @@ static int event_log_add_component_file(EventLog *el, EventLogComponent *compone
                 .id = TAKE_PTR(id),
         };
 
-        records = sd_json_variant_by_key(j, "records");
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "records", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_variant_noref, 0, 0 },
+                {}
+        };
+
+        r = sd_json_dispatch(j, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &records);
+        if (r < 0) {
+                log_warning_errno(r, "Failed to parse component file %s, ignoring: %m", path);
+                return 0;
+        }
+
         if (records) {
                 sd_json_variant *rj;
 
                 if (!sd_json_variant_is_array(records)) {
-                        log_warning_errno(r, "Component records field of file %s is not an array, ignoring.", path);
+                        log_warning("Component records field of file %s is not an array, ignoring.", path);
                         return 0;
                 }
 
@@ -1910,7 +2012,7 @@ static int event_log_load_components(EventLog *el) {
                 if (endswith(*f, ".pcrlock.d"))
                         r = event_log_add_component_dir(el, *f, dirs);
                 else if (endswith(*f, ".pcrlock"))
-                        r = event_log_add_component_file(el, NULL, *f);
+                        r = event_log_add_component_file(el, /* component= */ NULL, *f);
                 else
                         continue;
                 if (r < 0)
@@ -2177,7 +2279,7 @@ static int add_algorithm_columns(
 
                 size_t c = table_get_current_column(table);
 
-                r = table_add_cell(table, NULL, TABLE_HEADER, v ?: n);
+                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_HEADER, v ?: n);
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -2226,7 +2328,7 @@ static int show_log_table(EventLog *el, sd_json_variant **ret_variant) {
         if (r < 0)
                 return table_log_add_error(r);
 
-        r = add_algorithm_columns(el, table, NULL, NULL);
+        r = add_algorithm_columns(el, table, /* prefix= */ NULL, /* json_field_prefix= */ NULL);
         if (r < 0)
                 return r;
 
@@ -2275,18 +2377,18 @@ static int show_log_table(EventLog *el, sd_json_variant **ret_variant) {
 
                         et = tpm2_log_event_type_to_string(record->firmware_event_type);
                         if (et)
-                                r = table_add_cell(table, NULL, TABLE_STRING, et);
+                                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, et);
                         else
-                                r = table_add_cell(table, NULL, TABLE_UINT32_HEX, &record->firmware_event_type);
+                                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_UINT32_HEX, &record->firmware_event_type);
                 } else if (EVENT_LOG_RECORD_IS_USERSPACE(record))
-                        r = table_add_cell(table, NULL, TABLE_STRING, tpm2_userspace_event_type_to_string(record->userspace_event_type));
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, tpm2_userspace_event_type_to_string(record->userspace_event_type));
                 else
-                        r = table_add_cell(table, NULL, TABLE_EMPTY, NULL);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_EMPTY, /* data= */ NULL);
                 if (r < 0)
                         return table_log_add_error(r);
 
                 if (record->event_payload_valid < 0 || record->event_payload_valid == EVENT_PAYLOAD_VALID_DONT_KNOW)
-                        r = table_add_cell(table, NULL, TABLE_EMPTY, NULL);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_EMPTY, /* data= */ NULL);
                 else
                         r = table_add_many(table,
                                            TABLE_BOOLEAN_CHECKMARK, record->event_payload_valid == EVENT_PAYLOAD_VALID_YES,
@@ -2308,9 +2410,9 @@ static int show_log_table(EventLog *el, sd_json_variant **ret_variant) {
                                 if (!sd_json_format_enabled(arg_json_format_flags))
                                         strshorten(hex, arg_abbreviate_hash);
 
-                                r = table_add_cell(table, NULL, TABLE_STRING, hex);
+                                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, hex);
                         } else
-                                r = table_add_cell(table, NULL, TABLE_EMPTY, NULL);
+                                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_EMPTY, /* data= */ NULL);
                         if (r < 0)
                                 return table_log_add_error(r);
                 }
@@ -2440,9 +2542,9 @@ static int show_pcr_table(EventLog *el, sd_json_variant **ret_variant) {
                         return table_log_add_error(r);
 
                 if (el->registers[pcr].n_measurements > 0)
-                        r = table_add_cell(table, NULL, TABLE_UINT, &el->registers[pcr].n_measurements);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_UINT, &el->registers[pcr].n_measurements);
                 else
-                        r = table_add_cell(table, NULL, TABLE_EMPTY, NULL);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_EMPTY, /* data= */ NULL);
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -2571,7 +2673,7 @@ static int event_log_load_and_process(EventLog **ret) {
         if (r < 0)
                 return r;
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ false);
         if (r < 0)
                 return r;
 
@@ -2669,7 +2771,7 @@ static int event_log_record_to_cel(EventLogRecord *record, uint64_t *recnum, sd_
         }
 
         if (!ja) {
-                r = sd_json_variant_new_array(&ja, NULL, 0);
+                r = sd_json_variant_new_array(&ja, /* array= */ NULL, 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to allocate JSON array: %m");
         }
@@ -2732,7 +2834,7 @@ static int verb_show_cel(int argc, char *argv[], uintptr_t _data, void *userdata
         if (!el)
                 return log_oom();
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ true);
         if (r < 0)
                 return r;
 
@@ -2753,7 +2855,7 @@ static int verb_show_cel(int argc, char *argv[], uintptr_t _data, void *userdata
         if (arg_json_format_flags & (SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_PRETTY_AUTO))
                 pager_open(arg_pager_flags);
 
-        sd_json_variant_dump(array, arg_json_format_flags|SD_JSON_FORMAT_EMPTY_ARRAY, stdout, NULL);
+        sd_json_variant_dump(array, arg_json_format_flags|SD_JSON_FORMAT_EMPTY_ARRAY, stdout, /* prefix= */ NULL);
         return 0;
 }
 
@@ -2919,7 +3021,7 @@ static int make_pcrlock_record(
                 if (!hash)
                         return log_oom();
 
-                if (sym_EVP_Digest(data, data_size, hash, &hash_usize, md, NULL) != 1)
+                if (sym_EVP_Digest(data, data_size, hash, &hash_usize, md, /* impl= */ NULL) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to hash data with algorithm '%s'.", a);
 
                 r = sd_json_variant_append_arraybo(
@@ -2969,7 +3071,7 @@ static int make_pcrlock_record_from_stream(
                 if (!mdctx[i])
                         return log_oom();
 
-                if (sym_EVP_DigestInit_ex(mdctx[i], md, NULL) != 1)
+                if (sym_EVP_DigestInit_ex(mdctx[i], md, /* impl= */ NULL) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                                "Failed to initialize message digest for %s.", a);
         }
@@ -3037,14 +3139,13 @@ static const char *pcrlock_path(const char *default_pcrlock_path) {
         return arg_pcrlock_path ?: arg_pcrlock_auto ? default_pcrlock_path : NULL;
 }
 
-static int write_pcrlock(sd_json_variant *array, const char *default_pcrlock_path) {
+static int write_pcrlock_at(sd_json_variant *array, const char *p) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *a = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        const char *p;
         int r;
 
         if (!array) {
-                r = sd_json_variant_new_array(&a, NULL, 0);
+                r = sd_json_variant_new_array(&a, /* array= */ NULL, 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to allocate empty array: %m");
 
@@ -3057,7 +3158,6 @@ static int write_pcrlock(sd_json_variant *array, const char *default_pcrlock_pat
         if (r < 0)
                 return log_error_errno(r, "Failed to build JSON object: %m");
 
-        p = pcrlock_path(default_pcrlock_path);
         if (p) {
                 (void) mkdir_parents_label(p, 0755);
 
@@ -3074,6 +3174,10 @@ static int write_pcrlock(sd_json_variant *array, const char *default_pcrlock_pat
                 log_debug("%s written.", p);
 
         return 0;
+}
+
+static int write_pcrlock(sd_json_variant *array, const char *default_pcrlock_path) {
+        return write_pcrlock_at(array, pcrlock_path(default_pcrlock_path));
 }
 
 static int unlink_pcrlock(const char *default_pcrlock_path) {
@@ -3247,7 +3351,7 @@ static int event_log_component_variant_calculate(
                         assert(result->hash[i].size == (size_t) sz);
                         assert(b->hash.size == (size_t) sz);
 
-                        if (sym_EVP_DigestInit_ex(md_ctx, md, NULL) != 1)
+                        if (sym_EVP_DigestInit_ex(md_ctx, md, /* impl= */ NULL) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to initialize message digest.");
 
                         if (sym_EVP_DigestUpdate(md_ctx, result->hash[i].buffer, sz) != 1)
@@ -3396,7 +3500,7 @@ static int event_log_show_predictions(Tpm2PCRPrediction *context, uint16_t alg) 
                 }
 
                 if (!j) {
-                        r = sd_json_variant_new_object(&j, NULL, 0);
+                        r = sd_json_variant_new_object(&j, /* array= */ NULL, 0);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to allocated empty object: %m");
                 }
@@ -3633,6 +3737,58 @@ static int write_boot_policy_file(const char *json_text) {
         return 1;
 }
 
+static int profile_wants_pcrlock(const char *text, unsigned profile, const char *origin) {
+        _cleanup_free_ char *value = NULL;
+        int r;
+
+        assert(origin);
+
+        if (text) {
+                r = parse_env_data(text, /* size= */ SIZE_MAX, origin, "PCRLOCK", &value);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse profile data from %s: %m", origin);
+        }
+
+        /* A non-default profile must opt in explicitly, so that booting it does not unlock the secrets
+         * bound to the policy by accident. */
+        if (!value)
+                return profile == 0;
+
+        r = parse_boolean(value);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse PCRLOCK= setting '%s' from %s: %m", value, origin);
+
+        return r;
+}
+
+static int booted_profile_wants_pcrlock(void) {
+        _cleanup_free_ char *s = NULL, *text = NULL;
+        unsigned profile;
+        int r;
+
+        r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("StubProfile"), &s);
+        if (r < 0) {
+                /* systemd-stub older than v257 and other boot paths do not set the variable. */
+                log_debug_errno(r, "Failed to read StubProfile EFI variable, assuming profile @0: %m");
+                return true;
+        }
+
+        r = safe_atou(s, &profile);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse StubProfile EFI variable '%s': %m", s);
+
+        const char *path = in_initrd() ? "/.extra/profile" : "/run/systemd/stub/profile";
+        r = read_full_file(path, &text, /* ret_size= */ NULL);
+        if (r == -ENOENT)
+                /* systemd-stub only passes the file to userspace if the booted profile has a .profile
+                 * section. lock-uki applies the default of PCRLOCK= to a profile without such a section. */
+                log_debug_errno(r, "Failed to read %s, assuming that profile @%u does not set PCRLOCK=: %m", path, profile);
+        else if (r < 0)
+                return log_error_errno(r, "Failed to read %s: %m", path);
+
+        return profile_wants_pcrlock(text, profile, path);
+}
+
 static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
         int r;
 
@@ -3668,6 +3824,9 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
         _cleanup_(tpm2_pcr_prediction_done) Tpm2PCRPrediction new_prediction = {
                 arg_pcr_mask != 0 ? arg_pcr_mask : DEFAULT_PCR_MASK,
         };
+
+        uint32_t requested_pcrs = new_prediction.pcrs;
+
         r = event_log_reduce_to_safe_pcrs(el, &new_prediction.pcrs);
         if (r < 0)
                 return r;
@@ -3689,7 +3848,7 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
                 return r;
 
         if (DEBUG_LOGGING)
-                (void) sd_json_variant_dump(new_prediction_json, SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO, stderr, NULL);
+                (void) sd_json_variant_dump(new_prediction_json, SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO, stderr, /* prefix= */ NULL);
 
         /* v257 and older mistakenly used --pcrlock= for the path. To keep backward compatibility, let's fallback to it when
          * --policy= is unspecified but --pcrlock is specified. */
@@ -3719,6 +3878,21 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
         if (have_old_policy) {
                 if (arg_nv_index != 0 && old_policy.nv_index != arg_nv_index)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Stored policy references different NV index (0x%x) than specified (0x%x), refusing.", old_policy.nv_index, arg_nv_index);
+
+                /* A UKI profile that is excluded from PCR locking has no .pcrlock file, hence the event log
+                 * of this boot contains measurements that match no component. The next boot of an included
+                 * profile does not contain them, and still satisfies the current policy. A policy generated
+                 * now would not cover the PCRs of these measurements anymore. */
+                uint32_t dropped_pcrs = old_policy.prediction.pcrs & requested_pcrs & ~new_prediction.pcrs;
+                if (!force && dropped_pcrs != 0) {
+                        r = booted_profile_wants_pcrlock();
+                        if (r < 0)
+                                return r;
+                        if (r == 0) {
+                                log_notice("The booted UKI profile is excluded from PCR locking and a new policy would not cover PCRs that the current policy covers (mask 0x%" PRIx32 "), not updating policy.", dropped_pcrs);
+                                return 0;
+                        }
+                }
 
                 if (!force &&
                     old_policy.algorithm == el->primary_algorithm &&
@@ -3870,7 +4044,7 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
                                         tc,
                                         policy_session,
                                         nv_handle,
-                                        NULL);
+                                        /* ret_policy_digest= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to submit AuthorizeNV policy: %m");
 
@@ -4047,7 +4221,7 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
                 return log_error_errno(r, "Failed to generate JSON: %m");
 
         _cleanup_free_ char *text = NULL;
-        r = sd_json_variant_format(new_configuration_json, 0, &text);
+        r = sd_json_variant_format(new_configuration_json, /* flags= */ 0, &text);
         if (r < 0)
                 return log_error_errno(r, "Failed to format new configuration to JSON: %m");
 
@@ -4331,7 +4505,7 @@ static int lock_firmware(bool is_code) {
         if (r < 0)
                 return r;
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ false);
         if (r < 0)
                 return r;
 
@@ -4484,7 +4658,7 @@ static int lock_secureboot_policy(void) {
 
                 _cleanup_free_ void *data = NULL;
                 size_t data_size;
-                r = efi_get_variable(name, NULL, &data, &data_size);
+                r = efi_get_variable(name, /* ret_attribute= */ NULL, &data, &data_size);
                 if (r < 0) {
                         if (r != -ENOENT || vv->synthesize_empty == 0)
                                 return log_error_errno(r, "Failed to read EFI variable '%s': %m", name);
@@ -4513,7 +4687,7 @@ static int lock_secureboot_policy(void) {
                 };
 
                 efi_id128_to_guid(vv->id, vdata->variableName);
-                memcpy(mempcpy(vdata->unicodeName, name16, name16_bytes), data, data_size);
+                memcpy_safe(mempcpy(vdata->unicodeName, name16, name16_bytes), data, data_size);
 
                 r = make_pcrlock_record(TPM2_PCR_SECURE_BOOT_POLICY /* =7 */, vdata, vdata_size, &record);
                 if (r < 0)
@@ -4679,7 +4853,7 @@ static int lock_secureboot_authority(void) {
         if (r < 0)
                 return r;
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ false);
         if (r < 0)
                 return r;
 
@@ -4767,7 +4941,7 @@ static int verb_lock_gpt(int argc, char *argv[], uintptr_t _data, void *userdata
         if (r < 0)
                 return log_error_errno(r, "Failed to determine root block device: %m");
 
-        fd = sd_device_open(d, O_CLOEXEC|O_RDONLY|O_NOCTTY);
+        fd = device_open(d, O_RDONLY|O_NOCTTY);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open root block device: %m");
 
@@ -4868,62 +5042,20 @@ static int verb_unlock_gpt(int argc, char *argv[], uintptr_t _data, void *userda
         return unlink_pcrlock(PCRLOCK_GPT_PATH);
 }
 
-static int pe_stdin_too_large(void) {
-        return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
-                               "PE/UKI binary from stdin is larger than the maximum supported size of %s.",
-                               FORMAT_BYTES(PCRLOCK_PE_INPUT_MAX));
-}
-
-static int acquire_stdin_pe_fd(void) {
-        _cleanup_close_ int fd = -EBADF;
-        const char *td;
-        struct stat st;
-        int r;
-
-        if (fstat(STDIN_FILENO, &st) < 0)
-                return log_error_errno(errno, "Failed to stat stdin: %m");
-
-        if (S_ISREG(st.st_mode)) {
-                if ((uint64_t) st.st_size > PCRLOCK_PE_INPUT_MAX)
-                        return pe_stdin_too_large();
-
-                /* Regular stdin is already seekable. Keep it directly to avoid copying large redirected
-                 * PE/UKI files before hashing them. The size check above is a fast-path guard; a file that
-                 * grows concurrently is still hashed stream-wise with bounded memory use. */
-                fd = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to duplicate stdin: %m");
-
-                return TAKE_FD(fd);
-        }
-
-        r = var_tmp_dir(&td);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine temporary directory: %m");
-
-        fd = open_tmpfile_unlinkable(td, O_RDWR|O_CLOEXEC);
-        if (fd < 0)
-                return log_error_errno(fd, "Failed to create temporary file for PE binary: %m");
-
-        r = copy_bytes(STDIN_FILENO, fd, PCRLOCK_PE_INPUT_MAX + 1, /* copy_flags= */ 0);
-        if (r < 0)
-                return log_error_errno(r, "Failed to copy PE binary from stdin to temporary file: %m");
-        if (r > 0)
-                return pe_stdin_too_large();
-
-        return TAKE_FD(fd);
-}
-
 static int acquire_pe_fd(const char *path) {
-        if (path) {
-                int fd = open(path, O_RDONLY|O_CLOEXEC);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open '%s': %m", path);
+        int fd;
 
-                return fd;
-        }
+        if (path)
+                fd = open_seekable_data_fd(AT_FDCWD, path, PCRLOCK_PE_INPUT_MAX);
+        else
+                fd = seekable_data_fd(STDIN_FILENO, PCRLOCK_PE_INPUT_MAX);
+        if (fd == -EFBIG)
+                return log_error_errno(fd, "PE/UKI binary %s is larger than the maximum supported size of %s.",
+                                       path ?: "from stdin", FORMAT_BYTES(PCRLOCK_PE_INPUT_MAX));
+        if (fd < 0)
+                return log_error_errno(fd, "Failed to open %s: %m", path ?: "stdin");
 
-        return acquire_stdin_pe_fd();
+        return fd;
 }
 
 VERB(verb_lock_pe, "lock-pe", "[BINARY]\0", VERB_ANY, 2, 0,
@@ -4978,62 +5110,189 @@ static int verb_lock_pe(int argc, char *argv[], uintptr_t _data, void *userdata)
                         return log_error_errno(r, "Failed to append record object: %m");
         }
 
-        return write_pcrlock(array, NULL);
+        return write_pcrlock(array, /* default_pcrlock_path= */ NULL);
 }
 
 VERB_NOARG(verb_unlock_simple, "unlock-pe",
            "Remove .pcrlock file for PE binary");
 static int verb_unlock_simple(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        return unlink_pcrlock(NULL);
+        return unlink_pcrlock(/* default_pcrlock_path= */ NULL);
 }
 
-typedef void* SectionHashArray[_UNIFIED_SECTION_MAX * TPM2_N_HASH_ALGORITHMS];
-
-static void section_hashes_array_done(SectionHashArray *array) {
-        assert(array);
-
-        for (size_t i = 0; i < _UNIFIED_SECTION_MAX * TPM2_N_HASH_ALGORITHMS; i++)
-                free((*array)[i]);
-}
-
-VERB(verb_lock_uki, "lock-uki", "[UKI]\0", VERB_ANY, 2, 0,
-     "Generate a .pcrlock file from UKI PE binary");
-static int verb_lock_uki(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL, *pe_digests = NULL;
-        _cleanup_(section_hashes_array_done) SectionHashArray section_hashes = {};
+typedef struct UkiHashCache {
+        /* hashes contains one digest per PE section and hash algorithm. Several profiles use the same
+         * section if they inherit it from the base profile. */
+        void **hashes;
+        size_t n_hashes;
         size_t hash_sizes[TPM2_N_HASH_ALGORITHMS];
-        _cleanup_close_ int fd = -EBADF;
+} UkiHashCache;
+
+static void uki_hash_cache_done(UkiHashCache *cache) {
+        assert(cache);
+
+        free_many(cache->hashes, cache->n_hashes);
+        cache->hashes = mfree(cache->hashes);
+        cache->n_hashes = 0;
+}
+
+static int pcrlock_path_is_variant(const char *path) {
+        _cleanup_free_ char *absolute = NULL, *dir = NULL, *dir_name = NULL;
         int r;
 
-        if (arg_pcr_mask != 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "PCR not configurable for UKI lock down.");
+        assert(path);
 
-        fd = acquire_pe_fd(argc >= 2 ? argv[1] : NULL);
-        if (fd < 0)
-                return fd;
+        r = path_make_absolute_cwd(path, &absolute);
+        if (r < 0)
+                return log_error_errno(r, "Failed to make path '%s' absolute: %m", path);
 
-        for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++) {
-                _cleanup_free_ void *peh = NULL;
-                const EVP_MD *md;
-                const char *a;
+        r = path_extract_directory(absolute, &dir);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract directory from '%s': %m", absolute);
 
-                assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
-                assert_se(md = sym_EVP_get_digestbyname(a));
+        r = path_extract_filename(dir, &dir_name);
+        if (r == -EADDRNOTAVAIL) /* The file is located in the root directory. */
+                return false;
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract file name from '%s': %m", dir);
 
-                r = pe_hash(fd, md, &peh, hash_sizes + i);
+        return !!endswith(dir_name, ".pcrlock.d");
+}
+
+static int pcrlock_profile_path(const char *path, unsigned profile, char **ret) {
+        char *s;
+
+        assert(path);
+        assert(profile > 0);
+        assert(ret);
+
+        const char *e = endswith(path, ".pcrlock");
+        if (e) {
+                if (asprintf(&s, "%.*s@%u.pcrlock", (int) (e - path), path, profile) < 0)
+                        return log_oom();
+        } else if (asprintf(&s, "%s@%u", path, profile) < 0)
+                return log_oom();
+
+        *ret = s;
+        return 0;
+}
+
+static int unlink_pcrlock_profiles(const char *path, const bool *keep) {
+        _cleanup_free_ char *dir = NULL, *fn = NULL, *prefix = NULL;
+        _cleanup_closedir_ DIR *d = NULL;
+        int r;
+
+        assert(path);
+
+        /* The UKI might be gone already, hence unlink_pcrlock_profiles() finds the files of the profiles
+         * above @0 by the names that pcrlock_profile_path() generates. */
+
+        r = path_extract_filename(path, &fn);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract file name from '%s': %m", path);
+
+        r = path_extract_directory(path, &dir);
+        if (r < 0 && r != -EDESTADDRREQ)
+                return log_error_errno(r, "Failed to extract directory from '%s': %m", path);
+
+        const char *e = endswith(fn, ".pcrlock"), *suffix = e ? ".pcrlock" : "";
+        const char *stem = e ? strndupa_safe(fn, e - fn) : fn;
+        prefix = strjoin(stem, "@");
+        if (!prefix)
+                return log_oom();
+
+        d = opendir(dir ?: ".");
+        if (!d) {
+                if (errno == ENOENT)
+                        return 0;
+
+                return log_error_errno(errno, "Failed to open directory '%s': %m", dir ?: ".");
+        }
+
+        /* The file name of the .pcrlock file may start with a dot, and FOREACH_DIRENT() skips such files. */
+        FOREACH_DIRENT_ALL(de, d, return log_error_errno(errno, "Failed to read directory '%s': %m", dir ?: ".")) {
+                const char *n = startswith(de->d_name, prefix);
+                if (!n)
+                        continue;
+
+                const char *x = endswith(n, suffix);
+                if (!x || x == n)
+                        continue;
+
+                _cleanup_free_ char *number = strndup(n, x - n);
+                if (!number)
+                        return log_oom();
+
+                /* pcrlock_profile_path() only generates decimal profile numbers above 0 without leading
+                 * zeroes. A file with any other name was not written by lock-uki. */
+                unsigned profile;
+                if (!in_charset(number, DIGITS) || number[0] == '0' ||
+                    safe_atou_full(number, 10, &profile) < 0 || profile >= UNIFIED_PROFILES_MAX)
+                        continue;
+
+                if (keep && keep[profile])
+                        continue;
+
+                if (unlinkat(dirfd(d), de->d_name, 0) < 0 && errno != ENOENT)
+                        return log_error_errno(errno, "Failed to delete %s/%s: %m", dir ?: ".", de->d_name);
+
+                log_info("%s/%s deleted.", dir ?: ".", de->d_name);
+        }
+
+        return 0;
+}
+
+static int uki_profile_wants_pcrlock(
+                int fd,
+                const PeHeader *pe_header,
+                const IMAGE_SECTION_HEADER *sections,
+                unsigned profile) {
+
+        _cleanup_free_ char *text = NULL;
+        int r;
+
+        assert(fd >= 0);
+        assert(pe_header);
+
+        /* The section table of a profile starts with its .profile section. Profile @0 has none if the UKI
+         * has no .profile section at all. */
+        const IMAGE_SECTION_HEADER *psections = pe_find_profile_section_table(pe_header, sections, profile, /* ret_n_sections= */ NULL);
+        if (psections) {
+                r = pe_read_section_data(fd, psections, PE_SECTION_SIZE_MAX, (void**) &text, /* ret_size= */ NULL);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to hash PE binary: %m");
+                        return log_error_errno(r, "Failed to read .profile section of profile @%u: %m", profile);
+        }
 
-                r = sd_json_variant_append_arraybo(
-                                &pe_digests,
-                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
-                                SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(peh, hash_sizes[i])));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to build JSON digest object: %m");
+        return profile_wants_pcrlock(text, profile, ".profile");
+}
 
-                r = uki_hash(fd, md, section_hashes + (i * _UNIFIED_SECTION_MAX), hash_sizes + i);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to UKI hash PE binary: %m");
+static int uki_profile_records(
+                int fd,
+                const PeHeader *pe_header,
+                const IMAGE_SECTION_HEADER *sections,
+                UkiHashCache *cache,
+                unsigned profile,
+                sd_json_variant *pe_digests,
+                sd_json_variant **ret) {
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
+        const IMAGE_SECTION_HEADER *selected[_UNIFIED_SECTION_MAX];
+        int r;
+
+        assert(fd >= 0);
+        assert(pe_header);
+        assert(cache);
+        assert(pe_digests);
+        assert(ret);
+
+        /* uki_profile_records() returns the records for the measurements of one boot of the specified
+         * profile. It returns 0 if the UKI does not contain the profile. */
+
+        r = uki_profile_sections(pe_header, sections, profile, selected);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                *ret = NULL;
+                return 0;
         }
 
         r = sd_json_variant_append_arraybo(
@@ -5046,29 +5305,32 @@ static int verb_lock_uki(int argc, char *argv[], uintptr_t _data, void *userdata
         for (UnifiedSection section = 0; section < _UNIFIED_SECTION_MAX; section++) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *section_digests = NULL, *record = NULL;
 
-                if (!unified_section_measure(section))
+                if (!unified_section_measure(section) || !selected[section])
                         continue;
 
                 for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++) {
+                        void **hash = cache->hashes + (selected[section] - sections) * TPM2_N_HASH_ALGORITHMS + i;
                         const char *a;
-                        void *hash;
-
-                        hash = section_hashes[i * _UNIFIED_SECTION_MAX + section];
-                        if (!hash)
-                                continue;
 
                         assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
+
+                        if (!*hash) {
+                                const EVP_MD *md;
+
+                                assert_se(md = sym_EVP_get_digestbyname(a));
+
+                                r = uki_hash_section(fd, md, selected[section], hash, cache->hash_sizes + i);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to hash section %s: %m", unified_sections[section]);
+                        }
 
                         r = sd_json_variant_append_arraybo(
                                         &section_digests,
                                         SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
-                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_sizes[i])));
+                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(*hash, cache->hash_sizes[i])));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build JSON digest object: %m");
                 }
-
-                if (!section_digests)
-                        continue;
 
                 /* So we have digests for this section, hence generate a record for the section name first. */
                 r = make_pcrlock_record(TPM2_PCR_KERNEL_BOOT /* =11 */, unified_sections[section], strlen(unified_sections[section]) + 1, &record);
@@ -5088,11 +5350,166 @@ static int verb_lock_uki(int argc, char *argv[], uintptr_t _data, void *userdata
                         return log_error_errno(r, "Failed to append record object: %m");
         }
 
-        return write_pcrlock(array, NULL);
+        *ret = TAKE_PTR(array);
+        return 1;
 }
 
-VERB_NOARG(verb_unlock_simple, "unlock-uki",
-           "Remove .pcrlock file for UKI PE binary");
+VERB(verb_lock_uki, "lock-uki", "[UKI]\0", VERB_ANY, 2, 0,
+     "Generate .pcrlock files from UKI PE binary");
+static int verb_lock_uki(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *profiles = NULL, *pe_digests = NULL;
+        _cleanup_(uki_hash_cache_done) UkiHashCache cache = {};
+        _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
+        _cleanup_free_ PeHeader *pe_header = NULL;
+        bool wanted[UNIFIED_PROFILES_MAX] = {};
+        _cleanup_close_ int fd = -EBADF;
+        unsigned n_profiles = 0, first_extra_profile = 0;
+        int r;
+
+        if (arg_pcr_mask != 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "PCR not configurable for UKI lock down.");
+
+        fd = acquire_pe_fd(argc >= 2 ? argv[1] : NULL);
+        if (fd < 0)
+                return fd;
+
+        r = pe_load_headers_and_sections(fd, &pe_header, &sections);
+        if (r < 0)
+                return log_error_errno(r, "Failed to load PE headers: %m");
+
+        size_t n_hashes = (size_t) le16toh(pe_header->pe.NumberOfSections) * TPM2_N_HASH_ALGORITHMS;
+        cache.hashes = new0(void*, n_hashes);
+        if (!cache.hashes)
+                return log_oom();
+        cache.n_hashes = n_hashes;
+
+        /* The firmware measures the whole PE binary into PCR 4, regardless of the profile that is booted. */
+        for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++) {
+                _cleanup_free_ void *peh = NULL;
+                size_t hash_size;
+                const EVP_MD *md;
+                const char *a;
+
+                assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
+                assert_se(md = sym_EVP_get_digestbyname(a));
+
+                r = pe_hash(fd, md, &peh, &hash_size);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to hash PE binary: %m");
+
+                r = sd_json_variant_append_arraybo(
+                                &pe_digests,
+                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
+                                SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(peh, hash_size)));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to build JSON digest object: %m");
+        }
+
+        /* systemd-stub measures a different set of sections into PCR 11 for each profile, hence each
+         * profile is one variant of the component. */
+        for (; n_profiles < UNIFIED_PROFILES_MAX; n_profiles++) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
+
+                int q = uki_profile_records(fd, pe_header, sections, &cache, n_profiles, pe_digests, &array);
+                if (q == 0)
+                        break;
+
+                r = uki_profile_wants_pcrlock(fd, pe_header, sections, n_profiles);
+                if (r < 0)
+                        return r;
+                wanted[n_profiles] = r;
+
+                if (wanted[n_profiles] && n_profiles > 0 && first_extra_profile == 0)
+                        first_extra_profile = n_profiles;
+
+                if (q < 0) {
+                        /* The records of an excluded profile are only needed for the comparison below, hence
+                         * an excluded profile may have a section table that uki_profile_sections() rejects. */
+                        if (wanted[n_profiles] || q != -EBADMSG)
+                                return log_error_errno(q, "Failed to predict the measurements of profile @%u: %m", n_profiles);
+
+                        log_notice_errno(q, "Failed to predict the measurements of profile @%u, which is excluded from PCR locking. Not comparing it against the included profiles: %m", n_profiles);
+
+                        r = sd_json_variant_new_null(&array);
+                        if (r < 0)
+                                return log_oom();
+                }
+
+                r = sd_json_variant_append_array(&profiles, array);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append JSON record array: %m");
+        }
+
+        /* An excluded profile only stays locked if it is measured differently than every included profile. */
+        for (unsigned i = 0; i < n_profiles; i++) {
+                if (wanted[i])
+                        continue;
+
+                for (unsigned j = 0; j < n_profiles; j++)
+                        if (wanted[j] && sd_json_variant_equal(sd_json_variant_by_index(profiles, i), sd_json_variant_by_index(profiles, j)))
+                                log_warning("Profile @%u is excluded from PCR locking, but is measured identically to the included profile @%u. Booting profile @%u will satisfy the policy.", i, j, i);
+        }
+
+        const char *p = pcrlock_path(/* default_pcrlock_path= */ NULL);
+
+        /* The files of the profiles above @0 are only variants of the same component as the file of profile
+         * @0 if all of the files are located in the same *.pcrlock.d/ directory. Outside of such a directory
+         * each file is a component of its own, and no boot matches all of the components. */
+        if (p && first_extra_profile > 0) {
+                r = pcrlock_path_is_variant(p);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Profile @%u needs a .pcrlock file of its own, but '%s' is not located in a *.pcrlock.d/ directory, refusing.", first_extra_profile, p);
+        }
+
+        for (unsigned i = 0; i < n_profiles; i++) {
+                _cleanup_free_ char *pp = NULL;
+
+                if (!wanted[i]) {
+                        log_debug("Profile @%u is excluded from PCR locking, not generating a .pcrlock file for it.", i);
+                        continue;
+                }
+
+                if (p && i > 0) {
+                        r = pcrlock_profile_path(p, i, &pp);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = write_pcrlock_at(sd_json_variant_by_index(profiles, i), pp ?: p);
+                if (r < 0)
+                        return r;
+        }
+
+        if (!p)
+                return 0;
+
+        /* A previous invocation might have written files for profiles that are excluded or gone now. Such
+         * a file would keep the profile included. */
+        if (!wanted[0] && unlink(p) < 0 && errno != ENOENT)
+                return log_error_errno(errno, "Failed to delete %s: %m", p);
+
+        return unlink_pcrlock_profiles(p, wanted);
+}
+
+VERB_NOARG(verb_unlock_uki, "unlock-uki",
+           "Remove .pcrlock files for UKI PE binary");
+static int verb_unlock_uki(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        const char *p;
+        int r;
+
+        p = pcrlock_path(/* default_pcrlock_path= */ NULL);
+        if (!p)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No .pcrlock path specified, refusing.");
+
+        r = unlink_pcrlock_profiles(p, /* keep= */ NULL);
+        if (r < 0)
+                return r;
+
+        return unlink_pcrlock(/* default_pcrlock_path= */ NULL);
+}
 
 VERB_NOARG(verb_lock_machine_id, "lock-machine-id",
            "Generate a .pcrlock file from current machine ID");
@@ -5221,7 +5638,7 @@ static int verb_unlock_file_system(int argc, char *argv[], uintptr_t _data, void
         STRV_FOREACH(p, paths) {
                 _cleanup_free_ char *normalized_path = NULL, *pcrlock_file = NULL;
 
-                r = chase(*p, NULL, 0, &normalized_path, NULL);
+                r = chase(*p, /* root= */ NULL, /* flags= */ 0, &normalized_path, /* ret_fd= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to normal path '%s': %m", argv[1]);
 
@@ -5246,9 +5663,9 @@ static int verb_lock_kernel_cmdline(int argc, char *argv[], uintptr_t _data, voi
 
         if (argc > 1) {
                 if (empty_or_dash(argv[1]))
-                        r = read_full_stream(stdin, &cmdline, NULL);
+                        r = read_full_stream(stdin, &cmdline, /* ret_size= */ NULL);
                 else
-                        r = read_full_file(argv[1], &cmdline, NULL);
+                        r = read_full_file(argv[1], &cmdline, /* ret_size= */ NULL);
         } else
                 r = proc_cmdline(&cmdline);
         if (r < 0)
@@ -5333,7 +5750,7 @@ static int verb_lock_raw(int argc, char *argv[], uintptr_t _data, void *userdata
         if (r < 0)
                 return r;
 
-        return write_pcrlock(records, NULL);
+        return write_pcrlock(records, /* default_pcrlock_path= */ NULL);
 }
 
 VERB_NOARG(verb_unlock_simple, "unlock-raw",
@@ -5563,11 +5980,11 @@ static int vl_method_read_event_log(sd_varlink *link, sd_json_variant *parameter
         if (!el)
                 return log_oom();
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ true);
         if (r < 0)
                 return r;
 
-        r = sd_varlink_set_sentinel(link, NULL);
+        r = sd_varlink_set_sentinel(link, /* error_id= */ NULL);
         if (r < 0)
                 return r;
 
@@ -5600,7 +6017,7 @@ static int vl_method_list_components(sd_varlink *link, sd_json_variant *paramete
         if (r < 0)
                 return r;
 
-        r = sd_varlink_set_sentinel(link, NULL);
+        r = sd_varlink_set_sentinel(link, /* error_id= */ NULL);
         if (r < 0)
                 return r;
 
@@ -5617,7 +6034,7 @@ static int vl_method_list_components(sd_varlink *link, sd_json_variant *paramete
                 }
 
                 if (!variants) {
-                        r = sd_json_variant_new_array(&variants, NULL, 0);
+                        r = sd_json_variant_new_array(&variants, /* array= */ NULL, 0);
                         if (r < 0)
                                 return r;
                 }
@@ -5655,9 +6072,9 @@ static int vl_method_make_policy(sd_varlink *link, sd_json_variant *parameters, 
         if (r < 0)
                 return r;
         if (r == 0)
-                return sd_varlink_error(link, "io.systemd.PCRLock.NoChange", NULL);
+                return sd_varlink_error(link, "io.systemd.PCRLock.NoChange", /* parameters= */ NULL);
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_remove_policy(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -5673,7 +6090,7 @@ static int vl_method_remove_policy(sd_varlink *link, sd_json_variant *parameters
         if (r < 0)
                 return r;
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 typedef enum LockCategory {
@@ -5742,7 +6159,7 @@ static int vl_method_lock(sd_varlink *link, sd_json_variant *parameters, sd_varl
         if (r < 0)
                 return r;
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_on_completed_update(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -5763,7 +6180,7 @@ static int vl_method_on_completed_update(sd_varlink *link, sd_json_variant *para
         if (r < 0)
                 return r;
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int run(int argc, char *argv[]) {

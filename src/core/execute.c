@@ -35,8 +35,10 @@
 #include "glob-util.h"
 #include "hexdecoct.h"
 #include "image-policy.h"
+#include "io-uring-filter.h"
 #include "io-util.h"
 #include "ioprio-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "manager.h"
 #include "mkdir.h"
@@ -70,7 +72,7 @@
 const char* exec_context_tty_path(const ExecContext *context) {
         assert(context);
 
-        if (context->stdio_as_fds)
+        if (context->stdio_as_fds || exec_context_has_broker(context))
                 return NULL;
 
         if (context->tty_path)
@@ -111,14 +113,14 @@ int exec_context_apply_tty_size(
 
         /* If we got nothing so far and we are talking to a physical device, then let's query dimensions from
          * the ANSI terminal driver. Note that we will not bother with this in case terminal reset via ansi
-         * sequences is not enabled, as the DSR logic relies on ANSI sequences after all, and if we shall not
-         * use those during initialization we need to skip it. */
+         * sequences is not enabled, as the size query logic relies on ANSI sequences after all, and if we
+         * shall not use those during initialization we need to skip it. */
         if (rows == UINT_MAX && cols == UINT_MAX &&
             exec_context_shall_ansi_seq_reset(context) &&
             isatty_safe(input_fd)) {
-                r = terminal_get_size(input_fd, output_fd, &rows, &cols, /* try_dsr= */ true, /* try_csi18= */ false);
+                r = terminal_query(input_fd, output_fd, &rows, &cols, /* ret_terminfo= */ NULL);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to get terminal size by DSR, ignoring: %m");
+                        log_debug_errno(r, "Failed to get terminal size via ANSI sequences, ignoring: %m");
         }
 
         return terminal_set_size_fd(output_fd, tty_path, rows, cols);
@@ -140,7 +142,7 @@ void exec_context_tty_reset(const ExecContext *context, const ExecParameters *pa
         if (parameters && parameters->stdout_fd >= 0 && isatty_safe(parameters->stdout_fd))
                 fd = parameters->stdout_fd;
         else if (path && exec_context_has_tty(context)) {
-                fd = _fd = open_terminal(path, O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+                fd = _fd = open_terminal(path, O_RDWR|O_NOCTTY|O_NONBLOCK);
                 if (fd < 0)
                         return (void) log_debug_errno(fd, "Failed to open terminal '%s', ignoring: %m", path);
         } else
@@ -202,7 +204,7 @@ bool exec_needs_network_namespace(const ExecContext *context) {
 }
 
 static bool exec_needs_ephemeral(const ExecContext *context) {
-        return (context->root_image || context->root_directory) && context->root_ephemeral;
+        return (context->root_image || context->root_directory || context->root_directory_as_fd) && context->root_ephemeral;
 }
 
 bool exec_needs_ipc_namespace(const ExecContext *context) {
@@ -462,6 +464,20 @@ static void log_command_line(Unit *unit, const char *msg, const char *executable
 
 static int exec_context_load_environment(const Unit *unit, const ExecContext *c, char ***ret);
 
+bool exec_context_has_address_families(const ExecContext *c) {
+        assert(c);
+
+        return c->address_families_allow_list ||
+                !set_isempty(c->address_families);
+}
+
+bool exec_context_has_syscall_filters(const ExecContext *c) {
+        assert(c);
+
+        return c->syscall_allow_list ||
+                !hashmap_isempty(c->syscall_filter);
+}
+
 int exec_spawn(
                 Unit *unit,
                 ExecCommand *command,
@@ -488,6 +504,18 @@ int exec_spawn(
         assert(ret);
 
         LOG_CONTEXT_PUSH_UNIT(unit);
+
+        /* CLONE_INTO_CGROUP applies TasksMax= before the executor can fork a probe. */
+        if (FLAGS_SET(params->flags, EXEC_APPLY_SANDBOXING) &&
+            !FLAGS_SET(command->flags, EXEC_COMMAND_FULLY_PRIVILEGED) &&
+            (exec_context_has_address_families(context) ||
+             context->restrict_suid_sgid || exec_context_has_syscall_filters(context) ||
+             exec_context_io_uring_filter_set(context))) {
+                r = io_uring_bpf_filter_supported();
+                if (r < 0)
+                        return log_unit_error_errno(unit, r, "Failed to check whether io_uring BPF filters are supported: %m");
+                params->io_uring_bpf_filter_supported = r;
+        }
 
         r = exec_context_load_environment(unit, context, &params->files_env);
         if (r < 0)
@@ -545,7 +573,7 @@ int exec_spawn(
         if (r < 0)
                 return log_unit_error_errno(unit, r, "Failed to finish serialization stream: %m");
 
-        r = fd_cloexec(fileno(f), false);
+        r = fd_cloexec(fileno(f), /* cloexec= */ false);
         if (r < 0)
                 return log_unit_error_errno(unit, r, "Failed to set O_CLOEXEC on serialization fd: %m");
 
@@ -588,7 +616,7 @@ int exec_spawn(
                         &pidref);
 
         /* Drop the ambient set again, so no processes other than sd-executore spawned from the manager inherit it. */
-        (void) capability_ambient_set_apply(0, /* also_inherit= */ false);
+        (void) capability_ambient_set_apply(/* set= */ 0, /* also_inherit= */ false);
 
         if (r == -EUCLEAN && cgtarget)
                 return log_unit_error_errno(unit, r,
@@ -723,6 +751,7 @@ void exec_context_done(ExecContext *c) {
         c->syscall_archs = set_free(c->syscall_archs);
         c->syscall_log = hashmap_free(c->syscall_log);
         c->address_families = set_free(c->address_families);
+        c->io_uring_filter = set_free(c->io_uring_filter);
 
         FOREACH_ARRAY(d, c->directories, _EXEC_DIRECTORY_TYPE_MAX)
                 exec_directory_done(d);
@@ -1078,7 +1107,12 @@ static bool exec_context_may_touch_tty(const ExecContext *ec) {
 
 bool exec_context_may_touch_console(const ExecContext *ec) {
 
+        /* PTYs acquired from ptybrokerd are terminals (hence exec_context_may_touch_tty() may return true),
+         * but they never refer to the physical console, so exclude them here. Note that
+         * tty_may_match_dev_console() would otherwise return true for them, as exec_context_tty_path()
+         * reports no path. */
         return exec_context_may_touch_tty(ec) &&
+               !exec_context_has_broker(ec) &&
                tty_may_match_dev_console(exec_context_tty_path(ec));
 }
 
@@ -1635,6 +1669,14 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
         }
 #endif
 
+        if (exec_context_io_uring_filter_set(c)) {
+                _cleanup_strv_free_ char **l = exec_context_get_io_uring_filter(c);
+                _cleanup_free_ char *joined = strv_join(l, " ");
+
+                fprintf(f, "%sIOUringFilter: %s%s\n",
+                        prefix, c->io_uring_filter_allow_list ? "" : "~", strnull(joined));
+        }
+
         if (c->user_namespace_path)
                 fprintf(f,
                         "%sUserNamespacePath: %s\n",
@@ -1711,7 +1753,7 @@ int exec_context_get_effective_ioprio(const ExecContext *c) {
         if (c->ioprio_is_set)
                 return c->ioprio;
 
-        p = ioprio_get(IOPRIO_WHO_PROCESS, 0);
+        p = ioprio_get(IOPRIO_WHO_PROCESS, /* who= */ 0);
         if (p < 0)
                 return IOPRIO_DEFAULT_CLASS_AND_PRIO;
 
@@ -1756,10 +1798,8 @@ bool exec_context_get_effective_bind_log_sockets(const ExecContext *c) {
 void exec_context_free_log_extra_fields(ExecContext *c) {
         assert(c);
 
-        FOREACH_ARRAY(field, c->log_extra_fields, c->n_log_extra_fields)
-                free(field->iov_base);
-
-        c->log_extra_fields = mfree(c->log_extra_fields);
+        iovec_array_free(c->log_extra_fields, c->n_log_extra_fields);
+        c->log_extra_fields = NULL;
         c->n_log_extra_fields = 0;
 }
 
@@ -1784,9 +1824,9 @@ void exec_context_revert_tty(ExecContext *c, sd_id128_t invocation_id) {
         if (!path)
                 return;
 
-        fd = open(path, O_PATH|O_CLOEXEC); /* Pin the inode */
+        fd = xopenat(AT_FDCWD, path, O_PATH); /* Pin the inode */
         if (fd < 0)
-                return (void) log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,
+                return (void) log_full_errno(fd == -ENOENT ? LOG_DEBUG : LOG_WARNING, fd,
                                              "Failed to open TTY inode of '%s' to adjust ownership/access mode, ignoring: %m",
                                              path);
 
@@ -1801,7 +1841,7 @@ void exec_context_revert_tty(ExecContext *c, sd_id128_t invocation_id) {
         if (!S_ISCHR(st.st_mode))
                 return log_warning("Configured TTY '%s' is not actually a character device, ignoring.", path);
 
-        r = fchmod_and_chown(fd, TTY_MODE, 0, TTY_GID);
+        r = fchmod_and_chown(fd, TTY_MODE, /* uid= */ 0, TTY_GID);
         if (r < 0)
                 log_warning_errno(r, "Failed to reset TTY ownership/access mode of %s to " UID_FMT ":" GID_FMT ", ignoring: %m", path, (uid_t) 0, (gid_t) TTY_GID);
 }
@@ -2086,6 +2126,28 @@ char** exec_context_get_syscall_log(const ExecContext *c) {
         return l ? TAKE_PTR(l) : strv_new(NULL);
 }
 
+char** exec_context_get_io_uring_filter(const ExecContext *c) {
+        _cleanup_strv_free_ char **l = NULL;
+        void *op;
+
+        assert(c);
+
+        SET_FOREACH(op, c->io_uring_filter) {
+                const char *name;
+
+                name = io_uring_op_to_string(PTR_TO_INT(op) - 1);
+                if (!name)
+                        continue;
+
+                if (strv_extend(&l, name) < 0)
+                        return NULL;
+        }
+
+        strv_sort(l);
+
+        return l ? TAKE_PTR(l) : strv_new(NULL);
+}
+
 char** exec_context_get_address_families(const ExecContext *c) {
         _cleanup_strv_free_ char **l = NULL;
         void *af;
@@ -2135,20 +2197,39 @@ bool exec_context_restrict_filesystems_set(const ExecContext *c) {
           !set_isempty(c->restrict_filesystems);
 }
 
+bool exec_context_io_uring_filter_set(const ExecContext *c) {
+        assert(c);
+
+        return c->io_uring_filter_allow_list ||
+                !set_isempty(c->io_uring_filter);
+}
+
+bool exec_context_with_separate_rootfs(const ExecContext *c) {
+        assert(c);
+
+        /* Checks if a root file system other than our own root directory is used: RootDirectory= pointing
+         * somewhere else than /, RootImage=, RootMStack= or RootDirectoryFileDescriptor=.
+         * The settings are checked in the same order as pin_rootfs() resolves them: when several roots are
+         * configured, the first one that is set is used and the others are ignored, e.g. with both
+         * RootDirectory= and RootImage= configured, whether RootDirectory= resolves to our own root is
+         * irrelevant. Hence, do not reorder the checks. */
+
+        if (c->root_directory_as_fd || c->root_image)
+                return true;
+
+        if (c->root_directory)
+                return !empty_or_root(c->root_directory);
+
+        return c->root_mstack;
+}
+
 bool exec_context_with_rootfs(const ExecContext *c) {
         assert(c);
 
-        /* Checks if RootDirectory=, RootImage=, RootMStack= or RootDirectoryFileDescriptor= are used */
-
-        return !empty_or_root(c->root_directory) || c->root_image || c->root_directory_as_fd || c->root_mstack;
-}
-
-bool exec_context_with_rootfs_strict(const ExecContext *c) {
-        assert(c);
-
-        /* just like exec_context_with_rootfs(), but doesn't suppress a root directory of "/", i.e. returns
-         * true in more cases: when a root directory is explicitly configured, even if it's our usual
-         * root. */
+        /* Checks if RootDirectory=, RootImage=, RootMStack=, or RootDirectoryFileDescriptor= are used.
+         * Note that RootDirectory=/ counts, too: it is treated like any other root directory, even
+         * though it refers to our usual root. For checks that care about the root being a separate
+         * tree, use exec_context_with_separate_rootfs() above. */
 
         return c->root_directory || c->root_image || c->root_directory_as_fd || c->root_mstack;
 }
@@ -2301,6 +2382,44 @@ void exec_command_dump_list(ExecCommand *c, FILE *f, const char *prefix) {
 
         LIST_FOREACH(command, i, c)
                 exec_command_dump(i, f, prefix);
+}
+
+int exec_command_new(
+                const char *path,
+                char **argv_consume,
+                ExecCommandFlags flags,
+                ExecCommand **ret) {
+
+        _cleanup_strv_free_ char **argv = argv_consume;
+        _cleanup_(exec_command_freep) ExecCommand *c = NULL;
+        bool via_shell = FLAGS_SET(flags, EXEC_COMMAND_VIA_SHELL);
+        int r;
+
+        assert(path);
+        assert(ret);
+
+        c = new0(ExecCommand, 1);
+        if (!c)
+                return -ENOMEM;
+
+        r = path_simplify_alloc(via_shell ? _PATH_BSHELL : path, &c->path);
+        if (r < 0)
+                return r;
+
+        if (strv_isempty(argv)) {
+                r = strv_extend(&argv, via_shell ? "sh" : c->path);
+                if (r < 0)
+                        return r;
+        } else if (via_shell) {
+                r = free_and_strdup(&argv[0], argv[0][0] == '-' ? "-sh" : "sh");
+                if (r < 0)
+                        return r;
+        }
+
+        c->argv = TAKE_PTR(argv);
+        c->flags = flags;
+        *ret = TAKE_PTR(c);
+        return 0;
 }
 
 void exec_command_append_list(ExecCommand **l, ExecCommand *e) {
@@ -2456,10 +2575,7 @@ ExecSharedRuntime* exec_shared_runtime_destroy(ExecSharedRuntime *rt) {
         if (!rt)
                 return NULL;
 
-        assert(rt->n_ref > 0);
-        rt->n_ref--;
-
-        if (rt->n_ref > 0)
+        if (ref_counter_dec(&rt->n_ref) > 0)
                 return NULL;
 
         rt->tmp_dir = destroy_tree(rt->tmp_dir);
@@ -2636,7 +2752,7 @@ int exec_shared_runtime_acquire(Manager *m, const ExecContext *c, const char *id
 
 ref:
         /* increment reference counter. */
-        rt->n_ref++;
+        ref_counter_inc(&rt->n_ref);
         *ret = rt;
         return 1;
 }
@@ -2925,7 +3041,7 @@ int exec_shared_runtime_deserialize_one(Manager *m, const char *value, FDSet *fd
         }
 
 finalize:
-        r = exec_shared_runtime_add(m, id, &tmp_dir, &var_tmp_dir, userns_fdpair, netns_fdpair, ipcns_fdpair, NULL);
+        r = exec_shared_runtime_add(m, id, &tmp_dir, &var_tmp_dir, userns_fdpair, netns_fdpair, ipcns_fdpair, /* ret= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to add exec-runtime: %m");
         return 0;
@@ -3197,14 +3313,16 @@ ExecCleanMask exec_clean_mask_from_string(const char *s) {
 }
 
 static const char* const exec_input_table[_EXEC_INPUT_MAX] = {
-        [EXEC_INPUT_NULL]      = "null",
-        [EXEC_INPUT_TTY]       = "tty",
-        [EXEC_INPUT_TTY_FORCE] = "tty-force",
-        [EXEC_INPUT_TTY_FAIL]  = "tty-fail",
-        [EXEC_INPUT_SOCKET]    = "socket",
-        [EXEC_INPUT_NAMED_FD]  = "fd",
-        [EXEC_INPUT_DATA]      = "data",
-        [EXEC_INPUT_FILE]      = "file",
+        [EXEC_INPUT_NULL]       = "null",
+        [EXEC_INPUT_TTY]        = "tty",
+        [EXEC_INPUT_TTY_FORCE]  = "tty-force",
+        [EXEC_INPUT_TTY_FAIL]   = "tty-fail",
+        [EXEC_INPUT_SOCKET]     = "socket",
+        [EXEC_INPUT_NAMED_FD]   = "fd",
+        [EXEC_INPUT_DATA]       = "data",
+        [EXEC_INPUT_FILE]       = "file",
+        [EXEC_INPUT_BROKER]     = "broker",
+        [EXEC_INPUT_BROKER_LOG] = "broker-log",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(exec_input, ExecInput);
@@ -3222,6 +3340,8 @@ static const char* const exec_output_table[_EXEC_OUTPUT_MAX] = {
         [EXEC_OUTPUT_FILE]                = "file",
         [EXEC_OUTPUT_FILE_APPEND]         = "append",
         [EXEC_OUTPUT_FILE_TRUNCATE]       = "truncate",
+        [EXEC_OUTPUT_BROKER]              = "broker",
+        [EXEC_OUTPUT_BROKER_LOG]          = "broker-log",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(exec_output, ExecOutput);
@@ -3242,17 +3362,6 @@ static const char* const exec_preserve_mode_table[_EXEC_PRESERVE_MODE_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(exec_preserve_mode, ExecPreserveMode, EXEC_PRESERVE_YES);
-
-/* This table maps ExecDirectoryType to the symlink setting it is configured with in the unit */
-static const char* const exec_directory_type_symlink_table[_EXEC_DIRECTORY_TYPE_MAX] = {
-        [EXEC_DIRECTORY_RUNTIME]       = "RuntimeDirectorySymlink",
-        [EXEC_DIRECTORY_STATE]         = "StateDirectorySymlink",
-        [EXEC_DIRECTORY_CACHE]         = "CacheDirectorySymlink",
-        [EXEC_DIRECTORY_LOGS]          = "LogsDirectorySymlink",
-        [EXEC_DIRECTORY_CONFIGURATION] = "ConfigurationDirectorySymlink",
-};
-
-DEFINE_STRING_TABLE_LOOKUP(exec_directory_type_symlink, ExecDirectoryType);
 
 static const char* const exec_directory_type_mode_table[_EXEC_DIRECTORY_TYPE_MAX] = {
         [EXEC_DIRECTORY_RUNTIME]       = "RuntimeDirectoryMode",

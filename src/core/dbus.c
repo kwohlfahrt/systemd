@@ -39,6 +39,7 @@
 #include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
+#include "scope.h"
 #include "selinux-access.h"     /* IWYU pragma: keep */
 #include "serialize.h"
 #include "set.h"
@@ -69,6 +70,21 @@ void bus_send_pending_reload_message(Manager *m) {
         m->pending_reload_message_dbus = sd_bus_message_unref(m->pending_reload_message_dbus);
 
         return;
+}
+
+void bus_send_pending_reexecute_error(Manager *m, int error) {
+        int r;
+
+        assert(m);
+
+        if (!m->pending_reexecute_message_dbus)
+                return;
+
+        r = sd_bus_reply_method_errno(m->pending_reexecute_message_dbus, error, /* e= */ NULL);
+        if (r < 0)
+                log_warning_errno(r, "Failed to send queued reexecute error reply, ignoring: %m");
+
+        m->pending_reexecute_message_dbus = sd_bus_message_unref(m->pending_reexecute_message_dbus);
 }
 
 static int signal_disconnected(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
@@ -119,7 +135,7 @@ static int signal_activation_request(sd_bus_message *message, void *userdata, sd
                 goto failed;
         }
 
-        r = manager_load_unit(m, name, NULL, &error, &u);
+        r = manager_load_unit(m, name, /* path= */ NULL, &error, &u);
         if (r < 0)
                 goto failed;
 
@@ -153,7 +169,7 @@ failed:
                 return 0;
         }
 
-        r = sd_bus_send_to(NULL, reply, "org.freedesktop.DBus", NULL);
+        r = sd_bus_send_to(/* bus= */ NULL, reply, "org.freedesktop.DBus", /* ret_cookie= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to respond with to bus activation request: %m");
 
@@ -176,10 +192,10 @@ static int mac_selinux_filter(sd_bus_message *message, void *userdata, sd_bus_er
 
         if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Properties", "Set"))
                 verb = "reload";
-        else if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Introspectable", NULL) ||
-                 sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Properties", NULL) ||
-                 sd_bus_message_is_method_call(message, "org.freedesktop.DBus.ObjectManager", NULL) ||
-                 sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Peer", NULL))
+        else if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Introspectable", /* member= */ NULL) ||
+                 sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Properties", /* member= */ NULL) ||
+                 sd_bus_message_is_method_call(message, "org.freedesktop.DBus.ObjectManager", /* member= */ NULL) ||
+                 sd_bus_message_is_method_call(message, "org.freedesktop.DBus.Peer", /* member= */ NULL))
                 verb = "status";
         else
                 return 0;
@@ -587,7 +603,7 @@ static int bus_setup_api_vtables(Manager *m, sd_bus *bus) {
         assert(bus);
 
 #if HAVE_SELINUX
-        r = sd_bus_add_filter(bus, NULL, mac_selinux_filter, m);
+        r = sd_bus_add_filter(bus, /* ret_slot= */ NULL, mac_selinux_filter, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to add SELinux access filter: %m");
 #endif
@@ -607,12 +623,12 @@ static int bus_setup_disconnected_match(Manager *m, sd_bus *bus) {
 
         r = sd_bus_match_signal_async(
                         bus,
-                        NULL,
+                        /* ret= */ NULL,
                         "org.freedesktop.DBus.Local",
                         "/org/freedesktop/DBus/Local",
                         "org.freedesktop.DBus.Local",
                         "Disconnected",
-                        signal_disconnected, NULL, m);
+                        signal_disconnected, /* install_callback= */ NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for Disconnected message: %m");
 
@@ -731,7 +747,7 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
         if (r < 0)
                 log_warning_errno(r, "Failed to register MemoryAllocation1, ignoring: %m");
 
-        r = set_ensure_put(&m->private_buses, NULL, bus);
+        r = set_ensure_put(&m->private_buses, /* hash_ops= */ NULL, bus);
         if (r == -ENOMEM) {
                 log_oom();
                 return 0;
@@ -758,7 +774,7 @@ static int bus_track_coldplug(sd_bus *bus, sd_bus_track **t, char * const *l) {
                 return 0;
 
         if (!*t) {
-                r = sd_bus_track_new(bus, t, NULL, NULL);
+                r = sd_bus_track_new(bus, t, /* handler= */ NULL, /* userdata= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -794,19 +810,19 @@ static int bus_setup_api(Manager *m, sd_bus *bus) {
 
         r = sd_bus_match_signal_async(
                         bus,
-                        NULL,
+                        /* ret= */ NULL,
                         "org.freedesktop.DBus",
                         "/org/freedesktop/DBus",
                         "org.freedesktop.systemd1.Activator",
                         "ActivationRequest",
-                        signal_activation_request, NULL, m);
+                        signal_activation_request, /* install_callback= */ NULL, m);
         if (r < 0)
                 log_warning_errno(r, "Failed to subscribe to activation signal: %m");
 
         /* Allow replacing of our name, to ease implementation of reexecution, where we keep the old connection open
          * until after the new connection is set up and the name installed to allow clients to synchronously wait for
          * reexecution to finish */
-        r = sd_bus_request_name_async(bus, NULL, "org.freedesktop.systemd1", SD_BUS_NAME_REPLACE_EXISTING|SD_BUS_NAME_ALLOW_REPLACEMENT, NULL, NULL);
+        r = sd_bus_request_name_async(bus, /* ret_slot= */ NULL, "org.freedesktop.systemd1", SD_BUS_NAME_REPLACE_EXISTING|SD_BUS_NAME_ALLOW_REPLACEMENT, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
@@ -821,6 +837,27 @@ static int bus_setup_api(Manager *m, sd_bus *bus) {
         return 0;
 }
 
+static void bus_coldplug_deferred_tracks(Manager *m) {
+        Unit *u;
+        Job *j;
+        int r;
+
+        assert(m);
+
+        HASHMAP_FOREACH(u, m->units) {
+                r = bus_unit_coldplug_bus_track(u);
+                if (r < 0)
+                        log_unit_debug_errno(u, r, "Failed to track deserialized bus clients, ignoring: %m");
+
+                Scope *s = SCOPE(u);
+                if (s && !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(u)))
+                        (void) bus_scope_track_controller(s);
+        }
+
+        HASHMAP_FOREACH(j, m->jobs)
+                (void) bus_job_coldplug_bus_track(j);
+}
+
 static int api_bus_instance_id_reply(sd_bus_message *reply, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         const sd_bus_error *e;
@@ -830,6 +867,14 @@ static int api_bus_instance_id_reply(sd_bus_message *reply, void *userdata, sd_b
 
         assert(reply);
         assert_se(bus = sd_bus_message_get_bus(reply));
+
+        r = sd_bus_is_open(bus);
+        if (r < 0)
+                log_warning_errno(r, "Failed to check if bus is open, assuming it is, ignoring: %m");
+        else if (r == 0) {
+                log_debug("API bus connection closed before its instance ID was received.");
+                return 0; /* Let's skip the setup and wait for signal_disconnected(). */
+        }
 
         /* Whatever the outcome, we get only one shot at coldplugging the saved subscription state onto
          * this connection: consume it. */
@@ -878,8 +923,11 @@ setup_api:
                         bus_done_system(m);
                 if (m->api_bus == bus)
                         bus_done_api(m);
+
+                return 0;
         }
 
+        bus_coldplug_deferred_tracks(m);
         return 0;
 }
 
@@ -1096,6 +1144,8 @@ static void destroy_bus(Manager *m, sd_bus **bus) {
         /* Get rid of queued message on this bus */
         if (m->pending_reload_message_dbus && sd_bus_message_get_bus(m->pending_reload_message_dbus) == *bus)
                 m->pending_reload_message_dbus = sd_bus_message_unref(m->pending_reload_message_dbus);
+        if (m->pending_reexecute_message_dbus && sd_bus_message_get_bus(m->pending_reexecute_message_dbus) == *bus)
+                m->pending_reexecute_message_dbus = sd_bus_message_unref(m->pending_reexecute_message_dbus);
 
         /* Possibly flush unwritten data, but only if we are unprivileged, since we don't want to sync
          * here, and only if the connection is currently RUNNING: sd_bus_flush() first drives the
@@ -1112,9 +1162,28 @@ static void destroy_bus(Manager *m, sd_bus **bus) {
 }
 
 void bus_done_api(Manager *m) {
+        Unit *u;
+        Job *j;
+
+        /* This is called on every unit state change while D-Bus isn't running, see manager_recheck_dbus(). */
+        if (!m->api_bus)
+                return;
+
         destroy_bus(m, &m->api_bus);
 
         m->api_bus_ready = false;
+
+        /* Clients that we didn't get to track yet were on this bus too. */
+        HASHMAP_FOREACH(u, m->units)
+                if (u->deserialized_refs) {
+                        u->deserialized_refs = strv_free(u->deserialized_refs);
+                        unit_add_to_gc_queue(u);
+                }
+        HASHMAP_FOREACH(j, m->jobs)
+                if (j->deserialized_clients) {
+                        j->deserialized_clients = strv_free(j->deserialized_clients);
+                        job_add_to_gc_queue(j);
+                }
 }
 
 void bus_done_system(Manager *m) {

@@ -43,7 +43,6 @@ void iovec_erase(struct iovec *iovec);
 void iovec_done_erase(struct iovec *iovec);
 
 char* set_iovec_string_field(struct iovec *iovec, size_t *n_iovec, const char *field, const char *value);
-char* set_iovec_string_field_free(struct iovec *iovec, size_t *n_iovec, const char *field, char *value);
 
 void iovec_array_free(struct iovec *iovec, size_t n_iovec) _nonnull_if_nonzero_(1, 2);
 
@@ -56,3 +55,9 @@ struct iovec* iovec_memdup(const struct iovec *source, struct iovec *ret);
 int iovec_done_and_memdup(struct iovec *iovec, const struct iovec *source);
 
 struct iovec* iovec_append(struct iovec *iovec, const struct iovec *append);
+
+struct iovec* iovec_consume(struct iovec *iovec, size_t n);
+
+static inline struct iovec* iovec_unset_nullify(const struct iovec *iov) {
+        return iovec_is_set(iov) ? (struct iovec*) iov : NULL;
+}

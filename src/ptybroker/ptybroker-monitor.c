@@ -1,0 +1,718 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <unistd.h>
+
+#include "alloc-util.h"
+#include "ansi-seq.h"
+#include "csi-inband-resize.h"
+#include "errno-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "iovec-util.h"
+#include "log.h"
+#include "ptybroker.h"
+#include "ptybroker-monitor.h"
+#include "ptybroker-pty.h"
+
+/* Upper bound on how much of an incomplete ANSI sequence we may hold back on the input stream, in order to
+ * filter out CSI 48 size reports. The parser aborts sequences that grow beyond ANSI_SEQ_STRING_MAX (which
+ * are then passed through unscathed), hence held back data never exceeds that plus a few bytes of framing. */
+#define INPUT_HOLD_MAX (ANSI_SEQ_STRING_MAX + 8U)
+
+/* Similar, for the output stream: we hold back incomplete sequences, in order to filter out the payload's
+ * CSI 2048/48 requests */
+#define OUTPUT_HOLD_MAX INPUT_HOLD_MAX
+
+PseudoTTYMonitor* pseudo_tty_monitor_free(PseudoTTYMonitor *monitor) {
+        if (!monitor)
+                return NULL;
+
+        if (monitor->pty) {
+                LIST_REMOVE(monitors, monitor->pty->monitors, monitor);
+                monitor->pty->n_monitors--;
+
+                /* This monitor's dimensions no longer constrain the pty, re-determine the minimum */
+                if (monitor->inband_resize)
+                        (void) pseudo_tty_sync_winsize(monitor->pty);
+
+                /* Nor does its buffer space constrain the pty's readability anymore: refresh the pty's I/O
+                 * event mask, so that a pty stalled by this monitor gets going again (unless the pty is on
+                 * its way out anyway, in which case there's no point). */
+                if (!monitor->pty->in_free_queue)
+                        (void) pseudo_tty_set_events(monitor->pty);
+        }
+
+        sd_event_source_disable_unref(monitor->io_event_source);
+        sd_event_source_disable_unref(monitor->disconnect_event_source);
+
+        if (monitor->link) {
+                /* If the link is still around here the connection never completed its upgrade: close it, so
+                 * that the client doesn't hang on to a connection nobody will ever service. */
+                sd_varlink_set_userdata(monitor->link, /* userdata= */ NULL);
+                sd_varlink_close_unref(monitor->link);
+        }
+
+        iovec_done(&monitor->buffer);
+        iovec_done(&monitor->input_hold);
+        iovec_done(&monitor->output_hold);
+
+        ansi_seq_parser_done(&monitor->output_parser);
+        ansi_seq_parser_done(&monitor->input_parser);
+
+        return mfree(monitor);
+}
+
+void pseudo_tty_monitor_disconnect(PseudoTTYMonitor *monitor) {
+        assert(monitor);
+
+        /* Frees the monitor because its connection went away, and then hangs up the pty, if requested. (Note
+         * that pseudo_tty_monitor_free() takes care of re-evaluating the pty's event mask.) */
+
+        PseudoTTY *hang_up_pty = monitor->hang_up_on_disconnect ? monitor->pty : NULL;
+
+        pseudo_tty_monitor_free(monitor);
+
+        if (hang_up_pty)
+                (void) pseudo_tty_vhangup(hang_up_pty);
+}
+
+static int on_disconnect_defer(sd_event_source *s, void *userdata) {
+        PseudoTTYMonitor *monitor = ASSERT_PTR(userdata);
+
+        assert(s);
+
+        /* If the link is still set the connection upgrade never completed, but the connection is gone
+         * nonetheless. Nobody will ever service the monitor hence, drop it. */
+        if (!monitor->link)
+                return 0;
+
+        log_debug("Monitor connection went away before its upgrade completed, dropping monitor.");
+        pseudo_tty_monitor_disconnect(monitor);
+        return 0;
+}
+
+void pseudo_tty_monitor_on_link_disconnect(PseudoTTYMonitor *monitor) {
+        int r;
+
+        assert(monitor);
+
+        /* Called whenever the Varlink connection of the monitor is disconnected. Note that this also happens
+         * right before the upgrade callback is invoked, hence we can't free the monitor right-away. Instead,
+         * check from a deferred event source whether the upgrade happened in the meantime. */
+
+        if (!monitor->link || !monitor->pty || monitor->disconnect_event_source)
+                return;
+
+        r = sd_event_add_defer(monitor->pty->manager->event, &monitor->disconnect_event_source, on_disconnect_defer, monitor);
+        if (r < 0) {
+                log_warning_errno(r, "Failed to allocate deferred event source for monitor disconnect, dropping monitor right-away: %m");
+                /* Make sure the upgrade callback doesn't reference the monitor anymore, then drop it */
+                pseudo_tty_monitor_disconnect(monitor);
+                return;
+        }
+
+        (void) sd_event_source_set_description(monitor->disconnect_event_source, "monitor-disconnect");
+}
+
+static int pseudo_tty_monitor_write(PseudoTTYMonitor *monitor, int fd) {
+        assert(monitor);
+        assert(fd >= 0);
+
+        if (monitor->buffer.iov_len <= 0)
+                return 0;
+
+        ssize_t n = write(fd, monitor->buffer.iov_base, monitor->buffer.iov_len);
+        if (n < 0) {
+                if (ERRNO_IS_TRANSIENT(errno))
+                        return 0;
+
+                return log_error_errno(errno, "Failed to write to monitor socket: %m");
+        }
+
+        assert_se(iovec_consume(&monitor->buffer, n));
+        return n > 0;
+}
+
+int pseudo_tty_monitor_flush(PseudoTTYMonitor *monitor) {
+        assert(monitor);
+
+        /* Writes out as much of the buffered output as the connection takes right now, without blocking */
+
+        if (!monitor->io_event_source) /* The connection upgrade hasn't completed yet */
+                return 0;
+
+        int fd = sd_event_source_get_io_fd(monitor->io_event_source);
+        if (fd < 0)
+                return fd;
+
+        return pseudo_tty_monitor_write(monitor, fd);
+}
+
+static int pseudo_tty_monitor_push_output(PseudoTTYMonitor *monitor, const void *data, size_t n) {
+        assert(monitor);
+        assert(data || n == 0);
+
+        if (n == SIZE_MAX)
+                n = strlen(data);
+
+        if (!iovec_append(&monitor->buffer, &IOVEC_MAKE(data, n)))
+                return -ENOMEM;
+
+        return 0;
+}
+
+static int pseudo_tty_monitor_request_winsize(PseudoTTYMonitor *monitor) {
+        assert(monitor);
+
+        /* Enables size reports on the monitor's terminal. As per spec, this results in an immediate report
+         * of the current dimensions, followed by one for every change. Note that the output buffer always
+         * ends at a sequence boundary (incomplete sequences are held back in output_hold), hence we can
+         * append the enable sequence right-away. */
+
+        if (!monitor->inband_resize)
+                return 0;
+
+        return pseudo_tty_monitor_push_output(monitor, ANSI_INBAND_RESIZE_ENABLE, SIZE_MAX);
+}
+
+static int pseudo_tty_monitor_reply_mode(PseudoTTYMonitor *monitor) {
+        _cleanup_free_ char *reply = NULL;
+        int r;
+
+        assert(monitor);
+        assert(monitor->pty);
+
+        /* Answers a DECRQM query for CSI 2048/48 from the payload. We own the mode on the monitor's
+         * terminal, and excise all size reports from its input stream, and the payload's own requests to set
+         * the mode are swallowed, hence from the payload's point of view the mode is permanently reset
+         * (rather than merely reset, which would suggest it could be turned on). The reply goes into the
+         * pty's input stream directly: our held back input bytes of an incomplete sequence (if there are
+         * any) are only appended once the sequence is complete, hence the pty's write buffer always ends at
+         * a sequence boundary from our point of view.
+         *
+         * All monitors see the same output stream, hence each of them sees the query. The payload expects a
+         * single reply however, hence only the first monitor with CSI 2048/48 handling enabled answers. */
+
+        LIST_FOREACH(monitors, m, monitor->pty->monitors)
+                if (m->inband_resize) {
+                        if (m != monitor)
+                                return 0;
+                        break;
+                }
+
+        r = inband_resize_format_mode_report(INBAND_RESIZE_MODE_PERMANENTLY_RESET, &reply);
+        if (r < 0)
+                return r;
+
+        struct iovec *fwb = &monitor->pty->frontend_write_buffer;
+        size_t l = strlen(reply);
+
+        /* Don't let a payload flooding us with queries make us grow the buffer without bounds */
+        if (fwb->iov_len + l > BUFFER_MAX) {
+                log_debug("Pseudo TTY write buffer full, dropping CSI 2048/48 reply.");
+                return 0;
+        }
+
+        if (!iovec_append(fwb, &IOVEC_MAKE(reply, l)))
+                return -ENOMEM;
+
+        return 1;
+}
+
+static int pseudo_tty_monitor_process_output_sequence(PseudoTTYMonitor *monitor, bool replay, bool *reenable) {
+        int r;
+
+        assert(monitor);
+        assert(reenable);
+
+        /* Called whenever a sequence on the stream we send to the monitor completed, with the full sequence
+         * in output_hold. Passes it on, unless it is a request regarding CSI 2048/48: we own the mode on the
+         * monitor's terminal (and excise all size reports from its input stream), hence the payload cannot
+         * make use of it through a monitor, and its requests are not passed on. */
+
+        _cleanup_(iovec_done) struct iovec seq = TAKE_STRUCT(monitor->output_hold);
+
+        if (monitor->output_parser.introducer == 'c') {
+                /* ESC c → Full reset (RIS): this resets CSI 2048/48 too, hence turn it back on right
+                 * after */
+                *reenable = true;
+                return pseudo_tty_monitor_push_output(monitor, seq.iov_base, seq.iov_len);
+        }
+
+        const char *csi = monitor->output_parser.introducer == '[' ? ansi_seq_parser_string(&monitor->output_parser) : NULL;
+        if (!csi)
+                return pseudo_tty_monitor_push_output(monitor, seq.iov_base, seq.iov_len);
+
+        InbandResizeRequest request;
+        _cleanup_free_ char *remaining = NULL;
+        r = inband_resize_parse_request(csi, &request, &remaining);
+        if (r == -ENOMEM) {
+                /* We can't tell if this is a request regarding CSI 2048/48: pass it on as it is, and turn
+                 * the mode back on right after, just in case (which is harmless if it wasn't turned off). */
+                *reenable = true;
+                return pseudo_tty_monitor_push_output(monitor, seq.iov_base, seq.iov_len);
+        }
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return pseudo_tty_monitor_push_output(monitor, seq.iov_base, seq.iov_len);
+
+        /* If the request also covers other modes, pass on the request for those */
+        if (remaining) {
+                r = pseudo_tty_monitor_push_output(monitor, "\x1B[", SIZE_MAX);
+                if (r < 0)
+                        return r;
+
+                r = pseudo_tty_monitor_push_output(monitor, remaining, SIZE_MAX);
+                if (r < 0)
+                        return r;
+        }
+
+        /* When replaying the pending partial line to a new monitor, the query has been seen (and answered)
+         * before already, hence don't answer it again */
+        if (request == INBAND_RESIZE_QUERY && !replay)
+                return pseudo_tty_monitor_reply_mode(monitor);
+
+        return 0;
+}
+
+static int pseudo_tty_monitor_push_output_hold(PseudoTTYMonitor *monitor, char c) {
+        assert(monitor);
+
+        /* The parser gives up on sequences that grow beyond ANSI_SEQ_STRING_MAX, hence this is bounded */
+        assert(monitor->output_hold.iov_len < OUTPUT_HOLD_MAX);
+
+        if (!iovec_append(&monitor->output_hold, &IOVEC_MAKE_BYTE(c)))
+                return -ENOMEM;
+
+        return 0;
+}
+
+static int pseudo_tty_monitor_enqueue_output_full(PseudoTTYMonitor *monitor, const void *data, size_t n, bool replay) {
+        bool reenable = false;
+        int r;
+
+        assert(monitor);
+        assert(data || n == 0);
+
+        /* Appends pty output data to the monitor's output buffer. If CSI 2048/48 handling is enabled, also
+         * tracks ANSI sequence boundaries: the bytes of incomplete sequences are held back, so that we can
+         * filter out the payload's CSI 2048/48 requests, and insert our own sequences at safe positions. */
+
+        if (!monitor->inband_resize)
+                return pseudo_tty_monitor_push_output(monitor, data, n);
+
+        const char *q = data;
+        for (size_t i = 0, inc = 1; i < n; i += inc, inc = 1) {
+                char c = q[i];
+
+                r = ansi_seq_parser_feed(&monitor->output_parser, c);
+                if (r < 0)
+                        return r;
+
+                switch (r) {
+
+                case ANSI_SEQ_EVENT_TEXT:
+                        r = pseudo_tty_monitor_push_output(monitor, &c, 1);
+                        break;
+
+                case ANSI_SEQ_EVENT_SEQUENCE:
+                        r = pseudo_tty_monitor_push_output_hold(monitor, c);
+                        break;
+
+                case ANSI_SEQ_EVENT_END:
+                        r = pseudo_tty_monitor_push_output_hold(monitor, c);
+                        if (r < 0)
+                                return r;
+
+                        r = pseudo_tty_monitor_process_output_sequence(monitor, replay, &reenable);
+                        break;
+
+                case ANSI_SEQ_EVENT_ABORT:
+                case ANSI_SEQ_EVENT_RESTART: {
+                        /* Not a valid sequence after all: pass it on as it is, and process the current
+                         * character again. On restart the ESC within the aborted string sequence (OSC, DCS,
+                         * …) did not introduce ST, and begins a new sequence instead, as terminals see it
+                         * (and ptyfwd doesn't know DCS & friends at all, hence sees an ESC there in any
+                         * case). Hence keep holding that ESC back, as otherwise "ESC P ESC [ ? 2048 l" or
+                         * "ESC P ESC c" would get past us. */
+                        size_t keep = r == ANSI_SEQ_EVENT_RESTART;
+
+                        assert(monitor->output_hold.iov_len >= keep);
+                        assert(keep == 0 || ((const char*) monitor->output_hold.iov_base)[monitor->output_hold.iov_len - 1] == 0x1B);
+
+                        r = pseudo_tty_monitor_push_output(monitor, monitor->output_hold.iov_base, monitor->output_hold.iov_len - keep);
+                        if (r < 0)
+                                return r;
+
+                        monitor->output_hold.iov_len = 0;
+                        if (keep > 0)
+                                r = pseudo_tty_monitor_push_output_hold(monitor, 0x1B);
+
+                        inc = 0;
+                        break;
+                }
+
+                default:
+                        assert_not_reached();
+                }
+                if (r < 0)
+                        return r;
+        }
+
+        /* If the payload turned CSI 2048/48 off on the monitor's terminal, turn it back on, so that we keep
+         * getting size reports. Do this only once for all the data we processed, so that a payload sending
+         * lots of resets cannot make our buffer grow way beyond the data we have read. */
+        if (reenable)
+                return pseudo_tty_monitor_request_winsize(monitor);
+
+        return 0;
+}
+
+int pseudo_tty_monitor_enqueue_output(PseudoTTYMonitor *monitor, const void *data, size_t n) {
+        return pseudo_tty_monitor_enqueue_output_full(monitor, data, n, /* replay= */ false);
+}
+
+int pseudo_tty_monitor_push_pending(PseudoTTYMonitor *monitor) {
+        assert(monitor);
+        assert(monitor->pty);
+
+        /* If we are setting up a new monitor, let's immediately enqueue any incomplete lines still queued in the pty */
+
+        struct iovec v = monitor->pty->frontend_read_buffer;
+
+        /* Skip over initial newlines */
+        for (;;) {
+                if (!iovec_is_set(&v))
+                        return 0;
+
+                if (end_of_line_from_char(*(char*) v.iov_base) == EOL_NONE)
+                        break;
+
+                iovec_inc(&v, 1);
+        }
+
+        /* NB: this goes through the same path as regular pty output, so that the sequence boundary tracking
+         * sees every byte that is sent to the monitor, in particular if the pending line ends in the middle
+         * of a sequence. The data has been seen by the other monitors already though, hence mark it as
+         * replay, so that we don't answer the queries in it once more. */
+        return pseudo_tty_monitor_enqueue_output_full(monitor, v.iov_base, v.iov_len, /* replay= */ true);
+}
+
+static int pseudo_tty_monitor_read(PseudoTTYMonitor *monitor, int fd) {
+        int r;
+
+        assert(monitor);
+        assert(fd >= 0);
+
+        struct iovec *fwb = &monitor->pty->frontend_write_buffer;
+
+        if (fwb->iov_len >= BUFFER_MAX)
+                return 0;
+
+        /* Also apply back-pressure if the monitor doesn't drain what we have queued for it, so that the
+         * monitor's input can never make us grow its output buffer without bounds (for example, because
+         * the payload echoes what it receives). */
+        size_t space = pseudo_tty_monitor_space(monitor);
+        if (space == 0)
+                return 0;
+
+        size_t left = BUFFER_MAX - fwb->iov_len,
+               add = MIN3(left, space, (size_t) LONG_LINE_MAX),
+               offset = fwb->iov_len,
+               hold = monitor->input_hold.iov_len; /* Non-zero only if CSI 2048/48 handling is on */
+
+        if (!greedy_realloc(&fwb->iov_base, offset + hold + add, 1))
+                return log_oom();
+
+        /* Read directly into the pty's frontend write buffer, leaving room for any incomplete sequence
+         * bytes we held back last time */
+        ssize_t n = read(fd, (uint8_t*) fwb->iov_base + offset + hold, add);
+        if (n < 0) {
+                if (ERRNO_IS_TRANSIENT(errno))
+                        return 0;
+
+                return log_error_errno(errno, "Failed to read from monitor socket: %m");
+        }
+        if (n == 0) /* Propagate EOF as proper error. This is a normal lifecycle event, hence log about it
+                     * only at debug level. */
+                return log_debug_errno(SYNTHETIC_ERRNO(ECONNRESET), "Monitor disconnected.");
+
+        assert((size_t) n <= add);
+
+        /* Reinsert the held back bytes right before the data we just read */
+        if (hold > 0) {
+                memcpy((uint8_t*) fwb->iov_base + offset, monitor->input_hold.iov_base, hold);
+                monitor->input_hold.iov_len = 0;
+        }
+
+        fwb->iov_len = offset + hold + n;
+
+        if (!monitor->inband_resize)
+                return 1;
+
+        /* Now scan the data we just read for ANSI sequences, so that CSI 48 size reports can be picked
+         * out of the stream and consumed. The held back bytes have been fed to the parser last time already,
+         * hence start with the new data; if we are in the middle of a sequence it begins where the held back
+         * bytes were reinserted. */
+        size_t begin = hold > 0 ? offset : SIZE_MAX;
+
+        for (size_t i = offset + hold, inc = 1; i < fwb->iov_len; i += inc, inc = 1) {
+                char c = ((const char*) fwb->iov_base)[i];
+
+                r = ansi_seq_parser_feed(&monitor->input_parser, c);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to process data from monitor socket: %m");
+
+                switch (r) {
+
+                case ANSI_SEQ_EVENT_TEXT:
+                        break;
+
+                case ANSI_SEQ_EVENT_SEQUENCE:
+                        if (begin == SIZE_MAX)
+                                begin = i;
+                        break;
+
+                case ANSI_SEQ_EVENT_END: {
+                        assert(begin != SIZE_MAX);
+
+                        const char *seq = ansi_seq_parser_string(&monitor->input_parser);
+                        InbandResizeReport report;
+
+                        if (seq && monitor->input_parser.introducer == '[' &&
+                            inband_resize_parse_report(seq, &report) > 0) {
+
+                                /* A size report: excise it from the buffer, and update our dimension data */
+                                memmove((uint8_t*) fwb->iov_base + begin,
+                                        (uint8_t*) fwb->iov_base + i + 1,
+                                        fwb->iov_len - i - 1);
+                                fwb->iov_len -= i + 1 - begin;
+                                i = begin - 1; /* Continue right after the excised sequence (NB: the loop increments i again) */
+
+                                /* Only take over the fields the report actually carried (they are zero if
+                                 * absent or unparsable), so that a partial report doesn't make us forget
+                                 * what the monitor told us before. */
+                                if (report.columns > 0)
+                                        monitor->columns = report.columns;
+                                if (report.lines > 0)
+                                        monitor->lines = report.lines;
+
+                                /* Best effort: a monitor reporting dimensions the pty won't take is no reason
+                                 * to drop the monitor (or even hang up the pty) */
+                                (void) pseudo_tty_sync_winsize(monitor->pty);
+                        }
+
+                        begin = SIZE_MAX;
+                        break;
+                }
+
+                case ANSI_SEQ_EVENT_ABORT:
+                        /* Not a valid sequence after all: leave it in the stream as it is, and process the
+                         * current character again */
+                        begin = SIZE_MAX;
+                        inc = 0;
+                        break;
+
+                case ANSI_SEQ_EVENT_RESTART:
+                        /* Same, but the preceding ESC begins a new sequence */
+                        assert(i > 0 && ((const char*) fwb->iov_base)[i - 1] == 0x1B);
+                        begin = i - 1;
+                        inc = 0;
+                        break;
+
+                default:
+                        assert_not_reached();
+                }
+        }
+
+        /* If the buffer ends in the middle of a sequence, hold the incomplete sequence back, so that it
+         * does not hit the pty before we know whether to excise it. Note that the parser gives up on
+         * sequences that grow beyond ANSI_SEQ_STRING_MAX, hence the held back data is bounded. */
+        if (begin != SIZE_MAX) {
+                size_t tail = fwb->iov_len - begin;
+
+                assert(tail <= INPUT_HOLD_MAX);
+
+                if (!greedy_realloc(&monitor->input_hold.iov_base, tail, 1))
+                        return log_oom();
+
+                memcpy(monitor->input_hold.iov_base, (uint8_t*) fwb->iov_base + begin, tail);
+                monitor->input_hold.iov_len = tail;
+
+                fwb->iov_len = begin;
+        }
+
+        return 1;
+}
+
+int pseudo_tty_monitor_set_events(PseudoTTYMonitor *monitor) {
+        int r;
+
+        assert(monitor);
+
+        if (!monitor->io_event_source) /* The connection upgrade hasn't completed yet, nothing to watch so far */
+                return 0;
+
+        uint32_t events = 0;
+        if (monitor->buffer.iov_len > 0)
+                events |= EPOLLOUT;
+        if (monitor->pty->frontend_write_buffer.iov_len < BUFFER_MAX &&
+            pseudo_tty_monitor_space(monitor) > 0) /* see pseudo_tty_monitor_read() for the rationale */
+                events |= EPOLLIN;
+
+        r = sd_event_source_set_io_events(monitor->io_event_source, events);
+        if (r < 0)
+                return log_error_errno(r, "Failed to adjust I/O event mask for monitor socket: %m");
+
+        return 0;
+}
+
+static int on_monitor_io(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        PseudoTTYMonitor *monitor = ASSERT_PTR(userdata);
+        int r;
+
+        assert(s);
+        assert(fd >= 0);
+
+        r = 0;
+        RET_GATHER(r, pseudo_tty_monitor_write(monitor, fd));
+        RET_GATHER(r, pseudo_tty_monitor_read(monitor, fd));
+        if (r < 0)
+                goto fail;
+
+        /* Handle hangups only after processing any data still queued. Note that we might not see EOF on
+         * read() if we didn't read due to a full buffer, and epoll will keep reporting EPOLLHUP/EPOLLERR
+         * even with an empty event mask, hence handle them explicitly. */
+        if (revents & (EPOLLHUP|EPOLLERR)) {
+                r = log_debug_errno(SYNTHETIC_ERRNO(ECONNRESET), "Monitor disconnected.");
+                goto fail;
+        }
+
+        /* NB: We don't call the monitor-specific pseudo_tty_monitor_set_events() call here, but the
+         * pseudo_tty_set_events() call that applies to the whole pty. That's because having progressed here
+         * might allow progress on the pty too. Note that pseudo_tty_set_events() will call back into
+         * pseudo_tty_monitor_set_events() */
+        r = pseudo_tty_set_events(monitor->pty);
+        if (r < 0)
+                goto fail;
+
+        return 0;
+
+fail:
+        pseudo_tty_monitor_disconnect(monitor);
+        return r;
+}
+
+static int on_upgrade(sd_varlink *vl, int _input_fd, int _output_fd, void *userdata) {
+        /* The fds are donated to us, no matter what, hence take possession of them right-away */
+        _cleanup_close_ int input_fd = TAKE_FD(_input_fd), output_fd = TAKE_FD(_output_fd);
+        PseudoTTYMonitor *monitor = userdata;
+        int r;
+
+        assert(vl);
+        assert(input_fd >= 0);
+        assert(output_fd >= 0);
+
+        /* The upgrade only completes once the client consumed the upgrade reply, which might take a while
+         * (in particular if the client is slow to read a large track buffer). If the monitor went away in
+         * the meantime (because its pty was hung up), nobody is left to take the connection: drop it. */
+        if (!monitor)
+                return log_debug_errno(SYNTHETIC_ERRNO(ESTALE), "Monitor went away before its connection upgrade completed, closing connection.");
+
+        r = same_fd(input_fd, output_fd);
+        if (r < 0) {
+                log_error_errno(r, "Failed to detect if input/output fds are the same: %m");
+                goto fail;
+        }
+        if (r == 0) {
+                r = log_error_errno(SYNTHETIC_ERRNO(EBADF), "Cannot operate with distinct input/output fds.");
+                goto fail;
+        }
+
+        r = fd_nonblock(input_fd, /* nonblock= */ true);
+        if (r < 0) {
+                log_error_errno(r, "Failed to enable non-blocking mode on upgraded socket: %m");
+                goto fail;
+        }
+
+        assert(monitor->link == vl);
+        monitor->link = sd_varlink_unref(monitor->link);
+
+        assert(!monitor->io_event_source);
+        r = sd_event_add_io(monitor->pty->manager->event, &monitor->io_event_source, input_fd, /* events= */ 0, on_monitor_io, monitor);
+        if (r < 0) {
+                log_error_errno(r, "Failed to allocate monitor IO event: %m");
+                goto fail;
+        }
+
+        r = sd_event_source_set_io_fd_own(monitor->io_event_source, /* own= */ true);
+        if (r < 0) {
+                log_error_errno(r, "Failed to pass ownership of monitor fd to IO event: %m");
+                goto fail;
+        }
+
+        TAKE_FD(input_fd); /* ownership is now passed */
+
+        /* Ask the monitor to report its terminal dimensions, now and whenever they change */
+        r = pseudo_tty_monitor_request_winsize(monitor);
+        if (r < 0) {
+                log_error_errno(r, "Failed to enqueue window size report request: %m");
+                goto fail;
+        }
+
+        r = pseudo_tty_monitor_set_events(monitor);
+        if (r < 0)
+                goto fail;
+
+        return 0;
+
+fail:
+        pseudo_tty_monitor_disconnect(monitor);
+        return r;
+}
+
+int pseudo_tty_monitor_new(sd_varlink *link, bool inband_resize, PseudoTTYMonitor **ret) {
+        int r;
+
+        assert(link);
+        assert(ret);
+
+        _cleanup_(pseudo_tty_monitor_freep) PseudoTTYMonitor *monitor = new(PseudoTTYMonitor, 1);
+        if (!monitor)
+                return -ENOMEM;
+
+        *monitor = (PseudoTTYMonitor) {
+                .link = sd_varlink_ref(link),
+                .inband_resize = inband_resize,
+                .output_parser.capture = inband_resize,
+                .input_parser.capture = inband_resize,
+        };
+
+        r = sd_varlink_bind_upgrade(link, on_upgrade);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(monitor);
+        return 0;
+}
+
+void pseudo_tty_monitor_link(PseudoTTYMonitor *monitor, PseudoTTY *pty) {
+        assert(monitor);
+        assert(pty);
+
+        LIST_PREPEND(monitors, pty->monitors, monitor);
+        pty->n_monitors++;
+        monitor->pty = pty;
+
+        sd_varlink_set_userdata(monitor->link, monitor);
+}
+
+size_t pseudo_tty_monitor_space(PseudoTTYMonitor *monitor) {
+        assert(monitor);
+
+        /* Account for held back bytes of an incomplete sequence too, since they'll end up in the buffer
+         * eventually. NB: insertion of the CSI 2048/48 enable sequence may push the buffer slightly beyond
+         * BUFFER_MAX (at most once per read), hence be lenient here and saturate. */
+        return LESS_BY((size_t) BUFFER_MAX, monitor->buffer.iov_len + monitor->output_hold.iov_len);
+}

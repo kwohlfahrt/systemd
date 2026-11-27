@@ -17,6 +17,7 @@
 #include "string-table.h"
 #include "strv.h"
 #include "sysctl-util.h"
+#include "unaligned.h"
 
 bool link_ipv6ll_enabled(Link *link) {
         assert(link);
@@ -33,7 +34,7 @@ bool link_ipv6ll_enabled(Link *link) {
         if (link->iftype == ARPHRD_CAN)
                 return false;
 
-        if (STRPTR_IN_SET(link->kind, "vrf", "wireguard", "ipip", "gre", "sit", "vti", "nlmon"))
+        if (STRPTR_IN_SET(link->kind, "vrf", "ipip", "gre", "sit", "vti", "nlmon"))
                 return false;
 
         if (link->network->bond)
@@ -194,7 +195,6 @@ int link_set_ipv6ll_stable_secret(Link *link) {
                 a = link->network->ipv6ll_stable_secret;
         else {
                 sd_id128_t key;
-                le64_t v;
 
                 /* Generate a stable secret address from machine-ID and the interface name. */
 
@@ -202,16 +202,14 @@ int link_set_ipv6ll_stable_secret(Link *link) {
                 if (r < 0)
                         return log_link_debug_errno(link, r, "Failed to generate key: %m");
 
-                v = htole64(siphash24_string(link->ifname, key.bytes));
-                memcpy(a.s6_addr, &v, sizeof(v));
+                unaligned_write_le64(a.s6_addr, siphash24_string(link->ifname, key.bytes));
 
                 r = sd_id128_get_machine_app_specific(STABLE_SECRET_APP_ID_2, &key);
                 if (r < 0)
                         return log_link_debug_errno(link, r, "Failed to generate key: %m");
 
-                v = htole64(siphash24_string(link->ifname, key.bytes));
-                assert_cc(sizeof(v) * 2 == sizeof(a.s6_addr));
-                memcpy(a.s6_addr + sizeof(v), &v, sizeof(v));
+                assert_cc(sizeof(uint64_t) * 2 == sizeof(a.s6_addr));
+                unaligned_write_le64(a.s6_addr + sizeof(uint64_t), siphash24_string(link->ifname, key.bytes));
         }
 
         return sysctl_write_ip_property(AF_INET6, link->ifname, "stable_secret",
@@ -219,6 +217,8 @@ int link_set_ipv6ll_stable_secret(Link *link) {
 }
 
 int link_set_ipv6ll_addrgen_mode(Link *link, IPv6LinkLocalAddressGenMode mode) {
+        int r;
+
         assert(link);
         assert(link->manager);
         assert(mode >= 0 && mode < _IPV6_LINK_LOCAL_ADDRESS_GEN_MODE_MAX);
@@ -226,7 +226,14 @@ int link_set_ipv6ll_addrgen_mode(Link *link, IPv6LinkLocalAddressGenMode mode) {
         if (mode == link->ipv6ll_address_gen_mode)
                 return 0;
 
-        return sysctl_write_ip_property_uint32(AF_INET6, link->ifname, "addr_gen_mode", mode, manager_get_sysctl_shadow(link->manager));
+        r = sysctl_write_ip_property_uint32(AF_INET6, link->ifname, "addr_gen_mode", mode,
+                                            manager_get_sysctl_shadow(link->manager));
+        if (r < 0)
+                return r;
+
+        /* The kernel does not send RTM_NEWLINK message on changing the mode by sysctl. */
+        link->ipv6ll_address_gen_mode = mode;
+        return 0;
 }
 
 static const char* const ipv6_link_local_address_gen_mode_table[_IPV6_LINK_LOCAL_ADDRESS_GEN_MODE_MAX] = {

@@ -5,12 +5,17 @@
 
 #include "forward.h"
 
+/* The timer accuracy sd-event uses if 0 is specified as accuracy */
+#define EVENT_DEFAULT_ACCURACY_USEC (250 * USEC_PER_MSEC)
+
 #define PROTECT_EVENT(e)                                                \
         _unused_ _cleanup_(sd_event_unrefp) sd_event *_ref = sd_event_ref(e);
 
 extern const struct hash_ops event_source_hash_ops;
 
 sd_event* event_resolve(sd_event *e);
+
+bool event_origin_changed(sd_event *e);
 
 int event_reset_time(
                 sd_event *e,

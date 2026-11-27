@@ -22,11 +22,12 @@
 #include "pidref.h"
 #include "process-util.h"
 #include "random-util.h"
-#include "resolved-dns-server.h"
 #include "resolved-dns-stream.h"
 #include "resolved-dnstls.h"
 #include "resolved-manager.h"
+#include "socket-util.h"
 #include "sparse-endian.h"
+#include "ssl-util.h"
 #include "tests.h"
 #include "time-util.h"
 
@@ -64,17 +65,16 @@ static void receive_and_check_question(int fd, const uint8_t *expected_question,
 
         actual_question = newa(uint8_t, question_size);
         while (n_read < question_size) {
-                ssize_t r = read(fd, actual_question + n_read, question_size - n_read);
-                assert_se(r >= 0);
+                ssize_t r = ASSERT_OK_ERRNO(read(fd, actual_question + n_read, question_size - n_read));
                 n_read += (size_t)r;
         }
-        assert_se(n_read == question_size);
+        ASSERT_EQ(n_read, question_size);
 
-        assert_se(memcmp(expected_question, actual_question, question_size) == 0);
+        ASSERT_MEMEQ(expected_question, actual_question, question_size);
 }
 
 static void send_answer(int fd, const uint8_t *answer, size_t answer_size) {
-        assert_se(write(fd, answer, answer_size) == (ssize_t)answer_size);
+        ASSERT_OK_EQ_ERRNO(write(fd, answer, answer_size), (ssize_t) answer_size);
 }
 
 /* Sends two answers together in a single write operation,
@@ -88,7 +88,7 @@ static void send_answers_together(int fd,
         answer = newa(uint8_t, answer_size);
         memcpy(answer, answer1, answer1_size);
         memcpy(answer + answer1_size, answer2, answer2_size);
-        assert_se(write(fd, answer, answer_size) == (ssize_t)answer_size);
+        ASSERT_OK_EQ_ERRNO(write(fd, answer, answer_size), (ssize_t) answer_size);
 }
 
 static void server_handle(int fd) {
@@ -107,11 +107,11 @@ static void server_handle(int fd) {
 static void *tcp_dns_server(void *p) {
         _cleanup_close_ int bindfd = -EBADF, acceptfd = -EBADF;
 
-        assert_se((bindfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) >= 0);
-        assert_se(setsockopt(bindfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) >= 0);
-        assert_se(bind(bindfd, &server_address.sa, sockaddr_len(&server_address)) >= 0);
-        assert_se(listen(bindfd, 1) >= 0);
-        assert_se((acceptfd = accept4(bindfd, NULL, NULL, SOCK_CLOEXEC)) >= 0);
+        bindfd = ASSERT_OK_ERRNO(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        ASSERT_OK(setsockopt_int(bindfd, SOL_SOCKET, SO_REUSEADDR, /* value= */ true));
+        ASSERT_OK_ERRNO(bind(bindfd, &server_address.sa, sockaddr_len(&server_address)));
+        ASSERT_OK_ERRNO(listen(bindfd, 1));
+        acceptfd = ASSERT_OK_ERRNO(accept4(bindfd, NULL, NULL, SOCK_CLOEXEC));
         server_handle(acceptfd);
         return NULL;
 }
@@ -126,20 +126,20 @@ static void *tls_dns_server(void *p) {
         _cleanup_free_ char *cert_path = NULL, *key_path = NULL;
         _cleanup_free_ char *bind_str = NULL;
 
-        assert_se(get_testdata_dir("test-resolve/selfsigned.cert", &cert_path) >= 0);
-        assert_se(get_testdata_dir("test-resolve/selfsigned.key", &key_path) >= 0);
+        ASSERT_OK(get_testdata_dir("test-resolve/selfsigned.cert", &cert_path));
+        ASSERT_OK(get_testdata_dir("test-resolve/selfsigned.key", &key_path));
 
-        assert_se(asprintf(&bind_str, "%s:%d",
-                           IN_ADDR_TO_STRING(server_address.in.sin_family,
-                                             sockaddr_in_addr(&server_address.sa)),
-                           be16toh(server_address.in.sin_port)) >= 0);
+        ASSERT_OK_ERRNO(asprintf(&bind_str, "%s:%d",
+                                 IN_ADDR_TO_STRING(server_address.in.sin_family,
+                                                   sockaddr_in_addr(&server_address.sa)),
+                                 be16toh(server_address.in.sin_port)));
 
         /* We will hook one of the socketpair ends to OpenSSL's TLS server
          * stdin/stdout, so we will be able to read and write plaintext
          * from the other end's file descriptor like an usual TCP server */
         {
                 int fd[2];
-                assert_se(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) >= 0);
+                ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM, 0, fd));
                 fd_server = fd[0];
                 fd_tls = fd[1];
         }
@@ -148,14 +148,15 @@ static void *tls_dns_server(void *p) {
         r = ASSERT_OK(pidref_safe_fork_full(
                         "(test-resolved-stream-tls-openssl)",
                         (int[]) { fd_tls, fd_tls, STDOUT_FILENO },
-                        NULL, 0,
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
                         FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_REOPEN_LOG,
                         &openssl_pidref));
         if (r == 0) {
                 /* Child */
-                execlp("openssl", "openssl", "s_server", "-accept", bind_str,
-                       "-key", key_path, "-cert", cert_path,
-                       "-quiet", "-naccept", "1", NULL);
+                r = execvp_safe("openssl", STRV_MAKE("openssl", "s_server", "-accept", bind_str,
+                                                     "-key", key_path, "-cert", cert_path,
+                                                     "-quiet", "-naccept", "3"));
+                log_error_errno(r, "Failed to execute openssl: %m");
                 log_error("exec failed, is something wrong with the 'openssl' command?");
                 _exit(EXIT_FAILURE);
         } else {
@@ -164,10 +165,10 @@ static void *tls_dns_server(void *p) {
                 server_handle(fd_server);
 
                 /* Once the test is done kill the TLS server to release the port */
-                assert_se(pthread_mutex_lock(server_lock) == 0);
-                assert_se(pidref_kill(&openssl_pidref, SIGTERM) >= 0);
-                assert_se(pidref_wait_for_terminate(&openssl_pidref, NULL) >= 0);
-                assert_se(pthread_mutex_unlock(server_lock) == 0);
+                ASSERT_EQ(pthread_mutex_lock(server_lock), 0);
+                ASSERT_OK(pidref_kill(&openssl_pidref, SIGTERM));
+                ASSERT_OK(pidref_wait_for_terminate(&openssl_pidref, /* ret_si= */ NULL));
+                ASSERT_EQ(pthread_mutex_unlock(server_lock), 0);
         }
 
         return NULL;
@@ -182,13 +183,13 @@ static void send_simple_question(DnsStream *stream, uint16_t type) {
         _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
         _cleanup_(dns_question_unrefp) DnsQuestion *question = NULL;
 
-        assert_se(dns_packet_new(&p, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX) >= 0);
-        assert_se(question = dns_question_new(1));
-        assert_se(key = dns_resource_key_new(DNS_CLASS_IN, type, TEST_DOMAIN));
-        assert_se(dns_question_add(question, key, 0) >= 0);
-        assert_se(dns_packet_append_question(p, question) >= 0);
+        ASSERT_OK(dns_packet_new(&p, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_NOT_NULL(question = dns_question_new(1));
+        ASSERT_NOT_NULL(key = dns_resource_key_new(DNS_CLASS_IN, type, TEST_DOMAIN));
+        ASSERT_OK(dns_question_add(question, key, /* flags= */ 0));
+        ASSERT_OK(dns_packet_append_question(p, question));
         DNS_PACKET_HEADER(p)->qdcount = htobe16(dns_question_size(question));
-        assert_se(dns_stream_write_packet(stream, p) >= 0);
+        ASSERT_OK(dns_stream_write_packet(stream, p));
 }
 
 static const size_t MAX_RECEIVED_PACKETS = 2;
@@ -196,8 +197,8 @@ static DnsPacket *received_packets[2] = {};
 static size_t n_received_packets = 0;
 
 static int on_stream_packet(DnsStream *stream, DnsPacket *p) {
-        assert_se(n_received_packets < MAX_RECEIVED_PACKETS);
-        assert_se(received_packets[n_received_packets++] = dns_packet_ref(p));
+        ASSERT_LT(n_received_packets, MAX_RECEIVED_PACKETS);
+        ASSERT_NOT_NULL(received_packets[n_received_packets++] = dns_packet_ref(p));
         return 0;
 }
 
@@ -205,12 +206,44 @@ static int on_stream_complete_do_nothing(DnsStream *s, int error) {
         return 0;
 }
 
+#if ENABLE_DNS_OVER_TLS
+static int stream_error = 0;
+
+static int on_stream_complete_save_error(DnsStream *s, int error) {
+        stream_error = error;
+        return 0;
+}
+#endif
+
+static int connect_to_server(void) {
+        _cleanup_close_ int fd = -EBADF;
+        int r = -1;
+
+        /* The server may not be up immediately, so try to connect a few times before failing */
+        fd = ASSERT_OK_ERRNO(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+
+        for (int i = 0; i < 100; i++) {
+                r = connect(fd, &server_address.sa, sockaddr_len(&server_address));
+                if (r >= 0)
+                        break;
+                usleep_safe(EVENT_TIMEOUT_USEC / 100);
+        }
+        ASSERT_OK_ERRNO(r);
+
+        /* systemd-resolved uses (and requires) the socket to be in nonblocking mode */
+        ASSERT_OK_ERRNO(fcntl(fd, F_SETFL, O_NONBLOCK));
+
+        return TAKE_FD(fd);
+}
+
 static void test_dns_stream(bool tls) {
         Manager manager = {};
+#if ENABLE_DNS_OVER_TLS
+        _cleanup_(dnstls_server_data_done) DnsTlsServerData server_data = {};
+#endif
          _cleanup_(dns_stream_unrefp) DnsStream *stream = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_close_ int clientfd = -EBADF;
-        int r;
 
         void *(*server_entrypoint)(void *);
         pthread_t server_thread;
@@ -226,7 +259,7 @@ static void test_dns_stream(bool tls) {
                 manager.dns_over_tls_mode = DNS_OVER_TLS_OPPORTUNISTIC;
 #endif
 
-        assert_se(sd_event_new(&event) >= 0);
+        ASSERT_OK(sd_event_new(&event));
         manager.event = event;
 
         /* Set up a mock DNS (over TCP or TLS) server */
@@ -235,40 +268,29 @@ static void test_dns_stream(bool tls) {
         if (tls)
                 server_entrypoint = tls_dns_server;
 #endif
-        assert_se(pthread_mutex_init(&server_lock, NULL) == 0);
-        assert_se(pthread_mutex_lock(&server_lock) == 0);
-        assert_se(pthread_create(&server_thread, NULL, server_entrypoint, &server_lock) == 0);
+        ASSERT_EQ(pthread_mutex_init(&server_lock, NULL), 0);
+        ASSERT_EQ(pthread_mutex_lock(&server_lock), 0);
+        ASSERT_EQ(pthread_create(&server_thread, NULL, server_entrypoint, &server_lock), 0);
 
-        /* Create a socket client and connect to the TCP or TLS server
-         * The server may not be up immediately, so try to connect a few times before failing */
-        assert_se((clientfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) >= 0);
-
-        for (int i = 0; i < 100; i++) {
-                r = connect(clientfd, &server_address.sa, sockaddr_len(&server_address));
-                if (r >= 0)
-                        break;
-                usleep_safe(EVENT_TIMEOUT_USEC / 100);
-        }
-        assert_se(r >= 0);
-
-        /* systemd-resolved uses (and requires) the socket to be in nonblocking mode */
-        assert_se(fcntl(clientfd, F_SETFL, O_NONBLOCK) >= 0);
+        /* Create a socket client and connect to the TCP or TLS server */
+        clientfd = connect_to_server();
 
         /* Initialize DNS stream (disabling the default self-destruction
-           behaviour when no complete callback is set) */
-        assert_se(dns_stream_new(&manager, &stream, DNS_STREAM_LOOKUP, DNS_PROTOCOL_DNS,
-                                 TAKE_FD(clientfd), NULL, on_stream_packet, on_stream_complete_do_nothing,
-                                 DNS_STREAM_DEFAULT_TIMEOUT_USEC) >= 0);
+           behaviour when no complete callback is set). It takes over the fd only on success. */
+        ASSERT_OK(dns_stream_new(&manager, &stream, DNS_STREAM_LOOKUP, DNS_PROTOCOL_DNS,
+                                 clientfd, /* tfo_address= */ NULL, on_stream_packet, on_stream_complete_do_nothing,
+                                 DNS_STREAM_DEFAULT_TIMEOUT_USEC));
+        TAKE_FD(clientfd);
 #if ENABLE_DNS_OVER_TLS
         if (tls) {
-                DnsServer server = {
-                        .manager = &manager,
-                        .family = server_address.sa.sa_family,
-                        .address = *sockaddr_in_addr(&server_address.sa),
-                };
-
-                assert_se(dnstls_manager_init(&manager) >= 0);
-                assert_se(dnstls_stream_connect_tls(stream, &server) >= 0);
+                ASSERT_OK(dnstls_manager_init(&manager));
+                ASSERT_OK(dnstls_stream_connect_tls(
+                                        stream,
+                                        /* server_name= */ NULL,
+                                        server_address.sa.sa_family,
+                                        sockaddr_in_addr(&server_address.sa),
+                                        /* verify= */ manager.dns_over_tls_mode == DNS_OVER_TLS_YES,
+                                        &server_data));
         }
 #endif
 
@@ -276,10 +298,10 @@ static void test_dns_stream(bool tls) {
         log_info("test-resolved-stream: A record");
         send_simple_question(stream, DNS_TYPE_A);
         while (n_received_packets != 1)
-                assert_se(sd_event_run(event, EVENT_TIMEOUT_USEC) >= 1);
-        assert_se(DNS_PACKET_DATA(received_packets[0]));
-        assert_se(memcmp(DNS_PACKET_DATA(received_packets[0]),
-                         ANSWER_A + 2, sizeof(ANSWER_A) - 2) == 0);
+                ASSERT_OK_POSITIVE(sd_event_run(event, EVENT_TIMEOUT_USEC));
+        ASSERT_NOT_NULL(DNS_PACKET_DATA(received_packets[0]));
+        ASSERT_MEMEQ(DNS_PACKET_DATA(received_packets[0]),
+                     ANSWER_A + 2, sizeof(ANSWER_A) - 2);
         dns_packet_unref(TAKE_PTR(received_packets[0]));
         n_received_packets = 0;
 
@@ -287,10 +309,10 @@ static void test_dns_stream(bool tls) {
         log_info("test-resolved-stream: AAAA record");
         send_simple_question(stream, DNS_TYPE_AAAA);
         while (n_received_packets != 1)
-                assert_se(sd_event_run(event, EVENT_TIMEOUT_USEC) >= 1);
-        assert_se(DNS_PACKET_DATA(received_packets[0]));
-        assert_se(memcmp(DNS_PACKET_DATA(received_packets[0]),
-                         ANSWER_AAAA + 2, sizeof(ANSWER_AAAA) - 2) == 0);
+                ASSERT_OK_POSITIVE(sd_event_run(event, EVENT_TIMEOUT_USEC));
+        ASSERT_NOT_NULL(DNS_PACKET_DATA(received_packets[0]));
+        ASSERT_MEMEQ(DNS_PACKET_DATA(received_packets[0]),
+                     ANSWER_AAAA + 2, sizeof(ANSWER_AAAA) - 2);
         dns_packet_unref(TAKE_PTR(received_packets[0]));
         n_received_packets = 0;
 
@@ -302,28 +324,106 @@ static void test_dns_stream(bool tls) {
         send_simple_question(stream, DNS_TYPE_AAAA);
 
         while (n_received_packets != 2)
-                assert_se(sd_event_run(event, EVENT_TIMEOUT_USEC) >= 1);
-        assert_se(DNS_PACKET_DATA(received_packets[0]));
-        assert_se(DNS_PACKET_DATA(received_packets[1]));
-        assert_se(memcmp(DNS_PACKET_DATA(received_packets[0]),
-                         ANSWER_A + 2, sizeof(ANSWER_A) - 2) == 0);
-        assert_se(memcmp(DNS_PACKET_DATA(received_packets[1]),
-                         ANSWER_AAAA + 2, sizeof(ANSWER_AAAA) - 2) == 0);
+                ASSERT_OK_POSITIVE(sd_event_run(event, EVENT_TIMEOUT_USEC));
+        ASSERT_NOT_NULL(DNS_PACKET_DATA(received_packets[0]));
+        ASSERT_NOT_NULL(DNS_PACKET_DATA(received_packets[1]));
+        ASSERT_MEMEQ(DNS_PACKET_DATA(received_packets[0]),
+                     ANSWER_A + 2, sizeof(ANSWER_A) - 2);
+        ASSERT_MEMEQ(DNS_PACKET_DATA(received_packets[1]),
+                     ANSWER_AAAA + 2, sizeof(ANSWER_AAAA) - 2);
         dns_packet_unref(TAKE_PTR(received_packets[0]));
         dns_packet_unref(TAKE_PTR(received_packets[1]));
         n_received_packets = 0;
 
 #if ENABLE_DNS_OVER_TLS
-        if (tls)
+        if (tls) {
+                /* Shutting down the stream saves the TLS session for resumption, along with the fact that
+                 * the server certificate wasn't verified */
+                ASSERT_OK(dnstls_stream_shutdown(stream, /* error= */ 0));
+                ASSERT_NOT_NULL(server_data.session);
+                ASSERT_FALSE(server_data.session_verified);
+
+                /* Close the connection, so that the server accepts the next one */
+                stream = dns_stream_unref(stream);
+
+                /* A session negotiated with verification is kept and offered for resumption when
+                 * verification is required. The server's self-signed certificate never verifies, hence
+                 * pretend that it was, and only check that the session isn't dropped when connecting. */
+                SSL_SESSION *session = server_data.session;
+                server_data.session_verified = true;
+                clientfd = connect_to_server();
+                ASSERT_OK(dns_stream_new(&manager, &stream, DNS_STREAM_LOOKUP, DNS_PROTOCOL_DNS,
+                                         clientfd, /* tfo_address= */ NULL, on_stream_packet, on_stream_complete_do_nothing,
+                                         DNS_STREAM_DEFAULT_TIMEOUT_USEC));
+                TAKE_FD(clientfd);
+                ASSERT_OK(dnstls_stream_connect_tls(
+                                        stream,
+                                        /* server_name= */ NULL,
+                                        server_address.sa.sa_family,
+                                        sockaddr_in_addr(&server_address.sa),
+                                        /* verify= */ true,
+                                        &server_data));
+                ASSERT_PTR_EQ(server_data.session, session);
+                ASSERT_TRUE(server_data.session_verified);
+                stream = dns_stream_unref(stream);
+                server_data.session_verified = false;
+
+                /* Once verification is required, that session must not be resumed, as resuming a session
+                 * skips verifying the certificate. Hence it is forgotten, a full handshake is done, and that
+                 * fails, as the server's self-signed certificate doesn't verify. */
+                clientfd = connect_to_server();
+                ASSERT_OK(dns_stream_new(&manager, &stream, DNS_STREAM_LOOKUP, DNS_PROTOCOL_DNS,
+                                         clientfd, /* tfo_address= */ NULL, on_stream_packet, on_stream_complete_save_error,
+                                         DNS_STREAM_DEFAULT_TIMEOUT_USEC));
+                TAKE_FD(clientfd);
+                ASSERT_OK(dnstls_stream_connect_tls(
+                                        stream,
+                                        /* server_name= */ NULL,
+                                        server_address.sa.sa_family,
+                                        sockaddr_in_addr(&server_address.sa),
+                                        /* verify= */ true,
+                                        &server_data));
+                ASSERT_NULL(server_data.session);
+
+                while (stream_error == 0)
+                        ASSERT_OK_POSITIVE(sd_event_run(event, EVENT_TIMEOUT_USEC));
+
+                /* Make sure the handshake failed because the certificate didn't verify, and not for some
+                 * other reason */
+                ASSERT_EQ(stream_error, ECONNREFUSED);
+                ASSERT_EQ(sym_SSL_get_verify_result(stream->dnstls_data.ssl),
+                          (long) X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT);
+                ASSERT_EQ(n_received_packets, 0U);
+
+                /* A failed handshake leaves no session to resume */
+                ASSERT_NULL(server_data.session);
+
+                stream = dns_stream_unref(stream);
                 dnstls_manager_free(&manager);
+        }
 #endif
 
         /* Stop the DNS server */
-        assert_se(pthread_mutex_unlock(&server_lock) == 0);
-        assert_se(pthread_join(server_thread, NULL) == 0);
-        assert_se(pthread_mutex_destroy(&server_lock) == 0);
+        ASSERT_EQ(pthread_mutex_unlock(&server_lock), 0);
+        ASSERT_EQ(pthread_join(server_thread, NULL), 0);
+        ASSERT_EQ(pthread_mutex_destroy(&server_lock), 0);
 
         log_info("test-resolved-stream: Finished %s test", tls ? "TLS" : "TCP");
+}
+
+TEST(dns_stream_without_tls) {
+        test_dns_stream(/* tls= */ false);
+}
+
+TEST(dns_stream_with_tls) {
+#if ENABLE_DNS_OVER_TLS
+        if (system("openssl version >/dev/null 2>&1") != 0)
+                return (void) log_tests_skipped("openssl command does not seem to be available");
+
+        test_dns_stream(/* tls= */ true);
+#else
+        return (void) log_tests_skipped("DNS over TLS is disabled");
+#endif
 }
 
 static int try_isolate_network(void) {
@@ -333,7 +433,7 @@ static int try_isolate_network(void) {
         /* First test if CLONE_NEWUSER/CLONE_NEWNET can actually work for us, i.e. we can open the namespaces
          * and then still access the build dir we are run from. We do that in a child process since it's
          * nasty if we have to go back from the namespace once we entered it and realized it cannot work. */
-        r = pidref_safe_fork("(usernstest)", FORK_DEATHSIG_SIGKILL|FORK_LOG|FORK_WAIT, NULL);
+        r = pidref_safe_fork("(usernstest)", FORK_DEATHSIG_SIGKILL|FORK_LOG|FORK_WAIT, /* ret= */ NULL);
         if (r == 0) { /* child */
                 _cleanup_free_ char *rt = NULL, *d = NULL;
 
@@ -342,8 +442,8 @@ static int try_isolate_network(void) {
                         _exit(EXIT_FAILURE);
                 }
 
-                assert_se(get_process_exe(0, &rt) >= 0);
-                assert_se(path_extract_directory(rt, &d) >= 0);
+                ASSERT_OK(get_process_exe(/* pid= */ 0, &rt));
+                ASSERT_OK(path_extract_directory(rt, &d));
 
                 if (access(d, F_OK) < 0) {
                         log_warning_errno(errno, "test-resolved-stream: Can't access /proc/self/exe from user/network ns, running on host: %m");
@@ -354,17 +454,17 @@ static int try_isolate_network(void) {
         }
         if (r == -EPROTO) /* EPROTO means nonzero exit code of child, i.e. the tests in the child failed */
                 return 0;
-        assert_se(r > 0);
+        ASSERT_OK_POSITIVE(r);
 
         /* Now that we know that the unshare() is safe, let's actually do it */
-        assert_se(unshare(CLONE_NEWUSER | CLONE_NEWNET) >= 0);
+        ASSERT_OK_ERRNO(unshare(CLONE_NEWUSER | CLONE_NEWNET));
 
         /* Bring up the loopback interface on the newly created network namespace */
         struct ifreq req = { .ifr_ifindex = 1 };
-        assert_se((socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) >= 0);
-        assert_se(ioctl(socket_fd, SIOCGIFNAME, &req) >= 0);
-        assert_se(ioctl(socket_fd, SIOCGIFFLAGS, &req) >= 0);
-        assert_se(FLAGS_SET(req.ifr_flags, IFF_LOOPBACK));
+        socket_fd = ASSERT_OK_ERRNO(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        ASSERT_OK_ERRNO(ioctl(socket_fd, SIOCGIFNAME, &req));
+        ASSERT_OK_ERRNO(ioctl(socket_fd, SIOCGIFFLAGS, &req));
+        ASSERT_TRUE(FLAGS_SET(req.ifr_flags, IFF_LOOPBACK));
         req.ifr_flags |= IFF_UP;
         /* Do not assert on this, fails in the Ubuntu 24.04 CI environment */
         r = RET_NERRNO(ioctl(socket_fd, SIOCSIFFLAGS, &req));
@@ -374,27 +474,21 @@ static int try_isolate_network(void) {
         return 0;
 }
 
-int main(int argc, char **argv) {
+static int intro(void) {
+        int r;
+
         server_address = (union sockaddr_union) {
                 .in.sin_family = AF_INET,
                 .in.sin_port = htobe16(random_u64_range(UINT16_MAX - 1024) + 1024),
                 .in.sin_addr.s_addr = htobe32(INADDR_LOOPBACK)
         };
-        int r;
-
-        test_setup_logging(LOG_DEBUG);
 
         r = try_isolate_network();
         if (ERRNO_IS_NEG_PRIVILEGE(r))
                 return log_tests_skipped("lacking privileges");
-        assert_se(r >= 0);
+        ASSERT_OK(r);
 
-        test_dns_stream(false);
-#if ENABLE_DNS_OVER_TLS
-        if (system("openssl version >/dev/null 2>&1") != 0)
-                return log_tests_skipped("Skipping TLS test since the 'openssl' command does not seem to be available");
-        test_dns_stream(true);
-#endif
-
-        return 0;
+        return EXIT_SUCCESS;
 }
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

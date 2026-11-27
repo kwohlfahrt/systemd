@@ -53,9 +53,10 @@ the NV index handle space.
 
 The NV index range to use for this is configurable at build time, so that
 downstreams have some flexibility to change this if they want. This uses the
-0x01d10200 NV index as base by default. To abstract the actual nvindex number
-away there's a naming concept, so that nvindexes are referenced by name string
-rather than number.
+0x01d10200 NV index as base by default (see [TPM NV Index Assignments by
+systemd](/TPM2_NVINDEX_ASSIGNMENTS) for the NV index ranges systemd uses). To
+abstract the actual nvindex number away there's a naming concept, so that
+nvindexes are referenced by name string rather than number.
 
 NvPCRs are defined in little JSON snippets in `/usr/lib/nvpcr/*.nvpcr`, that
 match up index number and name, as well as pick a hash algorithm. The recognized
@@ -106,6 +107,20 @@ policy or different attributes that permit initialization during runtime can be
 detected because the name of the NV index will not match the name that was
 previously measured to PCR 9.
 
+If the booted UKI carries no PCR public key, or no signed PCR policy with the
+`initrd` policy reference for it, the branch for the first write is instead a
+`TPM2_PolicyPCR` assertion bound to the value of the kernel boot PCR (11) at the
+time the NvPCR is initialized. This fallback is only used in the initrd, where
+PCR 11 has a value that can no longer be reached once the initrd has been left.
+The same considerations as above apply, but the name of the NvPCR then depends
+on the value of PCR 11 in the initrd, and hence changes whenever the UKI changes.
+A verifier has to calculate the expected name from the expected value of PCR 11
+in the initrd (e.g. as calculated by `systemd-measure calculate
+--phase=enter-initrd`). This is hence only useful where that value can be
+predicted. Note that on systems that are not booted via a UKI, PCR 11 does not
+cover the kernel and initrd, and the name of the NvPCR hence does not depend on
+them.
+
 ## PCR Measurements Made by `systemd-boot` (UEFI)
 
 ### PCR 1, `EV_EVENT_TAG`, SMBIOS information
@@ -141,11 +156,12 @@ described above.
 
 This measurement is also performed by `systemd-stub` (see below), so that systems
 that boot a UKI directly, bypassing `systemd-boot`, still get it. Whichever
-component runs first performs the measurement and sets the volatile
-`LoaderPcrSMBIOS` EFI variable to the PCR index used; its presence suppresses a
-second measurement of the same data into the same PCR during the same boot. Note
-that the firmware itself typically also extends PCR 1, so its final value is not
-solely determined by this measurement.
+component runs first performs the measurement and, if all structures were
+measured successfully, sets the volatile `LoaderPcrSMBIOS` EFI variable to the
+PCR index used; its presence suppresses a second measurement of the same data
+into the same PCR during the same boot. Note that the firmware itself typically
+also extends PCR 1, so its final value is not solely determined by this
+measurement.
 
 ### PCR 5, `EV_EVENT_TAG`, `loader.conf`
 
@@ -171,8 +187,30 @@ below for details on PE section measurements done by `systemd-stub`.)
 → **Description** in the event log record is the literal kernel command line in
 UTF-16.
 
-→ **Measured hash** covers the literal kernel command line in UTF-16 (without any
-trailing NUL bytes).
+→ **Measured hash** covers the literal kernel command line in UTF-16LE, *including*
+its single terminating U+0000 character (i.e. the hashed data ends in exactly
+two 0x00 bytes). The event log record data is identical.
+
+### PCR 12, `EV_EVENT_TAG`, Type #1 DeviceTree
+
+When Secure Boot is disabled and a Boot Loader Specification Type #1 entry
+specifies a DeviceTree with the `devicetree` field, the DeviceTree is measured as
+a tagged event after it is read and before it is installed. If the measurement
+fails, the DeviceTree is not installed and the entry is not booted.
+
+This is about DeviceTrees referenced directly by the boot entry, not about
+DeviceTree addons (see below). Unlike addons, these DeviceTrees are not
+authenticated, hence they are measured with an event tag of their own, so that
+the two can be told apart in the event log.
+
+→ **Event Tag** `0x37c1e1f3`
+
+→ **Description** is the DeviceTree path from the Type #1 entry, in UTF-16,
+normalized to an EFI-style path with backslash separators and duplicate
+separators collapsed.
+
+→ **Measured hash** covers the content of the DeviceTree exactly as read from
+disk, before any firmware fixups are applied.
 
 ## PCR Measurements Made by `systemd-stub` (UEFI)
 
@@ -221,8 +259,9 @@ Might happen up to three times, for kernel command lines from:
 → **Description** in the event log record is the literal kernel command line in
 UTF-16.
 
-→ **Measured hash** covers the literal kernel command line in UTF-16 (without any
-trailing NUL bytes).
+→ **Measured hash** covers the literal kernel command line in UTF-16LE, *including*
+its single terminating U+0000 character (i.e. the hashed data ends in exactly
+two 0x00 bytes). The event log record data is identical.
 
 ### PCR 12, `EV_EVENT_TAG`, DeviceTrees
 
@@ -253,6 +292,22 @@ Ucode addons are measured individually as a tagged event.
 → **Description** is the addon filename.
 
 → **Measured hash** covers the contents of the ucode initrd.
+
+### PCR 12, `EV_EVENT_TAG`, addons trusted on first use
+
+Addons that the firmware refused to load, and that systemd-stub trusted on first
+use instead (see the "Trusting Addons On First Use" section of
+[systemd-stub(7)](https://www.freedesktop.org/software/systemd/man/latest/systemd-stub.html)),
+are measured as a whole, as a tagged event, before the sections taken from them
+are measured as described above. The firmware does not measure them into PCR 4,
+as it never loaded them. Every addon that is trusted on first use is measured,
+even if it is then ignored.
+
+→ **Event Tag** `0x7a0f3b51`
+
+→ **Description** is the addon filename.
+
+→ **Measured hash** covers the contents of the addon PE file.
 
 ### PCR 12, `EV_IPL`, per-uki credentials initrd
 

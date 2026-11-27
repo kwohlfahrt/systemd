@@ -191,6 +191,36 @@ int cg_create_and_attach(const char *path, pid_t pid) {
         return r;
 }
 
+int cg_pin_attribute(int dir_fd, const char *name) {
+        struct statx sx, dir_sx;
+        int r;
+
+        assert(dir_fd >= 0);
+        assert(filename_is_valid(name));
+
+        _cleanup_close_ int fd = xopenat(dir_fd, name, O_PATH|O_NOFOLLOW);
+        if (fd < 0)
+                return fd;
+
+        r = xstatx_full(fd, /* path= */ NULL, AT_STATX_DONT_SYNC, /* xstatx_flags= */ 0,
+                        STATX_TYPE|STATX_MNT_ID, /* optional_mask= */ 0, STATX_ATTR_MOUNT_ROOT, &sx);
+        if (r < 0)
+                return r;
+
+        /* Both fds pin their mounts, so neither mount ID can be recycled between the two queries. */
+        r = xstatx(dir_fd, /* path= */ NULL, AT_STATX_DONT_SYNC, STATX_MNT_ID, &dir_sx);
+        if (r < 0)
+                return r;
+        if (sx.stx_mnt_id != dir_sx.stx_mnt_id || FLAGS_SET(sx.stx_attributes, STATX_ATTR_MOUNT_ROOT))
+                return -EXDEV;
+
+        r = statx_verify_regular(&sx);
+        if (r < 0)
+                return r;
+
+        return TAKE_FD(fd);
+}
+
 int cg_set_access(
                 const char *path,
                 uid_t uid,
@@ -293,9 +323,9 @@ int cg_set_access_recursive(
         if (r < 0)
                 return r;
 
-        fd = open(fs, O_DIRECTORY|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, fs, O_DIRECTORY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         struct access_callback_data d = {
                 .uid = uid,
@@ -426,7 +456,7 @@ int cg_enable(
                         r = write_string_stream(f, s, WRITE_STRING_FILE_DISABLE_BUFFER);
                         if (r < 0) {
                                 log_debug_errno(r, "Failed to %s controller %s for %s (%s): %m",
-                                                FLAGS_SET(mask, bit) ? "enable" : "disable", n, p, fs);
+                                                enable_disable(FLAGS_SET(mask, bit)), n, p, fs);
                                 clearerr(f);
 
                                 /* If we can't turn off a controller, leave it on in the reported resulting mask. This

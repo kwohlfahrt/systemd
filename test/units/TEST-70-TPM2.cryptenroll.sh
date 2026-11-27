@@ -3,16 +3,24 @@
 set -eux
 set -o pipefail
 
-cryptenroll_wipe_and_check() {(
+cryptenroll_wipe_and_check() (
     set +o pipefail
 
     : >/tmp/cryptenroll.out
     systemd-cryptenroll "$@" |& tee /tmp/cryptenroll.out
     grep -qE "Wiped slot [[:digit:]]+" /tmp/cryptenroll.out
-)}
+)
 
 at_exit() {
-    rm -f "${IMAGE:-}" "${VL_IMAGE:-}" /tmp/cryptenroll.out /tmp/password
+    cryptsetup close "${VAR_IMAGE_NAME:-}" >/dev/null 2>&1 || :
+    if [[ -n "${VAR_LOOP:-}" ]]; then
+        losetup --detach "$VAR_LOOP" || :
+    fi
+
+    rm -f "${IMAGE:-}" "${VL_IMAGE:-}" "${VAR_IMAGE:-}" /tmp/cryptenroll.out /tmp/password /etc/polkit-1/rules.d/cryptenroll-unpriv.rules
+
+    # Ignore if polkit doesn't exist
+    systemctl try-reload-or-restart polkit.service || :
 }
 
 trap at_exit EXIT
@@ -78,6 +86,13 @@ NEWPIN=1234 systemd-cryptenroll --unlock-tpm2-device=auto --tpm2-device=auto --t
 PIN=1234 NEWPIN=4321 systemd-cryptenroll --unlock-tpm2-device=auto --tpm2-device=auto --tpm2-public-key= --tpm2-with-pin=yes "$IMAGE"
 PIN=4321 systemd-cryptenroll --unlock-tpm2-device=auto --recovery-key "$IMAGE"
 
+# A policy reference without a PCR public key has nothing to apply to, hence must be ignored. Wipe the
+# TPM2 slots first, as otherwise the enrollment stops early because one with the same policy exists.
+systemd-cryptenroll --wipe-slot=tpm2 "$IMAGE"
+PASSWORD=foo systemd-cryptenroll --tpm2-device=auto --tpm2-public-key= --tpm2-public-key-policyref=foo "$IMAGE"
+cryptsetup luksDump --dump-json-metadata "$IMAGE" | jq -e '[.tokens[] | select(.type == "systemd-tpm2")] | length == 1 and (.[0] | has("tpm2_pubkey_ref") | not)'
+systemd-cryptenroll --unlock-tpm2-device=auto --recovery-key "$IMAGE"
+
 (! systemd-cryptenroll --fido2-with-client-pin=false)
 (! systemd-cryptenroll --fido2-with-user-presence=f "$IMAGE" /tmp/foo)
 (! systemd-cryptenroll --fido2-with-client-pin=1234 "$IMAGE")
@@ -99,6 +114,20 @@ PIN=4321 systemd-cryptenroll --unlock-tpm2-device=auto --recovery-key "$IMAGE"
 (! systemd-cryptenroll --wipe-slot "$IMAGE")
 (! systemd-cryptenroll --wipe-slot=10240000 "$IMAGE")
 (! systemd-cryptenroll --fido2-device=auto --unlock-fido2-device=auto "$IMAGE")
+# TPM2 and FIDO2 may be combined, but only against a real TPM2 device, and regardless of the switch order
+(! systemd-cryptenroll --tpm2-device-key=/tmp/tpm2.pub --fido2-device=auto "$IMAGE" 2>&1) | grep "Multiple operations specified at once" >/dev/null
+(! systemd-cryptenroll --fido2-device=auto --tpm2-device-key=/tmp/tpm2.pub "$IMAGE" 2>&1) | grep "Multiple operations specified at once" >/dev/null
+(! systemd-cryptenroll --password --tpm2-device=auto --fido2-device=auto "$IMAGE")
+(! systemd-cryptenroll --password --fido2-device=auto --tpm2-device=auto "$IMAGE")
+(! systemd-cryptenroll --tpm2-device=auto --fido2-device=auto --pkcs11-token-uri=auto "$IMAGE")
+# The FIDO2 parameters of a TPM2+FIDO2 enrollment are part of the TPM2 token, so they cannot be kept off the header
+(! systemd-cryptenroll --tpm2-device=auto --fido2-device=auto --fido2-parameters-in-header=no --fido2-salt-file=/tmp/salt "$IMAGE" 2>&1) |
+    grep "cannot be disabled when enrolling TPM2 and FIDO2 together" >/dev/null
+# The salt of a TPM2+FIDO2 enrollment is derived from the TPM2 sealed secret, so it cannot come from a file
+(! systemd-cryptenroll --tpm2-device=auto --fido2-device=auto --fido2-salt-file=/tmp/salt "$IMAGE" 2>&1) |
+    grep "A FIDO2 salt file cannot be used when enrolling TPM2 and FIDO2 together" >/dev/null
+(! systemd-cryptenroll --unlock-key-file=/tmp/unlock --unlock-tpm2-device=auto --unlock-fido2-device=auto "$IMAGE")
+(! systemd-cryptenroll --unlock-tpm2-device=auto --unlock-fido2-device=auto --unlock-key-file=/tmp/unlock "$IMAGE")
 
 rm -f "$IMAGE"
 
@@ -127,12 +156,16 @@ echo -n "$RECOVERY_KEY" | cryptsetup open --type=luks2 --test-passphrase --key-f
 (! varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
     "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"recovery\",\"recoveryKey\":\"SOME_RANDOM_KEY\",\"unlockKeyFile\":\"/tmp/password\"}" | grep recoveryKey >/dev/null)
 
+# Enrolling a password runs the argon2id benchmark and the argon2id key derivation of libcryptsetup. The
+# benchmark and the key derivation together take longer than the 45s default timeout of varlinkctl when the VM
+# gets little CPU time. The calls that enroll a password hence use a longer timeout.
+#
 # Enroll a password, unlocking via key file (cf. NEWPASSWORD=… systemd-cryptenroll --unlock-key-file= --password)
-varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+varlinkctl --timeout=5min call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
     "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"unlockKeyFile\":\"/tmp/password\",\"password\":\"varlinkpassword\"}"
 
 # Enroll a password, unlocking via the key file passed as a file descriptor instead of a path
-varlinkctl --push-fd=3 call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+varlinkctl --timeout=5min --push-fd=3 call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
     "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"unlockKeyFileDescriptor\":0,\"password\":\"fdpassword\"}" 3</tmp/password
 
 # List enrolled slots (must be called with 'more'); we should see the password and the two recovery slots we enrolled
@@ -140,9 +173,29 @@ SLOTS=$(varlinkctl call --more "$VL_ADDRESS" io.systemd.CryptEnroll.ListSlots "{
 test "$(grep -c '"type":"recovery"' <<<"$SLOTS")" -eq 2
 grep '"type":"password"' <<<"$SLOTS" >/dev/null
 
+VAR_IMAGE="$(mktemp /tmp/systemd-cryptenroll-default-node-XXX.image)"
+VAR_IMAGE_NAME="$(basename "$VAR_IMAGE" .image)"
+truncate -s 20M "$VAR_IMAGE"
+cryptsetup luksFormat -q --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --use-urandom "$VAR_IMAGE" /tmp/password
+VAR_LOOP="$(losetup --show --find "$VAR_IMAGE")"
+cryptsetup open --type=luks2 --key-file=/tmp/password "$VAR_LOOP" "$VAR_IMAGE_NAME"
+mkfs.ext4 -q "/dev/mapper/$VAR_IMAGE_NAME"
+
+run_with_enc_var() {
+    unshare --mount --propagation private bash -c "mount -t ext4 \"/dev/mapper/$VAR_IMAGE_NAME\" /var && udevadm wait --settle /dev/mapper/$VAR_IMAGE_NAME && exec $*"
+}
+
+# Enroll password with picking the default node
+run_with_enc_var varlinkctl --timeout=5min call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    '"{\"mechanism\":\"password\",\"unlockKeyFile\":\"/tmp/password\",\"password\":\"varlinkpassword\"}"' | grep '"slot":1' >/dev/null
+
+# Enumerate enrolled slots with picking the default node
+SLOTS=$(run_with_enc_var varlinkctl call --more "$VL_ADDRESS" io.systemd.CryptEnroll.ListSlots '"{}"')
+test "$(grep -c '"type":"password"' <<<"$SLOTS")" -eq 2
+
 # Enroll combined with a wipe of the recovery key slot (cf. systemd-cryptenroll --wipe-slot=recovery --password).
 # The recovery key slot just got wiped, so it should be reported back in the (non-empty) wipedSlots output.
-varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+varlinkctl --timeout=5min call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
     "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"unlockKeyFile\":\"/tmp/password\",\"password\":\"wipepassword\",\"wipeTypes\":[\"recovery\"]}" | grep -E '"wipedSlots":\[[0-9]+(,[0-9]+)*\]' >/dev/null
 (! varlinkctl call --more "$VL_ADDRESS" io.systemd.CryptEnroll.ListSlots "{\"node\":\"$VL_IMAGE\"}" | grep '"type":"recovery"' >/dev/null)
 
@@ -154,5 +207,35 @@ varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
     "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"tpm2\",\"unlockKeyFile\":\"/tmp/password\"}")
 (! varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
     "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"pkcs11\",\"unlockKeyFile\":\"/tmp/password\"}")
+
+# Unlocking via TPM2 and FIDO2 may be combined, but not with any other unlock method
+(! varlinkctl call "$VL_ADDRESS" io.systemd.CryptEnroll.Enroll \
+    "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"password\":\"x\",\"unlockKeyFile\":\"/tmp/password\",\"unlockTpm2Device\":\"auto\",\"unlockFido2Device\":\"auto\"}")
+
+# Ensure polkit autentication as normal user works
+# Also check that the required policy is installed, as packages might be out of date with the test
+if systemd-analyze compare-versions "$(uname -r)" ge 6.5 && \
+        systemd-analyze compare-versions "$(pkcheck --version | awk '{print $3}')" ge 124; then
+    mkdir -p /etc/polkit-1/rules.d
+    cat >/etc/polkit-1/rules.d/cryptenroll-unpriv.rules <<'EOF'
+polkit.addRule(function(action, subject) {
+    if ((action.id == "io.systemd.cryptenroll.enroll" || action.id == "io.systemd.cryptenroll.list-slots") &&
+        subject.user == "testuser") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+
+    systemctl try-reload-or-restart polkit.service
+
+    chown testuser:testuser "$VL_IMAGE"
+
+    run0 -u testuser varlinkctl --timeout=5min call /run/systemd/io.systemd.CryptEnroll io.systemd.CryptEnroll.Enroll \
+        "{\"node\":\"$VL_IMAGE\",\"mechanism\":\"password\",\"unlockKeyFile\":\"/tmp/password\",\"password\":\"varlinkpassword\", \"allowInteractiveAuthentication\": true}" | grep '"slot"' >/dev/null
+
+    run0 -u testuser varlinkctl call --more /run/systemd/io.systemd.CryptEnroll io.systemd.CryptEnroll.ListSlots "{\"node\":\"$VL_IMAGE\", \"allowInteractiveAuthentication\": true}" | grep '"type":"password"' >/dev/null
+    rm -f /etc/polkit-1/rules.d/cryptenroll-unpriv.rules
+    systemctl try-reload-or-restart polkit.service
+fi
 
 rm -f "$VL_IMAGE"

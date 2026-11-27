@@ -51,7 +51,14 @@
 #include "user-record.h"
 #include "user-record-util.h"
 #include "user-util.h"
+#include "verbs.h"
 #include "virt.h"
+
+COMMAND(
+        "systemd-homework\0",
+        "Perform operations on home directories on behalf of systemd-homed.",
+        .option_namespace = "common",
+);
 
 /* Make sure a bad password always results in a 3s delay, no matter what */
 #define BAD_PASSWORD_DELAY_USEC (3 * USEC_PER_SEC)
@@ -129,7 +136,7 @@ int user_record_authenticate(
                 log_info("None of the supplied plaintext passwords unlock the user record's hashed passwords or recovery keys.");
         else if (need_password)
                 log_info("None of the supplied plaintext passwords unlock the user record's hashed passwords.");
-        else
+        else if (need_recovery_key)
                 log_info("None of the supplied plaintext passwords unlock the user record's hashed recovery keys.");
 
         /* Next, test cached PKCS#11 passwords */
@@ -220,7 +227,7 @@ int user_record_authenticate(
 #if HAVE_LIBFIDO2
                 _cleanup_(erase_and_freep) char *decrypted_password = NULL;
 
-                r = fido2_use_token(h, secret, i, &decrypted_password);
+                r = fido2_use_token(secret, i, &decrypted_password);
                 switch (r) {
                 case -EAGAIN:
                         need_token = true;
@@ -332,7 +339,7 @@ int home_setup_undo_mount(HomeSetup *setup, int level) {
         if (!setup->undo_mount)
                 return 0;
 
-        r = umount_recursive(HOME_RUNTIME_WORK_DIR, 0);
+        r = umount_recursive(HOME_RUNTIME_WORK_DIR, /* flags= */ 0);
         if (r < 0) {
                 if (level >= LOG_DEBUG) /* umount_recursive() does debug level logging anyway, no need to
                                          * repeat that here */
@@ -355,7 +362,7 @@ int home_setup_undo_dm(HomeSetup *setup, int level) {
                 assert(setup->crypt_device);
                 assert(setup->dm_name);
 
-                r = sym_crypt_deactivate_by_name(setup->crypt_device, setup->dm_name, 0);
+                r = sym_crypt_deactivate_by_name(setup->crypt_device, setup->dm_name, /* flags= */ 0);
                 if (r < 0)
                         return log_full_errno(level, r, "Failed to deactivate LUKS device: %m");
 
@@ -435,7 +442,7 @@ int home_setup_done(HomeSetup *setup) {
 
         if (setup->image_fd >= 0) {
                 if (setup->do_offline_fallocate) {
-                        q = run_fallocate(setup->image_fd, NULL);
+                        q = run_fallocate(setup->image_fd, /* st= */ NULL);
                         if (setup->tolerate_offline_fallocate_enospc &&
                             ERRNO_IS_NEG_DISK_SPACE(q))
                                 log_warning_errno(q, "Failed to allocate backing file, ignoring: %m");
@@ -482,8 +489,10 @@ int home_setup_done(HomeSetup *setup) {
         setup->volume_key = erase_and_free(setup->volume_key);
         setup->volume_key_size = 0;
 
-        if (setup->do_drop_caches)
+        if (setup->do_drop_caches) {
+                setup->do_drop_caches = false;
                 drop_caches_now();
+        }
 
         setup->mount_suffix = mfree(setup->mount_suffix);
 
@@ -515,7 +524,7 @@ int home_setup(
         switch (user_record_storage(h)) {
 
         case USER_LUKS:
-                return home_setup_luks(h, flags, NULL, setup, cache, ret_header_home);
+                return home_setup_luks(h, flags, /* force_image_path= */ NULL, setup, cache, ret_header_home);
 
         case USER_SUBVOLUME:
         case USER_DIRECTORY:
@@ -567,7 +576,7 @@ static int read_identity_file(int root_fd, sd_json_variant **ret) {
         assert(root_fd >= 0);
         assert(ret);
 
-        _cleanup_close_ int identity_fd = xopenat_full(root_fd, ".identity", O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW|O_NONBLOCK, XO_REGULAR, MODE_INVALID);
+        _cleanup_close_ int identity_fd = xopenat_full(root_fd, ".identity", O_RDONLY|O_NOCTTY|O_NOFOLLOW|O_NONBLOCK, XO_REGULAR, MODE_INVALID);
         if (identity_fd < 0)
                 return log_error_errno(identity_fd, "Failed to open .identity file in home directory: %m");
 
@@ -590,7 +599,6 @@ static int read_identity_file(int root_fd, sd_json_variant **ret) {
 static int write_identity_file(int root_fd, sd_json_variant *v, uid_t uid) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *normalized = NULL;
         _cleanup_fclose_ FILE *identity_file = NULL;
-        _cleanup_close_ int identity_fd = -EBADF;
         _cleanup_free_ char *fn = NULL;
         int r;
 
@@ -603,45 +611,27 @@ static int write_identity_file(int root_fd, sd_json_variant *v, uid_t uid) {
         if (r < 0)
                 log_warning_errno(r, "Failed to normalize user record, ignoring: %m");
 
-        r = tempfn_random(".identity", NULL, &fn);
+        r = fopen_tmpfile_linkable_at_full(root_fd, ".identity", O_WRONLY|O_NOCTTY, 0600, &fn, &identity_file);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to create .identity file in home directory: %m");
 
-        identity_fd = openat(root_fd, fn, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW, 0600);
-        if (identity_fd < 0)
-                return log_error_errno(errno, "Failed to create .identity file in home directory: %m");
+        CLEANUP_TMPFILE_AT(root_fd, fn);
 
-        identity_file = take_fdopen(&identity_fd, "w");
-        if (!identity_file) {
-                r = log_oom();
-                goto fail;
-        }
+        r = sd_json_variant_dump(normalized, SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_FLUSH, identity_file, /* prefix= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write .identity file: %m");
 
-        sd_json_variant_dump(normalized, SD_JSON_FORMAT_PRETTY, identity_file, NULL);
+        if (fchown(fileno(identity_file), uid, uid) < 0)
+                return log_error_errno(errno, "Failed to change ownership of identity file: %m");
 
-        r = fflush_and_check(identity_file);
-        if (r < 0) {
-                log_error_errno(r, "Failed to write .identity file: %m");
-                goto fail;
-        }
+        r = flink_tmpfile_at(identity_file, root_fd, fn, ".identity", LINK_TMPFILE_REPLACE);
+        if (r < 0)
+                return log_error_errno(r, "Failed to move identity file into place: %m");
 
-        if (fchown(fileno(identity_file), uid, uid) < 0) {
-                r = log_error_errno(errno, "Failed to change ownership of identity file: %m");
-                goto fail;
-        }
-
-        if (renameat(root_fd, fn, root_fd, ".identity") < 0) {
-                r = log_error_errno(errno, "Failed to move identity file into place: %m");
-                goto fail;
-        }
+        fn = mfree(fn); /* disarm CLEANUP_TMPFILE_AT() */
 
         log_info("Wrote embedded .identity file.");
-
         return 0;
-
-fail:
-        (void) unlinkat(root_fd, fn, 0);
-        return r;
 }
 
 int home_load_embedded_identity(
@@ -848,14 +838,14 @@ int home_maybe_shift_uid(
         /* Let's shift UIDs of this mount. Hopefully this makes the later chowning unnecessary. (Note that we
          * also prefer to do UID mapping even if the UID already matches our goal UID. That's because we want
          * to leave UIDs in the homed managed range unmapped.) */
-        (void) home_shift_uid(setup->root_fd, NULL, st.st_uid, h->uid, &mount_fd);
+        (void) home_shift_uid(setup->root_fd, /* target= */ NULL, st.st_uid, h->uid, &mount_fd);
 
         /* If this worked, then we'll have a reference to the mount now, which we can also use like an O_PATH
          * fd to the new dir. Let's convert it into a proper O_DIRECTORY fd. */
         if (mount_fd >= 0) {
                 safe_close(setup->root_fd);
 
-                setup->root_fd = fd_reopen(mount_fd, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                setup->root_fd = fd_reopen(mount_fd, O_RDONLY|O_DIRECTORY);
                 if (setup->root_fd < 0)
                         return log_error_errno(setup->root_fd, "Failed to convert mount fd into regular directory fd: %m");
         }
@@ -1003,16 +993,16 @@ static int home_deactivate(UserRecord *h, bool force) {
                 if (r < 0)
                         return r;
 
-                r = mount_nofollow_verbose(LOG_ERR, user_record_home_directory(h), HOME_RUNTIME_WORK_DIR, NULL, MS_BIND, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, user_record_home_directory(h), HOME_RUNTIME_WORK_DIR, /* fstype= */ NULL, MS_BIND, /* options= */ NULL);
                 if (r < 0)
                         return r;
 
                 setup.undo_mount = true; /* remember to unmount the new bind mount from HOME_RUNTIME_WORK_DIR */
 
                 /* Let's explicitly open the new root fs, using the moved path */
-                setup.root_fd = open(HOME_RUNTIME_WORK_DIR, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+                setup.root_fd = xopenat(AT_FDCWD, HOME_RUNTIME_WORK_DIR, O_RDONLY|O_DIRECTORY);
                 if (setup.root_fd < 0)
-                        return log_error_errno(errno, "Failed to open moved home directory: %m");
+                        return log_error_errno(setup.root_fd, "Failed to open moved home directory: %m");
 
                 /* Now get rid of the home at its original place (we only keep the bind mount we created above) */
                 r = umount_verbose(LOG_ERR, user_record_home_directory(h), UMOUNT_NOFOLLOW | (force ? MNT_FORCE|MNT_DETACH : 0));
@@ -1087,6 +1077,8 @@ static int copy_skel(UserRecord *h, int root_fd, const char *skel) {
                 log_info("Skeleton directory %s missing, ignoring.", skel);
                 return 0;
         }
+        if (r < 0)
+                return log_error_errno(r, "Failed to open skeleton directory %s: %m", skel);
 
         r = copy_tree_at(
                         skel_fd, /* from= */ NULL,
@@ -1122,7 +1114,7 @@ int home_populate(UserRecord *h, int dir_fd) {
         if (r < 0)
                 return r;
 
-        r = home_store_embedded_identity(h, dir_fd, NULL);
+        r = home_store_embedded_identity(h, dir_fd, /* old_home= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1270,7 +1262,7 @@ static int user_record_compile_effective_passwords(
 #if HAVE_LIBFIDO2
                 _cleanup_(erase_and_freep) char *decrypted_password = NULL;
 
-                r = fido2_use_token(h, h, i, &decrypted_password);
+                r = fido2_use_token(h, i, &decrypted_password);
                 if (r < 0)
                         return r;
 
@@ -1331,7 +1323,7 @@ static int determine_default_storage(UserStorage *ret) {
         if (r < 0)
                 return log_error_errno(r, "Failed to determine whether we are in a container: %m");
         if (r == 0) {
-                r = path_is_encrypted(get_home_root());
+                r = path_is_encrypted(get_home_root(), BLOCK_DEVICE_ENCRYPTED_DM_CRYPT);
                 if (r > 0)
                         log_info("%s is encrypted, not using '%s' storage, in order to avoid double encryption.", get_home_root(), user_storage_to_string(USER_LUKS));
                 else {
@@ -1406,19 +1398,19 @@ static int home_create(UserRecord *h, Hashmap *blobs, UserRecord **ret_home) {
                 r = user_record_add_binding(
                                 h,
                                 new_storage,
-                                NULL,
+                                /* image_path= */ NULL,
                                 SD_ID128_NULL,
                                 SD_ID128_NULL,
                                 SD_ID128_NULL,
-                                NULL,
-                                NULL,
+                                /* luks_cipher= */ NULL,
+                                /* luks_cipher_mode= */ NULL,
                                 UINT64_MAX,
                                 new_fs,
-                                NULL,
+                                /* home_directory= */ NULL,
                                 UID_INVALID,
                                 GID_INVALID);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to change storage type to LUKS: %m");
+                        return log_error_errno(r, "Failed to add default storage binding to record: %m");
         }
 
         r = user_record_test_image_path_and_warn(h);
@@ -1564,8 +1556,13 @@ static int home_remove(UserRecord *h) {
 
         if (hd) {
                 if (rmdir(hd) < 0) {
-                        if (errno != ENOENT)
-                                return log_error_errno(errno, "Failed to remove %s, ignoring: %m", hd);
+                        if (errno != ENOENT) {
+                                /* If we already removed the image, there's no point in failing now */
+                                if (!deleted)
+                                        return log_error_errno(errno, "Failed to remove %s: %m", hd);
+
+                                log_warning_errno(errno, "Failed to remove %s, ignoring: %m", hd);
+                        }
                 } else
                         deleted = true;
         }
@@ -1718,7 +1715,7 @@ static int home_update(UserRecord *h, Hashmap *blobs, UserRecord **ret) {
         if (r < 0)
                 return r;
 
-        r = home_sync_and_statfs(setup.root_fd, NULL);
+        r = home_sync_and_statfs(setup.root_fd, /* ret= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1776,6 +1773,7 @@ static int home_passwd(UserRecord *h, UserRecord **ret_home) {
         _cleanup_(home_setup_done) HomeSetup setup = HOME_SETUP_INIT;
         _cleanup_(password_cache_free) PasswordCache cache = {};
         HomeSetupFlags flags = 0;
+        uint32_t fscrypt_first_new_slot = 0;
         int r, reconciled;
 
         assert(h);
@@ -1813,7 +1811,7 @@ static int home_passwd(UserRecord *h, UserRecord **ret_home) {
                 break;
 
         case USER_FSCRYPT:
-                r = home_passwd_fscrypt(h, &setup, &cache, effective_passwords);
+                r = home_passwd_fscrypt(h, &setup, &cache, effective_passwords, &fscrypt_first_new_slot);
                 if (r < 0)
                         return r;
                 break;
@@ -1827,8 +1825,12 @@ static int home_passwd(UserRecord *h, UserRecord **ret_home) {
                 return r;
 
         r = home_store_embedded_identity(new_home, setup.root_fd, embedded_home);
-        if (r < 0)
+        if (r < 0) {
+                /* The old record is still in place, hence drop the new fscrypt key slots again */
+                if (user_record_storage(h) == USER_FSCRYPT)
+                        home_remove_slots_fscrypt(&setup, fscrypt_first_new_slot, UINT32_MAX);
                 return r;
+        }
 
         r = home_reconcile_blob_dirs(new_home, setup.root_fd, reconciled);
         if (r < 0)
@@ -1838,7 +1840,11 @@ static int home_passwd(UserRecord *h, UserRecord **ret_home) {
         if (r < 0)
                 return r;
 
-        r = home_sync_and_statfs(setup.root_fd, NULL);
+        /* Only remove the old fscrypt key slots now that the new record has been written */
+        if (user_record_storage(h) == USER_FSCRYPT)
+                home_remove_slots_fscrypt(&setup, /* from= */ 0, fscrypt_first_new_slot);
+
+        r = home_sync_and_statfs(setup.root_fd, /* ret= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1874,7 +1880,7 @@ static int home_inspect(UserRecord *h, UserRecord **ret_home) {
         if (r < 0)
                 return r;
 
-        r = home_load_embedded_identity(h, setup.root_fd, header_home, USER_RECONCILE_ANY, &cache, NULL, &new_home);
+        r = home_load_embedded_identity(h, setup.root_fd, header_home, USER_RECONCILE_ANY, &cache, /* ret_embedded_home= */ NULL, &new_home);
         if (r < 0)
                 return r;
 
@@ -1981,55 +1987,55 @@ static int home_unlock(UserRecord *h) {
         if (r < 0)
                 return r;
 
+        /* Connect to the service manager before resuming the device, so that we fail while the device is
+         * still suspended if that doesn't work. */
+        _cleanup_(unit_freezer_freep) UnitFreezer *f = NULL;
+        r = user_session_freezer_new(h->uid, &f);
+        if (r < 0)
+                return r;
+
         r = home_unlock_luks(h, &setup, &cache);
         if (r < 0)
                 return r;
 
-        _cleanup_(unit_freezer_freep) UnitFreezer *f = NULL;
-
-        /* We want to thaw the session only after it's safe to access $HOME */
-        r = user_session_freezer_new(h->uid, &f);
-        if (r > 0)
-                r = unit_freezer_thaw(f);
-        if (r < 0)
-                return r;
+        /* We want to thaw the session only after it's safe to access $HOME. The device is resumed at this
+         * point, hence don't fail if this doesn't work, unit_freezer_thaw() logs on its own. */
+        if (f)
+                (void) unit_freezer_thaw(f);
 
         log_info("Everything completed.");
         return 1;
 }
 
-static int run(int argc, char *argv[]) {
-        _cleanup_(user_record_unrefp) UserRecord *home = NULL, *new_home = NULL;
+typedef struct Context {
+        UserRecord *home;
+        UserRecord *new_home;
+} Context;
+
+static void context_done(Context *c) {
+        assert(c);
+
+        c->home = user_record_unref(c->home);
+        c->new_home = user_record_unref(c->new_home);
+}
+
+/* Read the user record to operate on from the specified file, or from stdin if path is NULL, along with
+ * the blobs the daemon passed as file descriptors. */
+static int load_record(const char *path, UserRecord **ret_home, Hashmap **ret_blobs) {
+        _cleanup_(user_record_unrefp) UserRecord *home = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_fclose_ FILE *opened_file = NULL;
         _cleanup_hashmap_free_ Hashmap *blobs = NULL;
-        const char *json_path = NULL, *blob_filename;
+        const char *json_path, *blob_filename;
         FILE *json_file;
-        usec_t start;
         sd_json_variant *fdmap, *blob_fd_variant;
         int r;
 
-        LIBBLKID_NOTE(recommended);
-        LIBCRYPT_NOTE(recommended);
-        LIBCRYPTO_NOTE(recommended);
-        LIBCRYPTSETUP_NOTE(recommended);
-        LIBFDISK_NOTE(recommended);
-        LIBFIDO2_NOTE(suggested);
-        LIBMOUNT_NOTE(recommended);
-        LIBP11KIT_NOTE(suggested);
-        LIBSELINUX_NOTE(recommended);
+        assert(ret_home);
+        assert(ret_blobs);
 
-        start = now(CLOCK_MONOTONIC);
-
-        log_setup();
-
-        umask(0022);
-
-        if (argc < 2 || argc > 3)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes one or two arguments.");
-
-        if (argc > 2) {
-                json_path = argv[2];
+        if (path) {
+                json_path = path;
 
                 opened_file = fopen(json_path, "re");
                 if (!opened_file)
@@ -2072,7 +2078,7 @@ static int run(int argc, char *argv[]) {
                         if (!filename)
                                 return log_oom();
 
-                        r = fd_cloexec(fd, true);
+                        r = fd_cloexec(fd, /* cloexec= */ true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to enable O_CLOEXEC on blob %s: %m", filename);
 
@@ -2093,6 +2099,60 @@ static int run(int argc, char *argv[]) {
                 return log_oom();
 
         r = user_record_load(home, v, USER_RECORD_LOAD_FULL|USER_RECORD_LOG|USER_RECORD_PERMISSIVE);
+        if (r < 0)
+                return r;
+
+        *ret_home = TAKE_PTR(home);
+        *ret_blobs = TAKE_PTR(blobs);
+        return 0;
+}
+
+typedef enum HomeworkOperation {
+        HOMEWORK_ACTIVATE,
+        HOMEWORK_DEACTIVATE,
+        HOMEWORK_DEACTIVATE_FORCE,
+        HOMEWORK_CREATE,
+        HOMEWORK_REMOVE,
+        HOMEWORK_UPDATE,
+        HOMEWORK_RESIZE,
+        HOMEWORK_PASSWD,
+        HOMEWORK_INSPECT,
+        HOMEWORK_LOCK,
+        HOMEWORK_UNLOCK,
+        _HOMEWORK_OPERATION_MAX,
+} HomeworkOperation;
+
+VERB_FULL(verb_operation, "activate", "[FILE]\0", 1, 2, 0, HOMEWORK_ACTIVATE,
+          "Activate a home directory");
+VERB_FULL(verb_operation, "deactivate", "[FILE]\0", 1, 2, 0, HOMEWORK_DEACTIVATE,
+          "Deactivate a home directory");
+VERB_FULL(verb_operation, "deactivate-force", "[FILE]\0", 1, 2, 0, HOMEWORK_DEACTIVATE_FORCE,
+          "Deactivate a home directory forcibly");
+VERB_FULL(verb_operation, "create", "[FILE]\0", 1, 2, 0, HOMEWORK_CREATE,
+          "Create a home directory");
+VERB_FULL(verb_operation, "remove", "[FILE]\0", 1, 2, 0, HOMEWORK_REMOVE,
+          "Remove a home directory");
+VERB_FULL(verb_operation, "update", "[FILE]\0", 1, 2, 0, HOMEWORK_UPDATE,
+          "Update a home directory");
+VERB_FULL(verb_operation, "resize", "[FILE]\0", 1, 2, 0, HOMEWORK_RESIZE,
+          "Resize a home directory");
+VERB_FULL(verb_operation, "passwd", "[FILE]\0", 1, 2, 0, HOMEWORK_PASSWD,
+          "Change the password of a home directory");
+VERB_FULL(verb_operation, "inspect", "[FILE]\0", 1, 2, 0, HOMEWORK_INSPECT,
+          "Inspect a home directory");
+VERB_FULL(verb_operation, "lock", "[FILE]\0", 1, 2, 0, HOMEWORK_LOCK,
+          "Lock a home directory");
+VERB_FULL(verb_operation, "unlock", "[FILE]\0", 1, 2, 0, HOMEWORK_UNLOCK,
+          "Unlock a home directory");
+static int verb_operation(int argc, char *argv[], uintptr_t data, void *userdata) {
+        Context *c = ASSERT_PTR(userdata);
+        HomeworkOperation operation = data;
+        _cleanup_hashmap_free_ Hashmap *blobs = NULL;
+        int r;
+
+        assert(operation >= 0 && operation < _HOMEWORK_OPERATION_MAX);
+
+        r = load_record(argc > 1 ? argv[1] : NULL, &c->home, &blobs);
         if (r < 0)
                 return r;
 
@@ -2125,31 +2185,64 @@ static int run(int argc, char *argv[]) {
          * ENETUNREACH     → backing storage is currently not (image is ENOENT, or AF_UNIX socket to connect to is ENOENT)
          */
 
-        if (streq(argv[1], "activate"))
-                r = home_activate(home, &new_home);
-        else if (streq(argv[1], "deactivate"))
-                r = home_deactivate(home, false);
-        else if (streq(argv[1], "deactivate-force"))
-                r = home_deactivate(home, true);
-        else if (streq(argv[1], "create"))
-                r = home_create(home, blobs, &new_home);
-        else if (streq(argv[1], "remove"))
-                r = home_remove(home);
-        else if (streq(argv[1], "update"))
-                r = home_update(home, blobs, &new_home);
-        else if (streq(argv[1], "resize"))
-                r = home_resize(home, &new_home);
-        else if (streq(argv[1], "passwd"))
-                r = home_passwd(home, &new_home);
-        else if (streq(argv[1], "inspect"))
-                r = home_inspect(home, &new_home);
-        else if (streq(argv[1], "lock"))
-                r = home_lock(home);
-        else if (streq(argv[1], "unlock"))
-                r = home_unlock(home);
-        else
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown verb '%s'.", argv[1]);
-        if (IN_SET(r, -ENOKEY, -EREMOTEIO) && !strv_isempty(home->password) ) { /* There were passwords specified but they were incorrect */
+        switch (operation) {
+
+        case HOMEWORK_ACTIVATE:
+                return home_activate(c->home, &c->new_home);
+        case HOMEWORK_DEACTIVATE:
+                return home_deactivate(c->home, /* force= */ false);
+        case HOMEWORK_DEACTIVATE_FORCE:
+                return home_deactivate(c->home, /* force= */ true);
+        case HOMEWORK_CREATE:
+                return home_create(c->home, blobs, &c->new_home);
+        case HOMEWORK_REMOVE:
+                return home_remove(c->home);
+        case HOMEWORK_UPDATE:
+                return home_update(c->home, blobs, &c->new_home);
+        case HOMEWORK_RESIZE:
+                return home_resize(c->home, &c->new_home);
+        case HOMEWORK_PASSWD:
+                return home_passwd(c->home, &c->new_home);
+        case HOMEWORK_INSPECT:
+                return home_inspect(c->home, &c->new_home);
+        case HOMEWORK_LOCK:
+                return home_lock(c->home);
+        case HOMEWORK_UNLOCK:
+                return home_unlock(c->home);
+        default:
+                assert_not_reached();
+        }
+}
+
+static int run(int argc, char *argv[]) {
+        _cleanup_(context_done) Context c = {};
+        usec_t start;
+        int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPT_NOTE(recommended);
+        LIBCRYPTO_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(recommended);
+        LIBFDISK_NOTE(recommended);
+        LIBFIDO2_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBP11KIT_NOTE(suggested);
+        LIBSELINUX_NOTE(recommended);
+
+        start = now(CLOCK_MONOTONIC);
+
+        log_setup();
+
+        umask(0022);
+
+        char **args = NULL;
+        r = common_parse_argv(argc, argv, &args);
+        if (r <= 0)
+                return r;
+
+        r = dispatch_verb(args, &c);
+        if (IN_SET(r, -ENOKEY, -EBADSLT, -EREMOTEIO) && c.home && !strv_isempty(c.home->password)) {
+                /* There were passwords specified but they were incorrect */
                 usec_t end, n, d;
 
                 /* Make sure bad password replies always take at least 3s, and if longer multiples of 3s, so
@@ -2172,8 +2265,15 @@ static int run(int argc, char *argv[]) {
         /* We always pass the new record back, regardless if it changed or not. This allows our caller to
          * prepare a fresh record, send to us, and only if it works use it without having to keep a local
          * copy. */
-        if (new_home)
-                sd_json_variant_dump(new_home->json, SD_JSON_FORMAT_NEWLINE, stdout, NULL);
+        if (c.new_home) {
+                /* stdout is how we pass the resulting record to homed, make sure it was fully written */
+                r = sd_json_variant_dump(c.new_home->json,
+                                         SD_JSON_FORMAT_NEWLINE|SD_JSON_FORMAT_FLUSH,
+                                         stdout,
+                                         /* prefix= */ NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to write resulting user record: %m");
+        }
 
         return 0;
 }

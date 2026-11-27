@@ -251,29 +251,23 @@ static inline void ordered_hashmap_clear(OrderedHashmap *h) {
 
 void *_hashmap_first_key_and_value(HashmapBase *h, bool remove, void **ret_key);
 static inline void *hashmap_steal_first_key_and_value(Hashmap *h, void **ret) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), true, ret);
+        return _hashmap_first_key_and_value(HASHMAP_BASE(h), /* remove= */ true, ret);
 }
 static inline void *ordered_hashmap_steal_first_key_and_value(OrderedHashmap *h, void **ret) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), true, ret);
-}
-static inline void *hashmap_first_key_and_value(Hashmap *h, void **ret) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), false, ret);
-}
-static inline void *ordered_hashmap_first_key_and_value(OrderedHashmap *h, void **ret) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), false, ret);
+        return _hashmap_first_key_and_value(HASHMAP_BASE(h), /* remove= */ true, ret);
 }
 
 static inline void *hashmap_steal_first(Hashmap *h) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), true, NULL);
+        return _hashmap_first_key_and_value(HASHMAP_BASE(h), /* remove= */ true, /* ret_key= */ NULL);
 }
 static inline void *ordered_hashmap_steal_first(OrderedHashmap *h) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), true, NULL);
+        return _hashmap_first_key_and_value(HASHMAP_BASE(h), /* remove= */ true, /* ret_key= */ NULL);
 }
 static inline void *hashmap_first(Hashmap *h) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), false, NULL);
+        return _hashmap_first_key_and_value(HASHMAP_BASE(h), /* remove= */ false, /* ret_key= */ NULL);
 }
 static inline void *ordered_hashmap_first(OrderedHashmap *h) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(h), false, NULL);
+        return _hashmap_first_key_and_value(HASHMAP_BASE(h), /* remove= */ false, /* ret_key= */ NULL);
 }
 
 static inline void *_hashmap_first_key(HashmapBase *h, bool remove) {
@@ -283,16 +277,16 @@ static inline void *_hashmap_first_key(HashmapBase *h, bool remove) {
         return key;
 }
 static inline void *hashmap_steal_first_key(Hashmap *h) {
-        return _hashmap_first_key(HASHMAP_BASE(h), true);
+        return _hashmap_first_key(HASHMAP_BASE(h), /* remove= */ true);
 }
 static inline void *ordered_hashmap_steal_first_key(OrderedHashmap *h) {
-        return _hashmap_first_key(HASHMAP_BASE(h), true);
+        return _hashmap_first_key(HASHMAP_BASE(h), /* remove= */ true);
 }
 static inline void *hashmap_first_key(Hashmap *h) {
-        return _hashmap_first_key(HASHMAP_BASE(h), false);
+        return _hashmap_first_key(HASHMAP_BASE(h), /* remove= */ false);
 }
 static inline void *ordered_hashmap_first_key(OrderedHashmap *h) {
-        return _hashmap_first_key(HASHMAP_BASE(h), false);
+        return _hashmap_first_key(HASHMAP_BASE(h), /* remove= */ false);
 }
 
 /* no hashmap_next */
@@ -304,6 +298,11 @@ static inline char** hashmap_get_strv(Hashmap *h) {
 }
 static inline char** ordered_hashmap_get_strv(OrderedHashmap *h) {
         return _hashmap_get_strv(HASHMAP_BASE(h));
+}
+
+char** _hashmap_values_to_strv(HashmapBase *h);
+static inline char** hashmap_values_to_strv(Hashmap *h) {
+        return _hashmap_values_to_strv(HASHMAP_BASE(h));
 }
 
 int _hashmap_dump_sorted(HashmapBase *h, void ***ret, size_t *ret_n);
@@ -331,11 +330,6 @@ static inline int ordered_hashmap_dump_keys_sorted(OrderedHashmap *h, void ***re
  * the entries were inserted.
  * It is safe to remove the current entry.
  */
-#define _HASHMAP_BASE_FOREACH(e, h, i) \
-        for (Iterator i = ITERATOR_FIRST; _hashmap_iterate((h), &i, (void**)&(e), NULL); )
-#define HASHMAP_BASE_FOREACH(e, h) \
-        _HASHMAP_BASE_FOREACH(e, h, UNIQ_T(i, UNIQ))
-
 #define _HASHMAP_FOREACH(e, h, i) \
         for (Iterator i = ITERATOR_FIRST; hashmap_iterate((h), &i, (void**)&(e), NULL); )
 #define HASHMAP_FOREACH(e, h) \

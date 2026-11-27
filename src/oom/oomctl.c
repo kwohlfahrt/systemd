@@ -17,7 +17,7 @@ static PagerFlags arg_pager_flags = 0;
 COMMAND(
         "oomctl\0",
         "Manage or inspect the userspace OOM killer.",
-        .man_pages = "oomctl(1)\0",
+        .man_page = "oomctl(1)",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -36,7 +36,7 @@ static int verb_dump_state(int argc, char *argv[], uintptr_t _data, void *userda
 
         pager_open(arg_pager_flags);
 
-        r = bus_call_method(bus, bus_oom_mgr, "DumpByFileDescriptor", &error, &reply, NULL);
+        r = bus_call_method(bus, bus_oom_mgr, "DumpByFileDescriptor", &error, &reply, /* types= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to dump context: %s", bus_error_message(&error, r));
 

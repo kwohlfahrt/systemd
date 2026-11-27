@@ -24,6 +24,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "sysctl-util.h"
 #include "virt.h"
 
 enum {
@@ -276,7 +277,7 @@ static Virtualization detect_vm_dmi(void) {
                         _cleanup_free_ char *s = NULL;
                         const char *e;
 
-                        r = read_full_virtual_file("/sys/class/dmi/id/product_name", &s, NULL);
+                        r = read_full_virtual_file("/sys/class/dmi/id/product_name", &s, /* ret_size= */ NULL);
                         /* In EC2, virtualized is much more common than metal, so if for some reason
                          * we fail to read the DMI data, assume we are virtualized. */
                         if (r < 0) {
@@ -344,7 +345,7 @@ static int detect_vm_xen_dom0(void) {
         for (const char *i = domcap;;) {
                 _cleanup_free_ char *cap = NULL;
 
-                r = extract_first_word(&i, &cap, ",", 0);
+                r = extract_first_word(&i, &cap, ",", /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0) {
@@ -657,9 +658,9 @@ Virtualization detect_container(void) {
         }
 
         /* "Official" way of detecting WSL https://github.com/Microsoft/WSL/issues/423#issuecomment-221627364 */
-        r = read_one_line_file("/proc/sys/kernel/osrelease", &o);
+        r = sysctl_read("kernel/osrelease", &o);
         if (r < 0)
-                log_debug_errno(r, "Failed to read /proc/sys/kernel/osrelease, ignoring: %m");
+                log_debug_errno(r, "Failed to read kernel.osrelease sysctl, ignoring: %m");
         else if (strstr(o, "Microsoft") || strstr(o, "WSL")) {
                 v = VIRTUALIZATION_WSL;
                 goto finish;

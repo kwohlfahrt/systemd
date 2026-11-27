@@ -31,7 +31,7 @@ COMMAND(
         "systemd-escape\0",
         "Escape strings for usage in systemd unit names.",
         .argspec = "STRING…\0" "--stdin\0",
-        .man_pages = "systemd-escape(1)\0",
+        .man_page = "systemd-escape(1)",
 );
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
@@ -225,7 +225,7 @@ static int process_one(const char *input, char **ret) {
         }
 
         case ACTION_MANGLE:
-                r = unit_name_mangle(input, 0, &e);
+                r = unit_name_mangle(input, /* flags= */ 0, &e);
                 if (r < 0)
                         return log_error_errno(r, "Failed to mangle name: %m");
 

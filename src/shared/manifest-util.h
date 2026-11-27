@@ -1,0 +1,201 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+#pragma once
+
+#include "sd-json.h"
+
+#include "forward.h"
+#include "time-util.h"
+
+/* Generic helpers for generating (and verifying) file manifests of directory trees, in various formats. */
+
+/* By default, accept timestamps that deviate by up to 2s when verifying, since that's the granularity FAT
+ * stores modification times in */
+#define MANIFEST_TIMESTAMP_ACCURACY_DEFAULT_NSEC (2 * NSEC_PER_SEC)
+
+typedef enum ManifestFormat {
+        MANIFEST_FORMAT_LIST,       /* A simple list of file names, one per line */
+        MANIFEST_FORMAT_MTREE,      /* BSD mtree(8) */
+        MANIFEST_FORMAT_SHA256SUMS, /* The format sha256sum(1) generates, and sha256sum -c consumes */
+        MANIFEST_FORMAT_UAPI16,     /* UAPI.16 Manifest */
+        _MANIFEST_FORMAT_MAX,
+        _MANIFEST_FORMAT_INVALID = -EINVAL,
+} ManifestFormat;
+
+/* Optional per-inode fields to include in a manifest, as bitmask. Note that the inode type is not
+ * covered by this: it is always included if the format can express it. */
+typedef enum ManifestField {
+        MANIFEST_FIELD_MODE             = 1 << 0, /* Access mode bits */
+        MANIFEST_FIELD_UID              = 1 << 1, /* Owning UID */
+        MANIFEST_FIELD_GID              = 1 << 2, /* Owning GID */
+        MANIFEST_FIELD_SIZE             = 1 << 3, /* File size (regular files, symlinks) */
+        MANIFEST_FIELD_HASH             = 1 << 4, /* Hash of file contents, see ManifestHash for the algorithm */
+        MANIFEST_FIELD_SYMLINK          = 1 << 5, /* Symlink target */
+        MANIFEST_FIELD_DEVICE           = 1 << 6, /* Major/minor of device nodes */
+        MANIFEST_FIELD_HARDLINK         = 1 << 7, /* Hardlink grouping information (only UAPI.16 supports this) */
+        MANIFEST_FIELD_MTIME            = 1 << 8, /* Modification time (not in the default set, opt-in) */
+        MANIFEST_FIELD_USER_XATTR       = 1 << 9, /* Extended attributes in the "user." namespace (only UAPI.16, opt-in) */
+        MANIFEST_FIELD_USER_NAME        = 1 << 10, /* Owning user name, resolved via the host's user database (opt-in) */
+        MANIFEST_FIELD_GROUP_NAME       = 1 << 11, /* Owning group name, resolved via the host's user database (opt-in) */
+        /* Linux inode flags, see chattr(1) (only UAPI.16, opt-in) */
+        MANIFEST_FIELD_FLAG_APPEND_ONLY = 1 << 12, /* FS_APPEND_FL */
+        MANIFEST_FIELD_FLAG_IMMUTABLE   = 1 << 13, /* FS_IMMUTABLE_FL */
+        MANIFEST_FIELD_FLAG_NO_ATIME    = 1 << 14, /* FS_NOATIME_FL */
+        MANIFEST_FIELD_FLAG_NO_COW      = 1 << 15, /* FS_NOCOW_FL */
+        MANIFEST_FIELD_FLAG_NO_DUMP     = 1 << 16, /* FS_NODUMP_FL */
+        /* FAT directory entry attributes (only UAPI.16, opt-in) */
+        MANIFEST_FIELD_READ_ONLY        = 1 << 17, /* ATTR_RO, encoded in the generic "readOnly" field */
+        MANIFEST_FIELD_FLAG_HIDDEN      = 1 << 18, /* ATTR_HIDDEN */
+        MANIFEST_FIELD_FLAG_SYSTEM      = 1 << 19, /* ATTR_SYS */
+        MANIFEST_FIELD_FLAG_ARCHIVE     = 1 << 20, /* ATTR_ARCH */
+        /* File system identity, on the top-level object (only UAPI.16, opt-in) */
+        MANIFEST_FIELD_FS_UUID          = 1 << 21, /* File system UUID, see FS_IOC_GETFSUUID */
+        MANIFEST_FIELD_FS_LABEL         = 1 << 22, /* File system label, see FS_IOC_GETFSLABEL */
+        MANIFEST_FIELD_FAT_SERIAL       = 1 << 23, /* FAT volume serial number, see FAT_IOCTL_GET_VOLUME_ID */
+        /* The fields that may be generated from a directory tree */
+        _MANIFEST_FIELD_FSTREE_ALL      = (1 << 24) - 1,
+        /* GPT partition table entry fields (only UAPI.16). Only systemd-repart generates these, for the
+         * partition table it creates, hence they cannot be selected via manifest_fields_from_string() */
+        MANIFEST_FIELD_GPT_LABEL        = 1 << 24, /* Partition label */
+        MANIFEST_FIELD_GPT_UUID         = 1 << 25, /* Partition UUID */
+        MANIFEST_FIELD_GPT_TYPE_UUID    = 1 << 26, /* Partition type UUID */
+        MANIFEST_FIELD_GPT_DISK_UUID    = 1 << 27, /* Disk UUID, on the top-level object */
+        MANIFEST_FIELD_GPT_FLAGS        = 1 << 28, /* Raw partition attribute flags */
+        MANIFEST_FIELD_GPT_FLAG_NO_AUTO = 1 << 29, /* SD_GPT_FLAG_NO_AUTO */
+        MANIFEST_FIELD_GPT_FLAG_GROWFS  = 1 << 30, /* SD_GPT_FLAG_GROWFS */
+        /* The fields that may be generated from a GPT partition table. Note that the read-only flag is
+         * encoded in the generic "readOnly" field, which is hence part of both sets. */
+        _MANIFEST_FIELD_GPT_ALL         = MANIFEST_FIELD_GPT_LABEL|MANIFEST_FIELD_GPT_UUID|MANIFEST_FIELD_GPT_TYPE_UUID|
+                                          MANIFEST_FIELD_GPT_DISK_UUID|MANIFEST_FIELD_GPT_FLAGS|
+                                          MANIFEST_FIELD_GPT_FLAG_NO_AUTO|MANIFEST_FIELD_GPT_FLAG_GROWFS|
+                                          MANIFEST_FIELD_READ_ONLY,
+        _MANIFEST_FIELD_ALL             = _MANIFEST_FIELD_FSTREE_ALL|_MANIFEST_FIELD_GPT_ALL,
+        _MANIFEST_FIELD_DEFAULT         = MANIFEST_FIELD_MODE|MANIFEST_FIELD_UID|MANIFEST_FIELD_GID|MANIFEST_FIELD_SIZE|
+                                          MANIFEST_FIELD_HASH|MANIFEST_FIELD_SYMLINK|MANIFEST_FIELD_DEVICE|MANIFEST_FIELD_HARDLINK,
+        _MANIFEST_FIELD_INVALID         = -EINVAL,
+} ManifestField;
+
+/* The hash algorithm to use for MANIFEST_FIELD_HASH. Only the mtree format supports anything but SHA256. */
+typedef enum ManifestHash {
+        MANIFEST_HASH_SHA256,
+        MANIFEST_HASH_SHA512,
+        _MANIFEST_HASH_MAX,
+        _MANIFEST_HASH_INVALID = -EINVAL,
+} ManifestHash;
+
+/* The digest size of the largest hash algorithm we support (i.e. SHA512) */
+#define MANIFEST_HASH_SIZE_MAX 64U
+
+typedef struct ManifestContext {
+        ManifestFormat format;
+        ManifestField fields;
+        ManifestHash hash;
+        FILE *output;           /* not owned */
+        bool color;
+
+        /* Track how many inodes we skipped because we couldn't read them or they are not representable in
+         * this manifest format */
+        uint64_t n_skipped;
+        /* Of the above, how many were skipped because the format does not list inodes of their type by
+         * design (i.e. anything but regular files in SHA256SUMS). This is expected, hence not a failure. */
+        uint64_t n_skipped_expected;
+
+        /* Track how many times we omitted some metadata of an inode we did serialize, because we couldn't
+         * read it or it is not representable in this manifest format */
+        uint64_t n_metadata_omitted;
+
+        /* Set once the top-level inode is covered by the manifest (for formats that do not list the
+         * top-level inode itself, once we enumerated it) */
+        bool top_level_covered;
+
+        /* Caches of resolved user/group names, keyed by UID/GID, "" if not resolvable */
+        Hashmap *user_names;
+        Hashmap *group_names;
+
+        /* Hardlink database fields (only UAPI.16) */
+        int db_fd;
+        char *db_path;
+        uint64_t counter;
+
+        sd_json_format_flags_t json_format_flags;
+
+        /* When verifying, the maximum deviation of timestamps (currently only the modification time) from
+         * the manifest we accept */
+        nsec_t timestamp_accuracy_nsec;
+
+        /* Signing (generation) and signature verification (verification), UAPI.16 only */
+        X509 *certificate;                        /* Not owned. Used for signing */
+        X509 *const *certificates;                /* Not owned. If set a signature by one of these is required */
+        size_t n_certificates;
+        EVP_PKEY *private_key;                    /* Not owned. If set the manifest is signed with it (PKCS#7) */
+        Uapi16Signer *signer;                     /* Allocated on demand by manifest_make() */
+
+        uint64_t n_errors;                        /* Number of mismatches found so far */
+        uint64_t n_not_applicable;                /* Number of fields listed in the manifest we did not verify,
+                                                   * as they do not apply to the file system (e.g. FAT
+                                                   * attributes on a non-FAT file system) */
+} ManifestContext;
+
+#define MANIFEST_CONTEXT_NULL                                                            \
+        (const ManifestContext) {                                                        \
+                .format = _MANIFEST_FORMAT_INVALID,                                      \
+                .fields = _MANIFEST_FIELD_DEFAULT,                                       \
+                .hash = MANIFEST_HASH_SHA256,                                            \
+                .db_fd = -EBADF,                                                         \
+                .json_format_flags = SD_JSON_FORMAT_OFF,                                 \
+                .timestamp_accuracy_nsec = MANIFEST_TIMESTAMP_ACCURACY_DEFAULT_NSEC,     \
+        }
+
+void manifest_context_done(ManifestContext *c);
+
+DECLARE_STRING_TABLE_LOOKUP(manifest_format, ManifestFormat);
+
+/* Only for single bits */
+const char* manifest_field_to_string(ManifestField f) _const_;
+ManifestField manifest_field_from_string(const char *s) _pure_;
+
+/* Same, but for the names of the values of the "features" field of UAPI.16 manifests, which differ for some
+ * fields. Unlike the above, these cover the GPT fields too. */
+const char* manifest_field_to_uapi16_feature(ManifestField f) _const_;
+ManifestField manifest_field_from_uapi16_feature(const char *s) _pure_;
+
+/* Parses a comma separated list of field names. Each item may be prefixed with "+" or "-" to add or remove
+ * the field from the mask passed in in *fields, otherwise the mask is reset with the first item. "all",
+ * "default" and "none" are accepted as special values. */
+int manifest_fields_from_string(const char *s, ManifestField *fields);
+int manifest_fields_to_string(ManifestField f, char **ret);
+
+const char* manifest_hash_to_string(ManifestHash i) _const_;
+ManifestHash manifest_hash_from_string(const char *s) _pure_;
+size_t manifest_hash_size(ManifestHash h) _const_;
+
+/* Generates a manifest of the directory tree the specified fd refers to, in the format and with the fields
+ * configured in the context. */
+int manifest_make(ManifestContext *c, int dir_fd);
+
+/* Low-level UAPI.16 stream writer, for callers that generate the objects themselves rather than via
+ * manifest_make(): manifest_uapi16_begin() prepares the context (and the signer, if a private key is
+ * configured), manifest_uapi16_write_object() sorts one object, feeds it to the signer and writes it, and
+ * manifest_uapi16_end() writes the signature object (if signing) and the trailer, and flushes the
+ * output. The first object written must be the header object, carrying the "mediaType" field. */
+int manifest_uapi16_begin(ManifestContext *c);
+int manifest_uapi16_write_object(ManifestContext *c, sd_json_variant *j);
+int manifest_uapi16_end(ManifestContext *c);
+
+/* Parses the next entry of a SHA256SUMS-style file (i.e. the output of sha256sum(1) and friends) from the
+ * specified stream. Call this repeatedly on the same stream to iterate through all entries. Returns > 0 and
+ * the file name and digest of the entry, or 0 on EOF in which case the returned file name is NULL and the
+ * digest empty. The file names returned are unescaped, validated to be relative and normalized, and never
+ * empty. *line_nr is increased by one for each line read, and is used in log messages; initialize it to
+ * zero before the first call. */
+int manifest_parse_sums(FILE *f, size_t *line_nr, char **ret_filename, struct iovec *ret_digest);
+
+/* Verifies the directory tree the specified fd refers to against the manifest read from the specified
+ * stream. The manifest is processed entry by entry, and never loaded into memory as a whole. Every mismatch is
+ * logged and counted, and once the whole manifest is processed -EBADMSG is returned if there was at least
+ * one. Only the list, sha256sums and uapi16 formats are supported. */
+int manifest_verify(ManifestContext *c, int dir_fd, FILE *f);
+
+/* Calculates the hash of the file the specified fd refers to, with the algorithm configured in the context.
+ * The digest written to the buffer is manifest_hash_size(c->hash) bytes long. The fd may be an O_PATH fd.
+ * Flushes the output stream first, so that users get an idea where we are when hashing takes a while. */
+int manifest_context_hash_fd(ManifestContext *c, int inode_fd, uint8_t ret[static MANIFEST_HASH_SIZE_MAX]);

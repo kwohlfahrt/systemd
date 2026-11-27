@@ -15,6 +15,7 @@
 #include "env-util.h"
 #include "errno-util.h"
 #include "event-util.h"
+#include "exit-status.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
@@ -29,6 +30,7 @@
 #include "recurse-dir.h"
 #include "set.h"
 #include "signal-util.h"
+#include "socket-label.h"
 #include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -38,7 +40,6 @@
 #include "unaligned.h"
 #include "userns-registry.h"
 #include "userns-restrict.h"
-#include "xattr-util.h"
 
 #define LISTEN_TIMEOUT_USEC (25 * USEC_PER_SEC)
 
@@ -53,6 +54,14 @@ static int on_worker_exit(sd_event_source *s, const siginfo_t *si, void *userdat
         sd_event_source_disable_unref(s);
 
         if (si->si_code == CLD_EXITED) {
+                if (si->si_status == EXIT_EXEC) {
+                        /* The worker binary cannot be executed, respawning it would just fail the same way
+                         * over and over again. Let's give up. */
+                        log_error("Worker " PID_FMT " failed to execute worker binary, exiting.", si->si_pid);
+                        sd_event_exit(m->event, EXIT_FAILURE);
+                        return 0;
+                }
+
                 if (si->si_status == EXIT_SUCCESS)
                         log_debug("Worker " PID_FMT " exited successfully.", si->si_pid);
                 else
@@ -115,11 +124,11 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, NULL);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        r = sd_event_add_memory_pressure(m->event, /* ret= */ NULL, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
@@ -127,13 +136,23 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 log_debug_errno(r, "Failed to enable watchdog handling, ignoring: %m");
 
-        r = sd_event_add_signal(m->event, NULL, SIGUSR2|SD_EVENT_SIGNAL_PROCMASK, on_sigusr2, m);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, SIGUSR2|SD_EVENT_SIGNAL_PROCMASK, on_sigusr2, m);
         if (r < 0)
                 return r;
 
         *ret = TAKE_PTR(m);
         return 0;
 }
+
+#if HAVE_VMLINUX_H
+static void manager_unload_bpf(Manager *m) {
+        assert(m);
+
+        m->userns_restrict_bpf_ring_buffer_event_source = sd_event_source_disable_unref(m->userns_restrict_bpf_ring_buffer_event_source);
+        m->userns_restrict_bpf_ring_buffer = bpf_ring_buffer_free(m->userns_restrict_bpf_ring_buffer);
+        m->userns_restrict_bpf = userns_restrict_bpf_free(m->userns_restrict_bpf);
+}
+#endif
 
 Manager* manager_free(Manager *m) {
         if (!m)
@@ -147,9 +166,7 @@ Manager* manager_free(Manager *m) {
         safe_close(m->listen_fd);
 
 #if HAVE_VMLINUX_H
-        sd_event_source_disable_unref(m->userns_restrict_bpf_ring_buffer_event_source);
-        bpf_ring_buffer_free(m->userns_restrict_bpf_ring_buffer);
-        userns_restrict_bpf_free(m->userns_restrict_bpf);
+        manager_unload_bpf(m);
 #endif
 
         safe_close(m->registry_fd);
@@ -187,7 +204,7 @@ static int start_one_worker(Manager *m) {
                 /* Child */
 
                 if (m->listen_fd == 3) {
-                        r = fd_cloexec(3, false);
+                        r = fd_cloexec(3, /* cloexec= */ false);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to turn off O_CLOEXEC for fd 3: %m");
                                 _exit(EXIT_FAILURE);
@@ -246,7 +263,7 @@ static int start_one_worker(Manager *m) {
 
                 r = invoke_callout_binary(SYSTEMD_NSRESOURCEWORK_PATH, STRV_MAKE("systemd-nsresourcework", "xxxxxxxxxxxxxxxx")); /* With some extra space rename_process() can make use of */
                 log_error_errno(r, "Failed to start worker process: %m");
-                _exit(EXIT_FAILURE);
+                _exit(ERRNO_IS_NEG_RESOURCE(r) ? EXIT_FAILURE : EXIT_EXEC);
         }
 
         r = event_add_child_pidref(m->event, &source, &pidref, WEXITED, on_worker_exit, m);
@@ -339,11 +356,10 @@ static void manager_release_userns_by_info(Manager *m, UserNamespaceInfo *info) 
          * clobber the new namespace's BPF allowlist, fdstore fd and registry entry. */
         if (info->userns_id != 0) {
                 _cleanup_close_ int probe_fd = namespace_open_by_id(info->userns_id);
-                if (probe_fd >= 0) {
-                        log_warning("Refusing to release user namespace %" PRIu64 " (id %" PRIu64 "): the namespace is still alive.",
-                                    info->userns_inode, info->userns_id);
-                        return;
-                }
+                if (probe_fd >= 0)
+                        return (void) log_warning("Refusing to release user namespace %" PRIu64 " (id %" PRIu64 "): the namespace is still alive.",
+                                                  info->userns_inode, info->userns_id);
+
                 if (probe_fd != -ESTALE &&
                     !ERRNO_IS_NEG_PRIVILEGE(probe_fd) &&
                     !ERRNO_IS_NEG_NOT_SUPPORTED(probe_fd))
@@ -459,7 +475,7 @@ static int manager_scan_registry(Manager *m, Set **registry_inodes) {
                         continue;
                 }
 
-                if (set_ensure_put(registry_inodes, NULL, UINT32_TO_PTR(inode)) < 0)
+                if (set_ensure_put(registry_inodes, /* hash_ops= */ NULL, UINT32_TO_PTR(inode)) < 0)
                         return log_oom();
 
                 log_debug("Found user namespace %" PRIu64 " in registry directory", inode);
@@ -503,12 +519,15 @@ static int manager_make_listen_socket(Manager *m) {
         xsprintf(text, UID_FMT "-" UID_FMT "," UID_FMT "-" UID_FMT,
                  CONTAINER_UID_MIN, CONTAINER_UID_MAX,
                  (uid_t) DYNAMIC_UID_MIN, (uid_t) DYNAMIC_UID_MAX);
-        FOREACH_STRING(xattr, "user.userdb.uid", "user.userdb.gid")
-                (void) xsetxattr(AT_FDCWD, sockaddr.un.sun_path, /* at_flags= */ 0, xattr, text);
-        (void) xsetxattr(AT_FDCWD, sockaddr.un.sun_path, /* at_flags= */ 0, "user.userdb.username", "ns-*");
-        (void) xsetxattr(AT_FDCWD, sockaddr.un.sun_path, /* at_flags= */ 0, "user.userdb.groupname", "ns-*");
+        (void) socket_set_xattrs(
+                        AT_FDCWD,
+                        sockaddr.un.sun_path,
+                        STRV_MAKE("user.userdb.uid",       text,
+                                  "user.userdb.gid",       text,
+                                  "user.userdb.username",  "ns-*",
+                                  "user.userdb.groupname", "ns-*"));
 
-        if (listen(m->listen_fd, SOMAXCONN) < 0)
+        if (listen(m->listen_fd, SOMAXCONN_DELUXE) < 0)
                 return log_error_errno(errno, "Failed to listen on socket: %m");
 
         return 1;
@@ -545,7 +564,7 @@ static int manager_scan_listen_fds(Manager *m, Set **fdstore_inodes) {
                                 continue;
                         }
 
-                        if (set_ensure_put(fdstore_inodes, NULL, UINT32_TO_PTR(inode)) < 0)
+                        if (set_ensure_put(fdstore_inodes, /* hash_ops= */ NULL, UINT32_TO_PTR(inode)) < 0)
                                 return log_oom();
 
                         continue;
@@ -603,7 +622,7 @@ static int on_ringbuf_io(sd_event_source *s, int fd, uint32_t revents, void *use
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
-        r = sym_ring_buffer__poll(m->userns_restrict_bpf_ring_buffer, 0);
+        r = sym_ring_buffer__poll(m->userns_restrict_bpf_ring_buffer, /* timeout_ms= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Got failure reading from BPF ring buffer: %m");
 
@@ -628,7 +647,7 @@ static int manager_setup_bpf(Manager *m) {
         if (rb_fd < 0)
                 return log_error_errno(rb_fd, "Failed to get fd of ring buffer: %m");
 
-        m->userns_restrict_bpf_ring_buffer = sym_ring_buffer__new(rb_fd, ringbuf_event, m, NULL);
+        m->userns_restrict_bpf_ring_buffer = sym_ring_buffer__new(rb_fd, ringbuf_event, m, /* opts= */ NULL);
         if (!m->userns_restrict_bpf_ring_buffer)
                 return log_error_errno(errno, "Failed to allocate BPF ring buffer object: %m");
 
@@ -651,19 +670,21 @@ static int manager_setup_bpf(Manager *m) {
 
 /* Puts the programs loaded by manager_setup_bpf() in effect. Deliberately separate, so that the maps are
  * already seeded from the registry by the time the first hook runs. */
-static int manager_attach_bpf(Manager *m) {
+static void manager_attach_bpf(Manager *m) {
         int r;
 
         assert(m);
 
         if (!m->userns_restrict_bpf) /* Setup failed earlier, and we already told the user. */
-                return 0;
+                return;
 
+        /* Some kernels can load BPF-LSM programs but not attach them, e.g. arm64 before 7.2. Handle this
+         * like a failed setup. */
         r = userns_restrict_attach(m->userns_restrict_bpf, /* pin= */ true);
-        if (r < 0)
-                return log_error_errno(r, "Failed to attach BPF programs: %m");
-
-        return 0;
+        if (r < 0) {
+                log_notice_errno(r, "Proceeding with user namespace interfaces disabled.");
+                manager_unload_bpf(m);
+        }
 }
 #else
 static int manager_setup_bpf(Manager *m) {
@@ -671,8 +692,7 @@ static int manager_setup_bpf(Manager *m) {
         return 0;
 }
 
-static int manager_attach_bpf(Manager *m) {
-        return 0;
+static void manager_attach_bpf(Manager *m) {
 }
 #endif
 
@@ -759,9 +779,7 @@ int manager_startup(Manager *m) {
         /* The maps now describe every namespace we are responsible for, so the policy can go into
          * effect. Until this point the previous version's programs, if any, were still attached and
          * enforcing, so no namespace was ever left unguarded. */
-        r = manager_attach_bpf(m);
-        if (r < 0)
-                return r;
+        manager_attach_bpf(m);
 
         r = manager_make_listen_socket(m);
         if (r < 0)

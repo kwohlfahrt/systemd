@@ -1,0 +1,2656 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <fcntl.h>
+#include <linux/magic.h>
+#include <linux/msdos_fs.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "alloc-util.h"
+#include "ansi-color.h"
+#include "bitfield.h"
+#include "chase.h"
+#include "chattr-util.h"
+#include "crypto-util.h"
+#include "errno-util.h"
+#include "escape.h"
+#include "extract-word.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "format-util.h"
+#include "fs-util.h"
+#include "hashmap.h"
+#include "hexdecoct.h"
+#include "id128-util.h"
+#include "iovec-util.h"
+#include "json-util.h"
+#include "log.h"
+#include "logarithm.h"
+#include "manifest-util.h"
+#include "mountpoint-util.h"
+#include "nulstr-util.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "recurse-dir.h"
+#include "rm-rf.h"
+#include "sha256.h"
+#include "stat-util.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "terminal-util.h"
+#include "tmpfile-util.h"
+#include "uapi16-manifest.h"
+#include "uid-classification.h"
+#include "user-util.h"
+#include "utf8.h"
+#include "xattr-util.h"
+
+void manifest_context_done(ManifestContext *c) {
+        assert(c);
+
+        if (c->db_fd >= 0)
+                (void) rm_rf_children(TAKE_FD(c->db_fd), REMOVE_PHYSICAL|REMOVE_REWIND, /* root_dev= */ NULL);
+
+        c->db_path = rmdir_and_free(c->db_path);
+
+        c->signer = uapi16_signer_free(c->signer);
+
+        c->user_names = hashmap_free(c->user_names);
+        c->group_names = hashmap_free(c->group_names);
+}
+
+static const char* const manifest_format_table[_MANIFEST_FORMAT_MAX] = {
+        [MANIFEST_FORMAT_LIST]       = "list",
+        [MANIFEST_FORMAT_MTREE]      = "mtree",
+        [MANIFEST_FORMAT_SHA256SUMS] = "sha256sums",
+        [MANIFEST_FORMAT_UAPI16]     = "uapi16",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(manifest_format, ManifestFormat);
+
+static const char* const manifest_hash_table[_MANIFEST_HASH_MAX] = {
+        [MANIFEST_HASH_SHA256] = "sha256",
+        [MANIFEST_HASH_SHA512] = "sha512",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(manifest_hash, ManifestHash);
+
+size_t manifest_hash_size(ManifestHash h) {
+        switch (h) {
+
+        case MANIFEST_HASH_SHA256:
+                return SHA256_DIGEST_SIZE;
+
+        case MANIFEST_HASH_SHA512:
+                return 64;
+
+        default:
+                assert_not_reached();
+        }
+}
+
+static const struct {
+        ManifestField field;
+        const char *name;
+        const char *uapi16_feature; /* The name in the "features" field of UAPI.16 manifests */
+} manifest_field_table[] = {
+        /* This is a bitfield, hence not a simple array indexed by the enum */
+        { MANIFEST_FIELD_MODE,              "mode",             "mode"                      },
+        { MANIFEST_FIELD_UID,               "uid",              "uid"                       },
+        { MANIFEST_FIELD_GID,               "gid",              "gid"                       },
+        { MANIFEST_FIELD_SIZE,              "size",             "size"                      },
+        { MANIFEST_FIELD_HASH,              "hash",             "sha256"                    }, /* UAPI.16 only supports SHA256 */
+        { MANIFEST_FIELD_SYMLINK,           "symlink",          "symlink"                   },
+        { MANIFEST_FIELD_DEVICE,            "device",           "device"                    },
+        { MANIFEST_FIELD_HARDLINK,          "hardlink",         "hardlink"                  },
+        { MANIFEST_FIELD_MTIME,             "mtime",            "mtime"                     },
+        { MANIFEST_FIELD_USER_XATTR,        "user-xattr",       "user-xattr"                },
+        { MANIFEST_FIELD_USER_NAME,         "user-name",        "user-name"                 },
+        { MANIFEST_FIELD_GROUP_NAME,        "group-name",       "group-name"                },
+        { MANIFEST_FIELD_FLAG_APPEND_ONLY,  "flag-append-only", "flag-append-only"          },
+        { MANIFEST_FIELD_FLAG_IMMUTABLE,    "flag-immutable",   "flag-immutable"            },
+        { MANIFEST_FIELD_FLAG_NO_ATIME,     "flag-no-atime",    "flag-no-atime"             },
+        { MANIFEST_FIELD_FLAG_NO_COW,       "flag-no-cow",      "flag-no-cow"               },
+        { MANIFEST_FIELD_FLAG_NO_DUMP,      "flag-no-dump",     "flag-no-dump"              },
+        { MANIFEST_FIELD_READ_ONLY,         "read-only",        "read-only"                 },
+        { MANIFEST_FIELD_FLAG_HIDDEN,       "flag-hidden",      "flag-hidden"               },
+        { MANIFEST_FIELD_FLAG_SYSTEM,       "flag-system",      "flag-system"               },
+        { MANIFEST_FIELD_FLAG_ARCHIVE,      "flag-archive",     "flag-archive"              },
+        { MANIFEST_FIELD_FS_UUID,           "fs-uuid",          "fs-uuid"                   },
+        { MANIFEST_FIELD_FS_LABEL,          "fs-label",         "fs-label"                  },
+        { MANIFEST_FIELD_FAT_SERIAL,        "fat-serial",       "fat-serial"                },
+        /* Not generated from directory trees, hence not selectable by name */
+        { MANIFEST_FIELD_GPT_LABEL,         NULL,               "gpt-label"                 },
+        { MANIFEST_FIELD_GPT_UUID,          NULL,               "gpt-uuid"                  },
+        { MANIFEST_FIELD_GPT_TYPE_UUID,     NULL,               "gpt-type-uuid"             },
+        { MANIFEST_FIELD_GPT_DISK_UUID,     NULL,               "gpt-disk-uuid"             },
+        { MANIFEST_FIELD_GPT_FLAGS,         NULL,               "gpt-flags"                 },
+        { MANIFEST_FIELD_GPT_FLAG_NO_AUTO,  NULL,               "gpt-flag-no-auto"          },
+        { MANIFEST_FIELD_GPT_FLAG_GROWFS,   NULL,               "gpt-flag-grow-file-system" },
+};
+
+const char* manifest_field_to_string(ManifestField f) {
+        FOREACH_ELEMENT(i, manifest_field_table)
+                if (i->field == f)
+                        return i->name;
+
+        return NULL;
+}
+
+ManifestField manifest_field_from_string(const char *s) {
+        if (!s)
+                return _MANIFEST_FIELD_INVALID;
+
+        FOREACH_ELEMENT(i, manifest_field_table)
+                if (streq_ptr(i->name, s))
+                        return i->field;
+
+        return _MANIFEST_FIELD_INVALID;
+}
+
+const char* manifest_field_to_uapi16_feature(ManifestField f) {
+        FOREACH_ELEMENT(i, manifest_field_table)
+                if (i->field == f)
+                        return i->uapi16_feature;
+
+        return NULL;
+}
+
+ManifestField manifest_field_from_uapi16_feature(const char *s) {
+        if (!s)
+                return _MANIFEST_FIELD_INVALID;
+
+        FOREACH_ELEMENT(i, manifest_field_table)
+                if (streq_ptr(i->uapi16_feature, s))
+                        return i->field;
+
+        return _MANIFEST_FIELD_INVALID;
+}
+
+int manifest_fields_from_string(const char *s, ManifestField *fields) {
+        ManifestField mask;
+        bool first = true;
+        int r;
+
+        assert(s);
+        assert(fields);
+
+        mask = *fields;
+
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
+
+                r = extract_first_word(&s, &word, ",", EXTRACT_DONT_COALESCE_SEPARATORS);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                const char *n = word;
+                bool add = true, relative = false;
+                if (n[0] == '+') {
+                        n++;
+                        relative = true;
+                } else if (n[0] == '-') {
+                        n++;
+                        add = false;
+                        relative = true;
+                }
+
+                /* The first non-relative item resets the mask, subsequent items add to it. */
+                if (first && !relative)
+                        mask = 0;
+                first = false;
+
+                ManifestField f;
+                if (streq(n, "all"))
+                        f = _MANIFEST_FIELD_FSTREE_ALL;
+                else if (streq(n, "default"))
+                        f = _MANIFEST_FIELD_DEFAULT;
+                else if (streq(n, "none"))
+                        f = 0;
+                else {
+                        f = manifest_field_from_string(n);
+                        if (f < 0)
+                                return -EINVAL;
+                }
+
+                if (add)
+                        mask |= f;
+                else
+                        mask &= ~f;
+        }
+
+        *fields = mask;
+        return 0;
+}
+
+int manifest_fields_to_string(ManifestField f, char **ret) {
+        _cleanup_free_ char *s = NULL;
+
+        assert(ret);
+
+        FOREACH_ELEMENT(i, manifest_field_table) {
+                if (!i->name || !FLAGS_SET(f, i->field))
+                        continue;
+
+                if (!strextend_with_separator(&s, ",", i->name))
+                        return -ENOMEM;
+        }
+
+        if (!s) {
+                s = strdup("none");
+                if (!s)
+                        return -ENOMEM;
+        }
+
+        *ret = TAKE_PTR(s);
+        return 0;
+}
+
+static int sha512_fd(int fd, uint8_t ret[static MANIFEST_HASH_SIZE_MAX]) {
+#if HAVE_OPENSSL
+        int r;
+
+        assert(fd >= 0);
+        assert(ret);
+
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        _cleanup_(EVP_MD_CTX_freep) EVP_MD_CTX *ctx = sym_EVP_MD_CTX_new();
+        if (!ctx)
+                return -ENOMEM;
+
+        if (sym_EVP_DigestInit_ex(ctx, sym_EVP_sha512(), /* impl= */ NULL) != 1)
+                return -EIO;
+
+        for (;;) {
+                uint8_t buffer[64 * 1024];
+                ssize_t n;
+
+                n = read(fd, buffer, sizeof(buffer));
+                if (n < 0)
+                        return -errno;
+                if (n == 0)
+                        break;
+
+                if (sym_EVP_DigestUpdate(ctx, buffer, n) != 1)
+                        return -EIO;
+        }
+
+        unsigned size;
+        if (sym_EVP_DigestFinal_ex(ctx, ret, &size) != 1)
+                return -EIO;
+
+        assert(size == manifest_hash_size(MANIFEST_HASH_SHA512));
+        return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
+}
+
+int manifest_context_hash_fd(ManifestContext *c, int inode_fd, uint8_t ret[static MANIFEST_HASH_SIZE_MAX]) {
+        assert(c);
+        assert(inode_fd >= 0);
+        assert(ret);
+
+        /* Calculating the hash might be slow, hence let's flush the output first, to give users an idea
+         * where we are slow. */
+        if (c->output)
+                (void) fflush(c->output);
+
+        /* Convert O_PATH fd into a regular one */
+        _cleanup_close_ int fd = fd_reopen(inode_fd, O_RDONLY);
+        if (fd < 0)
+                return fd;
+
+        switch (c->hash) {
+
+        case MANIFEST_HASH_SHA256:
+                return sha256_fd(fd, /* max_size= */ UINT64_MAX, ret);
+
+        case MANIFEST_HASH_SHA512:
+                return sha512_fd(fd, ret);
+
+        default:
+                assert_not_reached();
+        }
+}
+
+static bool manifest_handle_skip_event(ManifestContext *c, RecurseDirEvent event, const char *path) {
+        const char *what;
+        int error;
+
+        assert(c);
+
+        /* recurse_dir() reports inodes it could not open or stat via special events, and the same for
+         * directories below the maximum recursion depth. We cannot serialize them, hence count them as
+         * skipped. Returns true if the event was one of these. */
+
+        if (event == RECURSE_DIR_SKIP_DEPTH) {
+                log_warning("Maximum directory depth reached at '%s', skipping subtree.", strna(path));
+                c->n_skipped++;
+                return true;
+        }
+
+        if (event >= RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE && event <= RECURSE_DIR_SKIP_OPEN_DIR_ERROR_MAX) {
+                error = event - RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE;
+                what = "open directory";
+        } else if (event >= RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE && event <= RECURSE_DIR_SKIP_OPEN_INODE_ERROR_MAX) {
+                error = event - RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE;
+                what = "open inode";
+        } else if (event >= RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE && event <= RECURSE_DIR_SKIP_STAT_INODE_ERROR_MAX) {
+                error = event - RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE;
+                what = "stat inode";
+        } else
+                return false;
+
+        log_warning_errno(error, "Failed to %s '%s', skipping: %m", what, strna(path));
+        c->n_skipped++;
+        return true;
+}
+
+static int manifest_list_item(
+                RecurseDirEvent event,
+                const char *path,
+                int dir_fd,
+                int inode_fd,
+                const struct dirent *de,
+                const struct statx *sx,
+                void *userdata) {
+
+        ManifestContext *c = ASSERT_PTR(userdata);
+
+        assert(path);
+
+        if (manifest_handle_skip_event(c, event, path))
+                return RECURSE_DIR_CONTINUE;
+
+        if (event == RECURSE_DIR_ENTER)
+                fprintf(c->output, "%s%s/%s\n",
+                        path,
+                        c->color ? ansi_grey() : "",
+                        c->color ? ansi_normal() : "");
+        else if (event == RECURSE_DIR_ENTRY)
+                fprintf(c->output, "%s\n", path);
+
+        return RECURSE_DIR_CONTINUE;
+}
+
+static int manifest_resolve_name(ManifestContext *c, bool group, uid_t id, const char **ret) {
+        int r;
+
+        assert(c);
+        assert(ret);
+
+        /* Resolves a UID or GID to a user or group name via the host's user database (NSS), like tar does.
+         * Note that this means the names reflect the host's view, not necessarily the one of the tree we
+         * serialize, which is why including them is opt-in. Results are cached, including failures. Returns
+         * 0 and NULL if the ID cannot be resolved. */
+
+        Hashmap **cache = group ? &c->group_names : &c->user_names;
+        const char *cached = hashmap_get(*cache, UID_TO_PTR(id));
+        if (cached) {
+                *ret = empty_to_null(cached);
+                return 0;
+        }
+
+        _cleanup_free_ char *name = NULL;
+        if (group) {
+                _cleanup_free_ struct group *gr = NULL;
+                r = getgrgid_malloc(id, &gr);
+                if (r >= 0)
+                        name = strdup(gr->gr_name);
+        } else {
+                _cleanup_free_ struct passwd *pw = NULL;
+                r = getpwuid_malloc(id, &pw);
+                if (r >= 0)
+                        name = strdup(pw->pw_name);
+        }
+        if (r == -ENOMEM || (r >= 0 && !name))
+                return log_oom();
+        if (r < 0 && r != -ESRCH)
+                log_debug_errno(r, "Failed to resolve %s " UID_FMT ", ignoring: %m", group ? "GID" : "UID", id);
+
+        /* Only names we can represent are useful (in particular, no numeric ones) */
+        if (name && !valid_user_group_name(name, VALID_USER_RELAX))
+                name = mfree(name);
+
+        if (!name) {
+                name = strdup("");
+                if (!name)
+                        return log_oom();
+        }
+
+        r = hashmap_ensure_put(cache, &trivial_hash_ops_value_free, UID_TO_PTR(id), name);
+        if (r < 0)
+                return log_oom();
+
+        *ret = empty_to_null(TAKE_PTR(name));
+        return 0;
+}
+
+static int manifest_resolve_names(
+                ManifestContext *c,
+                const char *path,
+                const struct statx *sx,
+                const char **ret_user_name,
+                const char **ret_group_name) {
+
+        const char *u = NULL, *g = NULL;
+        int r;
+
+        assert(c);
+        assert(sx);
+        assert(ret_user_name);
+        assert(ret_group_name);
+
+        /* Resolves the owning user and group names of the inode, if requested. Names that cannot be
+         * resolved are counted as omitted metadata. */
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_USER_NAME) && FLAGS_SET(sx->stx_mask, STATX_UID)) {
+                r = manifest_resolve_name(c, /* group= */ false, sx->stx_uid, &u);
+                if (r < 0)
+                        return r;
+                if (!u) {
+                        log_debug("Cannot resolve owning UID " UID_FMT " of '%s' to a user name, omitting.", sx->stx_uid, strempty(path));
+                        c->n_metadata_omitted++;
+                }
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_GROUP_NAME) && FLAGS_SET(sx->stx_mask, STATX_GID)) {
+                r = manifest_resolve_name(c, /* group= */ true, sx->stx_gid, &g);
+                if (r < 0)
+                        return r;
+                if (!g) {
+                        log_debug("Cannot resolve owning GID " GID_FMT " of '%s' to a group name, omitting.", sx->stx_gid, strempty(path));
+                        c->n_metadata_omitted++;
+                }
+        }
+
+        *ret_user_name = u;
+        *ret_group_name = g;
+        return 0;
+}
+
+static const char *pick_color_for_uid_gid(ManifestContext *c, uid_t uid) {
+        assert(c);
+
+        if (!c->color)
+                return "";
+        if (uid == UID_NOBODY)
+                return ansi_highlight_yellow4(); /* files should never be owned by 'nobody' (but might happen due to userns mapping) */
+        if (uid_is_system(uid))
+                return ansi_normal();            /* files in disk images are typically owned by root and other system users, no issue there */
+        if (uid_is_dynamic(uid) || uid_is_greeter(uid))
+                return ansi_highlight_red();     /* files should never be owned persistently by dynamic users, and there are just no excuses */
+        if (uid_is_container(uid) || uid_is_foreign(uid))
+                return ansi_highlight_cyan();
+
+        return ansi_highlight();
+}
+
+static unsigned manifest_mtree_fields_to_statx(ManifestField fields) {
+        unsigned mask = STATX_TYPE; /* The inode type is always included */
+
+        /* Returns the statx() mask needed to generate an mtree manifest with the specified fields. Only
+         * covers the fields the mtree format can express, i.e. hardlink information is ignored. Symlink
+         * targets and device numbers only need the inode type. */
+
+        if (FLAGS_SET(fields, MANIFEST_FIELD_MODE))
+                mask |= STATX_MODE;
+        if (fields & (MANIFEST_FIELD_UID|MANIFEST_FIELD_USER_NAME))
+                mask |= STATX_UID;
+        if (fields & (MANIFEST_FIELD_GID|MANIFEST_FIELD_GROUP_NAME))
+                mask |= STATX_GID;
+        if (fields & (MANIFEST_FIELD_SIZE|MANIFEST_FIELD_HASH))
+                mask |= STATX_SIZE;
+        if (FLAGS_SET(fields, MANIFEST_FIELD_MTIME))
+                mask |= STATX_MTIME;
+
+        return mask;
+}
+
+static int manifest_mtree_item(
+                RecurseDirEvent event,
+                const char *path,
+                int dir_fd,
+                int inode_fd,
+                const struct dirent *de,
+                const struct statx *sx,
+                void *userdata) {
+
+        ManifestContext *c = ASSERT_PTR(userdata);
+        FILE *f = ASSERT_PTR(c->output);
+        _cleanup_free_ char *escaped = NULL;
+        int r;
+
+        assert(path);
+
+        if (manifest_handle_skip_event(c, event, path))
+                return RECURSE_DIR_CONTINUE;
+
+        if (!IN_SET(event, RECURSE_DIR_ENTER, RECURSE_DIR_ENTRY))
+                return RECURSE_DIR_CONTINUE;
+
+        assert(sx);
+
+        if (isempty(path))
+                path = ".";
+        else {
+                /* BSD mtree uses either C or octal escaping, and covers whitespace, comments and glob characters. We use C style escaping and follow suit */
+                path = escaped = xescape(path, WHITESPACE COMMENTS GLOB_CHARS);
+                if (!escaped)
+                        return log_oom();
+        }
+
+        fprintf(f, "%s", isempty(path) ? "." : path);
+
+        if (FLAGS_SET(sx->stx_mask, STATX_TYPE)) {
+                if (S_ISDIR(sx->stx_mode))
+                        fprintf(f, "%s/%s", c->color ? ansi_grey() : "", c->color ? ansi_normal() : "");
+
+                fprintf(f, " %stype=%s%s%s%s",
+                        c->color ? ansi_grey() : "",
+                        c->color ? ansi_normal() : "",
+                        c->color ? (S_ISDIR(sx->stx_mode) ? ansi_highlight_blue() :
+                                    S_ISLNK(sx->stx_mode) ? ansi_highlight_cyan() :
+                                    (S_ISFIFO(sx->stx_mode) || S_ISCHR(sx->stx_mode) || S_ISBLK(sx->stx_mode)) ? ansi_highlight_yellow4() :
+                                    S_ISSOCK(sx->stx_mode) ? ansi_highlight_magenta() : "") : "",
+                        ASSERT_PTR(S_ISDIR(sx->stx_mode) ? "dir" :
+                                   S_ISREG(sx->stx_mode) ? "file" :
+                                   S_ISLNK(sx->stx_mode) ? "link" :
+                                   S_ISFIFO(sx->stx_mode) ? "fifo" :
+                                   S_ISBLK(sx->stx_mode) ? "block" :
+                                   S_ISCHR(sx->stx_mode) ? "char" :
+                                   S_ISSOCK(sx->stx_mode) ? "socket" : NULL),
+                        c->color ? ansi_normal() : "");
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_MODE) && FLAGS_SET(sx->stx_mask, STATX_MODE) && (!FLAGS_SET(sx->stx_mask, STATX_TYPE) || !S_ISLNK(sx->stx_mode)))
+                fprintf(f, " %smode=%s%04o",
+                        c->color ? ansi_grey() : "",
+                        c->color ? ansi_normal() : "",
+                        (unsigned) (sx->stx_mode & 07777));
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_UID) && FLAGS_SET(sx->stx_mask, STATX_UID))
+                fprintf(f, " %suid=%s" UID_FMT "%s",
+                        c->color ? ansi_grey() : "",
+                        pick_color_for_uid_gid(c, sx->stx_uid),
+                        sx->stx_uid,
+                        c->color ? ansi_normal() : "");
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_GID) && FLAGS_SET(sx->stx_mask, STATX_GID))
+                fprintf(f, " %sgid=%s" GID_FMT "%s",
+                        c->color ? ansi_grey() : "",
+                        pick_color_for_uid_gid(c, sx->stx_gid),
+                        sx->stx_gid,
+                        c->color ?  ansi_normal() : "");
+
+        const char *user_name, *group_name;
+        r = manifest_resolve_names(c, path, sx, &user_name, &group_name);
+        if (r < 0)
+                return r;
+
+        if (user_name) {
+                _cleanup_free_ char *e = xescape(user_name, WHITESPACE COMMENTS);
+                if (!e)
+                        return log_oom();
+
+                fprintf(f, " %suname=%s%s",
+                        c->color ? ansi_grey() : "",
+                        c->color ? ansi_normal() : "",
+                        e);
+        }
+
+        if (group_name) {
+                _cleanup_free_ char *e = xescape(group_name, WHITESPACE COMMENTS);
+                if (!e)
+                        return log_oom();
+
+                fprintf(f, " %sgname=%s%s",
+                        c->color ? ansi_grey() : "",
+                        c->color ? ansi_normal() : "",
+                        e);
+        }
+
+        if (FLAGS_SET(sx->stx_mask, STATX_TYPE|STATX_SIZE) && S_ISREG(sx->stx_mode)) {
+                if (FLAGS_SET(c->fields, MANIFEST_FIELD_SIZE))
+                        fprintf(f, " %ssize=%s%" PRIu64,
+                                c->color ?  ansi_grey() : "",
+                                c->color ?  ansi_normal() : "",
+                                (uint64_t) sx->stx_size);
+
+                if (FLAGS_SET(c->fields, MANIFEST_FIELD_HASH) && inode_fd >= 0 && sx->stx_size > 0) {
+                        uint8_t hash[MANIFEST_HASH_SIZE_MAX];
+
+                        r = manifest_context_hash_fd(c, inode_fd, hash);
+                        if (r < 0) {
+                                log_warning_errno(r, "Failed to calculate file hash for '%s', ignoring: %m", path);
+                                c->n_metadata_omitted++;
+                        } else {
+                                _cleanup_free_ char *h = NULL;
+
+                                h = hexmem(hash, manifest_hash_size(c->hash));
+                                if (!h)
+                                        return log_oom();
+
+                                fprintf(f, " %s%ssum=%s%s",
+                                        c->color ? ansi_grey() : "",
+                                        manifest_hash_to_string(c->hash),
+                                        c->color ? ansi_normal() : "",
+                                        h);
+                        }
+                }
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_SYMLINK) && FLAGS_SET(sx->stx_mask, STATX_TYPE) && S_ISLNK(sx->stx_mode) && inode_fd >= 0) {
+                _cleanup_free_ char *target = NULL;
+
+                r = readlinkat_malloc(inode_fd, "", &target);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to read symlink '%s', ignoring: %m", path);
+                        c->n_metadata_omitted++;
+                } else {
+                        _cleanup_free_ char *target_escaped = NULL;
+
+                        target_escaped = xescape(target, WHITESPACE COMMENTS GLOB_CHARS);
+                        if (!target_escaped)
+                                return log_oom();
+
+                        fprintf(f, " %slink=%s%s",
+                                c->color ? ansi_grey() : "",
+                                c->color ? ansi_normal() : "",
+                                target_escaped);
+                }
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_DEVICE) && FLAGS_SET(sx->stx_mask, STATX_TYPE) && (S_ISBLK(sx->stx_mode) || S_ISCHR(sx->stx_mode)))
+                fprintf(f, " %sdevice=%slinux,%" PRIu64 ",%" PRIu64,
+                        c->color ? ansi_grey() : "",
+                        c->color ? ansi_normal() : "",
+                        (uint64_t) sx->stx_rdev_major,
+                        (uint64_t) sx->stx_rdev_minor);
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_MTIME) && FLAGS_SET(sx->stx_mask, STATX_MTIME) && sx->stx_mtime.tv_sec >= 0)
+                fprintf(f, " %stime=%s%" PRIu64 ".%09" PRIu32,
+                        c->color ? ansi_grey() : "",
+                        c->color ? ansi_normal() : "",
+                        (uint64_t) sx->stx_mtime.tv_sec,
+                       sx->stx_mtime.tv_nsec);
+
+        fprintf(f, "\n");
+
+        if (!de) /* Only the top-level inode comes without directory entry */
+                c->top_level_covered = true;
+
+        return RECURSE_DIR_CONTINUE;
+}
+
+static int manifest_uapi16_write_object_full(ManifestContext *c, sd_json_variant *j, bool sign) {
+        int r;
+
+        assert(c);
+        assert(c->format == MANIFEST_FORMAT_UAPI16);
+        assert(c->output);
+        assert(j);
+
+        /* Writes one object to the output. If we are signing (and 'sign' is true), the object is formatted
+         * a second time without any color sequences, and that rendering (which is what a consumer reading
+         * from a file or pipe sees) is what the signature covers. The colored rendering is for humans
+         * only. */
+
+        /* The specification recommends sorting fields alphabetically, recursively */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *n = sd_json_variant_ref(j);
+        r = sd_json_variant_normalize(&n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to sort JSON object: %m");
+
+        sd_json_format_flags_t flags = c->json_format_flags | SD_JSON_FORMAT_SEQ | SD_JSON_FORMAT_FLUSH;
+
+        if (sign && c->signer) {
+                sd_json_format_flags_t nocolor_flags = flags & ~(SD_JSON_FORMAT_COLOR|SD_JSON_FORMAT_COLOR_AUTO);
+
+                _cleanup_free_ char *text = NULL;
+                r = sd_json_variant_format(n, nocolor_flags, &text);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to format JSON object: %m");
+
+                r = uapi16_signer_feed(c->signer, text, strlen(text));
+                if (r < 0)
+                        return r;
+
+                if (flags == nocolor_flags) {
+                        /* Do not format the thing again if color is off anyway */
+                        fputs(text, c->output);
+                        r = fflush_and_check(c->output);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to write JSON output: %m");
+
+                        return 0;
+                }
+        }
+
+        r = sd_json_variant_dump(
+                        n,
+                        flags,
+                        c->output,
+                        /* prefix= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write JSON output: %m");
+
+        return 0;
+}
+
+int manifest_uapi16_write_object(ManifestContext *c, sd_json_variant *j) {
+        return manifest_uapi16_write_object_full(c, j, /* sign= */ true);
+}
+
+static unsigned manifest_uapi16_fields_to_statx(ManifestField fields) {
+        unsigned mask = STATX_TYPE; /* The inode type is always included */
+
+        /* Returns the statx() mask needed to generate an uapi16 manifest with the specified fields. */
+
+        if (fields & (MANIFEST_FIELD_MODE|MANIFEST_FIELD_READ_ONLY))
+                mask |= STATX_MODE;
+        if (fields & (MANIFEST_FIELD_UID|MANIFEST_FIELD_USER_NAME))
+                mask |= STATX_UID;
+        if (fields & (MANIFEST_FIELD_GID|MANIFEST_FIELD_GROUP_NAME))
+                mask |= STATX_GID;
+        if (fields & (MANIFEST_FIELD_SIZE|MANIFEST_FIELD_HASH))
+                mask |= STATX_SIZE;
+        if (FLAGS_SET(fields, MANIFEST_FIELD_HARDLINK))
+                mask |= STATX_NLINK;
+        if (FLAGS_SET(fields, MANIFEST_FIELD_MTIME))
+                mask |= STATX_MTIME;
+
+        return mask;
+}
+
+static int inode_fid_hex(int inode_fd, char **ret) {
+        _cleanup_free_ struct file_handle *handle = NULL;
+        int r;
+
+        assert(inode_fd >= 0);
+        assert(ret);
+
+        /* Generate a unique identifier for this inode via the kernel's FID logic. Returns 0 if the file
+         * system does not support FIDs, in which case we cannot identify hardlinks. */
+        uint64_t unique_mnt_id = 0;
+        int mnt_id = 0;
+        r = name_to_handle_at_try_fid(inode_fd, /* path= */ NULL, &handle, &mnt_id, &unique_mnt_id, AT_EMPTY_PATH);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
+                log_debug_errno(r, "File system does not support FIDs, not checking for hardlinks: %m");
+                *ret = NULL;
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to acquire FID of path: %m");
+
+        struct sha256_ctx ctx;
+        sha256_init_ctx(&ctx);
+        sha256_process_bytes(&handle->handle_bytes, sizeof(handle->handle_bytes), &ctx);
+        sha256_process_bytes(&handle->handle_type, sizeof(handle->handle_type), &ctx);
+        sha256_process_bytes(&handle->f_handle, handle->handle_bytes, &ctx);
+        sha256_process_bytes(&mnt_id, sizeof(mnt_id), &ctx);
+        sha256_process_bytes(&unique_mnt_id, sizeof(unique_mnt_id), &ctx);
+
+        uint8_t fid_hash[SHA256_DIGEST_SIZE];
+        sha256_finish_ctx(&ctx, fid_hash);
+
+        char *fhs = hexmem(fid_hash, sizeof(fid_hash));
+        if (!fhs)
+                return log_oom();
+
+        *ret = fhs;
+        return 1;
+}
+
+static int hardlink_db_acquire(ManifestContext *c) {
+        int r;
+
+        assert(c);
+
+        /* Returns 1 if the database was created just now and hence is empty, 0 if it existed already */
+
+        if (c->db_fd >= 0)
+                return 0;
+
+        assert(!c->db_path);
+
+        /* Let's use a temporary directory on disk as hardlink database, so that we can
+         * process very large images without allocating ridiculous amounts of memory. */
+
+        const char *vtd = NULL;
+        r = var_tmp_dir(&vtd);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine /var/tmp/ directory: %m");
+
+        _cleanup_free_ char *template = path_join(vtd, "manifest-hardlink-db-XXXXXX");
+        if (!template)
+                return log_oom();
+
+        c->db_fd = mkdtemp_open(template, /* flags= */ 0, &c->db_path);
+        if (c->db_fd < 0)
+                return log_error_errno(c->db_fd, "Failed to create temporary directory: %m");
+
+        return 1;
+}
+
+static int hardlink_data_lookup(
+                ManifestContext *c,
+                const char *path,
+                int inode_fd,
+                const struct statx *sx,
+                uint64_t *ret_hardlink_counter,
+                uint8_t ret_hash[static MANIFEST_HASH_SIZE_MAX],
+                bool *ret_hash_valid) {
+
+        _cleanup_free_ char *slt = NULL, *fhs = NULL;
+        int r;
+
+        assert(c);
+        assert(sx);
+        assert(ret_hardlink_counter);
+        assert(ret_hash);
+        assert(ret_hash_valid);
+
+        if (!FLAGS_SET(c->fields, MANIFEST_FIELD_HARDLINK))
+                goto nope;
+
+        if (!FLAGS_SET(sx->stx_mask, STATX_NLINK|STATX_TYPE))
+                goto nope;
+
+        if (S_ISDIR(sx->stx_mode) || sx->stx_nlink <= 1)
+                goto nope;
+
+        if (inode_fd < 0)
+                goto nope;
+
+        /* This is a hardlinked inode, apparently. Let's figure out its inode token */
+
+        r = inode_fid_hex(inode_fd, &fhs);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                /* We declare the "hardlink" feature in the manifest, which means a missing inode token
+                 * indicates the file is not hardlinked. Which is not true here, hence count. */
+                log_warning("Cannot identify hardlinked inode '%s', as the file system does not support file handles, omitting hardlink information.", empty_to_root(path));
+                c->n_metadata_omitted++;
+                goto nope;
+        }
+
+        r = hardlink_db_acquire(c);
+        if (r < 0)
+                return r;
+        bool is_empty = r > 0;
+
+        uint64_t hardlink_counter;
+        uint8_t hash[MANIFEST_HASH_SIZE_MAX];
+        bool hash_valid = false;
+
+        r = is_empty ? -ENOENT : readlinkat_malloc(c->db_fd, fhs, &slt);
+        if (r < 0) {
+                if (r != -ENOENT)
+                        return log_error_errno(r, "Failed to read hardlink database symlink '%s': %m", fhs);
+
+                if (c->counter >= UINT64_MAX) /* Paranoia */
+                        return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Hardlink overflow.");
+
+                hardlink_counter = ++c->counter;
+
+                slt = asprintf_safe("%" PRIu64, hardlink_counter);
+                if (!slt)
+                        return log_oom();
+
+                if (S_ISREG(sx->stx_mode) && FLAGS_SET(c->fields, MANIFEST_FIELD_HASH)) {
+                        r = manifest_context_hash_fd(c, inode_fd, hash);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to calculate file SHA256 sum for '%s', ignoring: %m", empty_to_root(path));
+                        else {
+                                _cleanup_free_ char *hs = hexmem(hash, SHA256_DIGEST_SIZE);
+                                if (!hs)
+                                        return log_oom();
+
+                                if (!strextend(&slt, ":", hs))
+                                        return log_oom();
+
+                                hash_valid = true;
+                        }
+                }
+
+                if (symlinkat(slt, c->db_fd, fhs) < 0)
+                        return log_error_errno(errno, "Failed to create hardlink database symlink '%s': %m", fhs);
+        } else {
+                char *colon = strchr(slt, ':');
+
+                if (colon) {
+                        _cleanup_free_ void *unhexxed = NULL;
+                        size_t unhexxed_size = 0;
+                        r = unhexmem(colon + 1, &unhexxed, &unhexxed_size);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to unhex file hash: %m");
+                        if (unhexxed_size != SHA256_DIGEST_SIZE)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Malformed hash entry.");
+
+                        memcpy(hash, unhexxed, unhexxed_size);
+                        hash_valid = true;
+                        *colon = 0;
+                }
+
+                r = safe_atou64(slt, &hardlink_counter);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to decode hardlink counter: %m");
+        }
+
+        *ret_hardlink_counter = hardlink_counter;
+        if (hash_valid)
+                memcpy_safe(ret_hash, hash, SHA256_DIGEST_SIZE);
+        *ret_hash_valid = hash_valid;
+        return 1;
+
+nope:
+        *ret_hardlink_counter = 0;
+        *ret_hash_valid = false;
+        return 0;
+}
+
+static int manifest_read_user_xattrs(int inode_fd, Uapi16Xattr **ret, size_t *ret_n) {
+        int r;
+
+        assert(inode_fd >= 0);
+        assert(ret);
+        assert(ret_n);
+
+        /* Reads all extended attributes in the "user." namespace of the specified inode (which may be an
+         * O_PATH fd), sorted by name. Returns -EUCLEAN if there's an attribute whose name cannot be
+         * represented in a UAPI.16 manifest. */
+
+        _cleanup_free_ char *list = NULL;
+        r = flistxattr_malloc(inode_fd, &list);
+        if (ERRNO_IS_NEG_XATTR_ABSENT(r)) {
+                /* If the file system doesn't support xattrs, the inode has none */
+                *ret = NULL;
+                *ret_n = 0;
+                return 0;
+        }
+        if (r < 0)
+                return r;
+
+        Uapi16Xattr *x = NULL;
+        size_t n = 0;
+        CLEANUP_ARRAY(x, n, uapi16_xattr_array_free);
+
+        NULSTR_FOREACH(i, list) {
+                const char *k = startswith(i, "user.");
+                if (!k)
+                        continue;
+
+                if (!uapi16_xattr_name_is_valid(k))
+                        return -EUCLEAN;
+
+                _cleanup_free_ char *v = NULL;
+                size_t l = 0;
+                r = fgetxattr_malloc(inode_fd, i, &v, &l);
+                if (ERRNO_IS_NEG_XATTR_ABSENT(r)) /* Removed in the meantime */
+                        continue;
+                if (r < 0)
+                        return r;
+
+                _cleanup_free_ char *kk = strdup(k);
+                if (!kk)
+                        return -ENOMEM;
+
+                if (!GREEDY_REALLOC(x, n+1))
+                        return -ENOMEM;
+
+                x[n++] = (Uapi16Xattr) {
+                        .name = TAKE_PTR(kk),
+                        .value = IOVEC_MAKE(TAKE_PTR(v), l),
+                };
+        }
+
+        r = uapi16_xattr_array_sort(x, n);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(x);
+        *ret_n = TAKE_GENERIC(n, size_t, 0);
+        return 0;
+}
+
+static int manifest_uapi16_xattrs(ManifestContext *c, const char *path, int inode_fd, sd_json_variant **ret) {
+        int r;
+
+        assert(c);
+        assert(inode_fd >= 0);
+        assert(ret);
+
+        Uapi16Xattr *x = NULL;
+        size_t n = 0;
+        CLEANUP_ARRAY(x, n, uapi16_xattr_array_free);
+
+        r = manifest_read_user_xattrs(inode_fd, &x, &n);
+        if (r == -EUCLEAN) {
+                /* A namespace object must list all attributes of the namespace, hence omit it entirely if
+                 * we cannot */
+                log_warning("Inode '%s' carries an extended attribute whose name cannot be represented in a UAPI.16 manifest, omitting extended attributes.", empty_to_root(path));
+                c->n_metadata_omitted++;
+                *ret = NULL;
+                return 0;
+        }
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_warning_errno(r, "Failed to read extended attributes of '%s', ignoring: %m", empty_to_root(path));
+                c->n_metadata_omitted++;
+                *ret = NULL;
+                return 0;
+        }
+
+        r = uapi16_xattrs_build_json(x, n, ret);
+        if (r < 0)
+                return log_error_errno(r, "Failed to build JSON object for extended attributes: %m");
+
+        return 1;
+}
+
+static unsigned manifest_fields_to_inode_flags(ManifestField f) {
+        unsigned m = 0;
+
+        /* Maps the manifest fields to the Linux inode flags they cover */
+        SET_FLAG(m, FS_APPEND_FL,    FLAGS_SET(f, MANIFEST_FIELD_FLAG_APPEND_ONLY));
+        SET_FLAG(m, FS_IMMUTABLE_FL, FLAGS_SET(f, MANIFEST_FIELD_FLAG_IMMUTABLE));
+        SET_FLAG(m, FS_NOATIME_FL,   FLAGS_SET(f, MANIFEST_FIELD_FLAG_NO_ATIME));
+        SET_FLAG(m, FS_NOCOW_FL,     FLAGS_SET(f, MANIFEST_FIELD_FLAG_NO_COW));
+        SET_FLAG(m, FS_NODUMP_FL,    FLAGS_SET(f, MANIFEST_FIELD_FLAG_NO_DUMP));
+
+        return m;
+}
+
+static uint32_t manifest_fields_to_fat_attrs(ManifestField f) {
+        uint32_t m = 0;
+
+        /* Maps the manifest fields to the FAT attributes they cover */
+        SET_FLAG(m, ATTR_RO,     FLAGS_SET(f, MANIFEST_FIELD_READ_ONLY));
+        SET_FLAG(m, ATTR_HIDDEN, FLAGS_SET(f, MANIFEST_FIELD_FLAG_HIDDEN));
+        SET_FLAG(m, ATTR_SYS,    FLAGS_SET(f, MANIFEST_FIELD_FLAG_SYSTEM));
+        SET_FLAG(m, ATTR_ARCH,   FLAGS_SET(f, MANIFEST_FIELD_FLAG_ARCHIVE));
+
+        return m;
+}
+
+static int manifest_read_inode_flags(int inode_fd, unsigned *ret) {
+        unsigned f;
+        int r;
+
+        assert(inode_fd >= 0);
+        assert(ret);
+
+        /* Reads the Linux inode flags covered by UAPI.16 of the specified inode (which may be an O_PATH
+         * fd). If the file system does not support inode flags at all, the inode is considered to have
+         * none. */
+
+        r = read_attr_fd(inode_fd, &f);
+        if (ERRNO_IS_NEG_IOCTL_NOT_SUPPORTED(r))
+                f = 0;
+        else if (r < 0)
+                return r;
+
+        *ret = f & UAPI16_INODE_FLAGS_ALL;
+        return 0;
+}
+
+static int manifest_read_fat_attrs(int inode_fd, uint32_t *ret) {
+        int r;
+
+        assert(inode_fd >= 0);
+        assert(ret);
+
+        /* Reads the FAT directory entry attributes covered by UAPI.16 of the specified inode (which may be
+         * an O_PATH fd). Returns 0 if the inode is not located on a FAT file system, 1 otherwise. */
+
+        r = fd_is_fs_type(inode_fd, MSDOS_SUPER_MAGIC);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                *ret = 0;
+                return 0;
+        }
+
+        _cleanup_close_ int fd_close = -EBADF;
+        int fd = fd_reopen_condition(inode_fd, O_RDONLY|O_NOCTTY, O_PATH, &fd_close);
+        if (fd < 0)
+                return fd;
+
+        uint32_t a;
+        if (ioctl(fd, FAT_IOCTL_GET_ATTRIBUTES, &a) < 0)
+                return -errno;
+
+        *ret = a & UAPI16_FAT_ATTRS_ALL;
+        return 1;
+}
+
+typedef struct FsIdentity {
+        bool is_fat;
+        char *label;                /* NULL if not queryable, "" if the file system has no label */
+        sd_id128_t uuid;
+        bool uuid_set;
+        uint32_t fat_serial;
+        bool fat_serial_set;
+        ManifestField unqueryable;  /* The identity fields the file system cannot report */
+} FsIdentity;
+
+static void fs_identity_done(FsIdentity *i) {
+        assert(i);
+
+        i->label = mfree(i->label);
+}
+
+static int manifest_read_fs_identity(int dir_fd, FsIdentity *ret) {
+        int r;
+
+        assert(dir_fd >= 0);
+        assert(ret);
+
+        /* Reads the identity of the file system the specified directory (which may be an O_PATH fd) is
+         * located in. Fields the file system cannot report are left unset. */
+
+        _cleanup_close_ int fd_close = -EBADF;
+        int fd = fd_reopen_condition(dir_fd, O_RDONLY|O_DIRECTORY|O_NOCTTY, O_PATH, &fd_close);
+        if (fd < 0)
+                return fd;
+
+        _cleanup_(fs_identity_done) FsIdentity id = {};
+
+        r = fd_is_fs_type(fd, MSDOS_SUPER_MAGIC);
+        if (r < 0)
+                return r;
+        id.is_fat = r;
+
+        char label[FSLABEL_MAX] = {};
+        if (ioctl(fd, FS_IOC_GETFSLABEL, label) < 0) {
+                if (!ERRNO_IS_IOCTL_NOT_SUPPORTED(errno))
+                        return -errno;
+
+                id.unqueryable |= MANIFEST_FIELD_FS_LABEL;
+        } else {
+                id.label = strndup(label, sizeof(label));
+                if (!id.label)
+                        return -ENOMEM;
+        }
+
+        if (id.is_fat) {
+                /* FAT has no UUID, but a 32-bit volume serial number instead */
+                uint32_t serial;
+                if (ioctl(fd, FAT_IOCTL_GET_VOLUME_ID, &serial) < 0) {
+                        if (!ERRNO_IS_IOCTL_NOT_SUPPORTED(errno))
+                                return -errno;
+
+                        id.unqueryable |= MANIFEST_FIELD_FAT_SERIAL;
+                } else {
+                        id.fat_serial = serial;
+                        id.fat_serial_set = true;
+                }
+        } else {
+                r = id128_get_fs_uuid_fd(fd, &id.uuid);
+                if (r == -EOPNOTSUPP)
+                        id.unqueryable |= MANIFEST_FIELD_FS_UUID;
+                else if (r >= 0)
+                        id.uuid_set = true;
+                else if (r != -EADDRNOTAVAIL) /* All-zero UUID: supported, but not set */
+                        return r;
+        }
+
+        *ret = TAKE_STRUCT(id);
+        return 0;
+}
+
+static int manifest_uapi16_extra_fields(
+                ManifestContext *c,
+                const char *path,
+                int inode_fd,
+                const struct statx *sx,
+                sd_json_variant **j) {
+
+        bool is_root = isempty(path);
+        int r;
+
+        assert(c);
+        assert(sx);
+        assert(FLAGS_SET(sx->stx_mask, STATX_TYPE)); /* Always requested, see manifest_uapi16_fields_to_statx() */
+        assert(j);
+
+        /* Adds the Linux inode flags, FAT attributes and read-only state to the object, if requested. */
+
+        if (inode_fd < 0)
+                return 0;
+
+        /* Inode flags and FAT attributes are only defined for regular files and directories */
+        bool reg_or_dir = S_ISREG(sx->stx_mode) || S_ISDIR(sx->stx_mode);
+
+        unsigned inode_mask = manifest_fields_to_inode_flags(c->fields);
+        if (inode_mask != 0 && reg_or_dir) {
+                unsigned f;
+                r = manifest_read_inode_flags(inode_fd, &f);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to read inode flags of '%s', ignoring: %m", empty_to_root(path));
+                        c->n_metadata_omitted++;
+                } else {
+                        r = uapi16_inode_flags_merge_json(j, f, inode_mask);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to add inode flags to JSON object: %m");
+                }
+        }
+
+        /* The root directory of a FAT file system has no directory entry, hence no attributes. The read-only
+         * state is taken from the ATTR_RO attribute only for regular files: vfat (unless mounted with
+         * "rodir") does not reflect ATTR_RO of directories in their access mode, and the specification
+         * does not permit "readOnly" to contradict "mode". */
+        uint32_t fat_mask = manifest_fields_to_fat_attrs(c->fields);
+        int read_only = -1;
+        if (fat_mask != 0 && reg_or_dir && !is_root) {
+                uint32_t a;
+                r = manifest_read_fat_attrs(inode_fd, &a);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to read FAT attributes of '%s', ignoring: %m", empty_to_root(path));
+                        c->n_metadata_omitted++;
+                } else if (r > 0) {
+                        /* "readOnly" is added below, as it is only included if set */
+                        r = uapi16_fat_attrs_merge_json(j, a, fat_mask & ~ATTR_RO);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to add FAT attributes to JSON object: %m");
+
+                        if (FLAGS_SET(fat_mask, ATTR_RO) && S_ISREG(sx->stx_mode))
+                                read_only = FLAGS_SET(a, ATTR_RO);
+                }
+        }
+
+        /* Everywhere else (and if the FAT attributes cannot be read) the read-only state is derived from
+         * the access mode, so that it is declared consistently with it. Symlinks have no access mode. */
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_READ_ONLY) && read_only < 0 &&
+            FLAGS_SET(sx->stx_mask, STATX_MODE) && !S_ISLNK(sx->stx_mode))
+                read_only = (sx->stx_mode & 0222) == 0;
+
+        /* The specification asks generators not to set "readOnly" to false, its default */
+        if (read_only > 0) {
+                r = sd_json_variant_set_field_boolean(j, "readOnly", true);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add read-only state to JSON object: %m");
+        }
+
+        return 0;
+}
+
+static int manifest_uapi16_fs_identity(
+                ManifestContext *c,
+                int dir_fd,
+                sd_json_variant **ret,
+                ManifestField *ret_unqueryable) {
+
+        int r;
+
+        assert(c);
+        assert(ret);
+        assert(ret_unqueryable);
+
+        /* Builds the file system identity fields of the root object, if requested. Also returns the
+         * requested identity fields the file system cannot report, so that the root object does not declare
+         * them as recorded features: if it did, readers would conclude the file system has no such
+         * property. */
+
+        if ((c->fields & (MANIFEST_FIELD_FS_UUID|MANIFEST_FIELD_FS_LABEL|MANIFEST_FIELD_FAT_SERIAL)) == 0 || dir_fd < 0) {
+                *ret = NULL;
+                *ret_unqueryable = 0;
+                return 0;
+        }
+
+        _cleanup_(fs_identity_done) FsIdentity id = {};
+        r = manifest_read_fs_identity(dir_fd, &id);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_warning_errno(r, "Failed to read file system identity, ignoring: %m");
+                c->n_metadata_omitted++;
+                *ret = NULL;
+                *ret_unqueryable = c->fields & (MANIFEST_FIELD_FS_UUID|MANIFEST_FIELD_FS_LABEL|MANIFEST_FIELD_FAT_SERIAL);
+                return 0;
+        }
+
+        char sb[UAPI16_FAT_SERIAL_STRING_MAX];
+        const char *label = NULL;
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_FS_LABEL) && !isempty(id.label)) {
+                if (uapi16_fs_label_is_valid(id.label))
+                        label = id.label;
+                else {
+                        /* Not declared either, as readers would conclude the file system has no label */
+                        log_warning("File system label cannot be represented in a UAPI.16 manifest, omitting.");
+                        c->n_metadata_omitted++;
+                        id.unqueryable |= MANIFEST_FIELD_FS_LABEL;
+                }
+        }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        r = sd_json_buildo(
+                        &j,
+                        SD_JSON_BUILD_PAIR_CONDITION(!!label, "fsLabel", SD_JSON_BUILD_STRING(label)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_FAT_SERIAL) && id.fat_serial_set, "fatSerial", SD_JSON_BUILD_STRING(uapi16_fat_serial_to_string(id.fat_serial, sb))),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_FS_UUID) && id.uuid_set, "fsUUID", SD_JSON_BUILD_UUID(id.uuid)));
+        if (r < 0)
+                return log_error_errno(r, "Failed to build file system identity JSON object: %m");
+
+        if (id.unqueryable != 0)
+                log_debug("File system cannot report all requested identity fields, not declaring them.");
+
+        *ret = TAKE_PTR(j);
+        *ret_unqueryable = id.unqueryable & c->fields;
+        return 0;
+}
+
+static int manifest_uapi16_item(
+                RecurseDirEvent event,
+                const char *path,
+                int dir_fd,
+                int inode_fd,
+                const struct dirent *de,
+                const struct statx *sx,
+                void *userdata) {
+
+        ManifestContext *c = ASSERT_PTR(userdata);
+        int r;
+
+        /* Generates a UAPI.16 Manifest of the directory tree */
+
+        if (manifest_handle_skip_event(c, event, path))
+                return RECURSE_DIR_CONTINUE;
+
+        if (!IN_SET(event, RECURSE_DIR_ENTER, RECURSE_DIR_ENTRY))
+                return RECURSE_DIR_CONTINUE;
+
+        /* We ignore this to avoid input-as-output cycles (only on top-level though!). Only skip regular
+         * files silently though, i.e. what we might have generated ourselves earlier. Anything else carrying
+         * a reserved name is not representable in a manifest, and is refused below. */
+        if (path &&
+            uapi16_manifest_filename_is_reserved(path) &&
+            FLAGS_SET(sx->stx_mask, STATX_TYPE) &&
+            S_ISREG(sx->stx_mode)) {
+                log_debug("Skipping directory entry '%s' to avoid recursive manifest generation.", path);
+                return RECURSE_DIR_SKIP_ENTRY;
+        }
+
+        bool is_root = isempty(path);
+
+        _cleanup_free_ char *data = NULL;
+        uint8_t hash[MANIFEST_HASH_SIZE_MAX];
+        uint64_t size = UINT64_MAX;
+        bool have_size = false, hash_valid = false, omit_hash = false;
+        const char *type = NULL;
+        uint64_t hardlink_counter = 0;
+
+        r = hardlink_data_lookup(c, path, inode_fd, sx, &hardlink_counter, hash, &hash_valid);
+        if (r < 0)
+                return r;
+
+        if (FLAGS_SET(sx->stx_mask, STATX_TYPE)) {
+                switch (sx->stx_mode & S_IFMT) {
+
+                case S_IFREG:
+                        if (FLAGS_SET(sx->stx_mask, STATX_SIZE)) {
+                                size = sx->stx_size;
+                                have_size = true;
+                        }
+
+                        /* The specification recommends leaving the hash of empty files unset, as it is
+                         * implied by the size. But only if we actually include the size. */
+                        if (FLAGS_SET(c->fields, MANIFEST_FIELD_SIZE) && have_size && size == 0)
+                                omit_hash = true;
+
+                        if (!hash_valid && !omit_hash && FLAGS_SET(c->fields, MANIFEST_FIELD_HASH) && inode_fd >= 0) {
+                                r = manifest_context_hash_fd(c, inode_fd, hash);
+                                if (r < 0) {
+                                        log_warning_errno(r, "Failed to calculate file SHA256 sum for '%s', ignoring: %m", empty_to_root(path));
+                                        c->n_metadata_omitted++;
+                                } else
+                                        hash_valid = true;
+                        }
+
+                        break;
+
+                case S_IFLNK:
+                        if (FLAGS_SET(c->fields, MANIFEST_FIELD_SYMLINK) && inode_fd >= 0) {
+                                r = readlinkat_malloc(inode_fd, "", &data);
+                                if (r < 0) {
+                                        log_warning_errno(r, "Failed to read symlink '%s', ignoring: %m", empty_to_root(path));
+                                        c->n_metadata_omitted++;
+                                } else {
+                                        size = strlen(data);
+                                        have_size = true;
+                                }
+                        }
+
+                        break;
+                }
+
+                /* Suppress the type on the top-level entry and on regular files. */
+                type = !is_root && !S_ISREG(sx->stx_mode) ? inode_type_to_string(sx->stx_mode) : NULL;
+        }
+
+        if (!is_root && !uapi16_name_is_valid(path)) {
+                _cleanup_free_ char *e = cescape(path);
+                if (!e)
+                        return log_oom();
+
+                /* This is not a path we can express in a UAPI.16 manifest (e.g. because it is not valid
+                 * UTF-8 or contains control characters). Let's continue, but count it and report the failure
+                 * in the end */
+                log_warning("Encountered path '%s' which cannot be represented in a UAPI.16 manifest, skipping.", e);
+                c->n_skipped++;
+                return RECURSE_DIR_SKIP_ENTRY; /* Don't descend into directories we cannot represent */
+        }
+
+        /* Symlinks cannot carry extended attributes in the "user." namespace, everything else might (Linux
+         * traditionally only allowed them on regular files and directories, but recently added support for
+         * sockets, and might extend this further), hence try. */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *jx = NULL;
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_USER_XATTR) &&
+            FLAGS_SET(sx->stx_mask, STATX_TYPE) &&
+            !S_ISLNK(sx->stx_mode) &&
+            inode_fd >= 0) {
+                r = manifest_uapi16_xattrs(c, path, inode_fd, &jx);
+                if (r < 0)
+                        return r;
+        }
+
+        const char *user_name, *group_name;
+        r = manifest_resolve_names(c, path, sx, &user_name, &group_name);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *jid = NULL, *jf = NULL;
+        if (is_root) {
+                ManifestField unqueryable = 0;
+                r = manifest_uapi16_fs_identity(c, inode_fd, &jid, &unqueryable);
+                if (r < 0)
+                        return r;
+
+                /* The root object declares the features the manifest records, i.e. which fields the file
+                 * objects may carry. Unless they are the default ones, as the specification asks us not to
+                 * set fields to their default. */
+                ManifestField declared = c->fields & ~unqueryable;
+                if (declared != _MANIFEST_FIELD_DEFAULT) {
+                        r = uapi16_features_build_json(declared, &jf);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to build features JSON array: %m");
+                }
+        }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        r = sd_json_buildo(
+                        &j,
+                        SD_JSON_BUILD_PAIR_CONDITION(is_root, "mediaType", JSON_BUILD_CONST_STRING(UAPI16_MANIFEST_MEDIA_TYPE)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!jf, "features", SD_JSON_BUILD_VARIANT(jf)),
+                        /* recurse_dir() with RECURSE_DIR_SORT sorts the entries of every directory by strcmp(),
+                         * and lists the entries of a directory right after it, i.e. the order of complete
+                         * names is the code point ordering, hence declare it */
+                        SD_JSON_BUILD_PAIR_CONDITION(is_root, "order", JSON_BUILD_CONST_STRING("codepoint")),
+                        SD_JSON_BUILD_PAIR_CONDITION(!is_root, "name", SD_JSON_BUILD_STRING(path)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!type, "type", SD_JSON_BUILD_STRING(type)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_SIZE) && have_size, "size", SD_JSON_BUILD_UNSIGNED(size)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!data, "contents", SD_JSON_BUILD_ARRAY(SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("literal", SD_JSON_BUILD_BASE64(data, size))))),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_HASH) && hash_valid && !omit_hash, "sha256", SD_JSON_BUILD_HEX(hash, SHA256_DIGEST_SIZE)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_DEVICE) && FLAGS_SET(sx->stx_mask, STATX_TYPE) && (S_ISBLK(sx->stx_mode) || S_ISCHR(sx->stx_mode)), "major", SD_JSON_BUILD_UNSIGNED(sx->stx_rdev_major)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_DEVICE) && FLAGS_SET(sx->stx_mask, STATX_TYPE) && (S_ISBLK(sx->stx_mode) || S_ISCHR(sx->stx_mode)), "minor", SD_JSON_BUILD_UNSIGNED(sx->stx_rdev_minor)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_MODE) && FLAGS_SET(sx->stx_mask, STATX_TYPE|STATX_MODE) && !S_ISLNK(sx->stx_mode), "mode", SD_JSON_BUILD_UNSIGNED(sx->stx_mode & 07777)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_UID) && FLAGS_SET(sx->stx_mask, STATX_UID), "uid", SD_JSON_BUILD_UNSIGNED(sx->stx_uid)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_GID) && FLAGS_SET(sx->stx_mask, STATX_GID), "gid", SD_JSON_BUILD_UNSIGNED(sx->stx_gid)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("userName", user_name),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("groupName", group_name),
+                        SD_JSON_BUILD_PAIR_CONDITION(hardlink_counter > 0, "inodeToken", SD_JSON_BUILD_UNSIGNED(hardlink_counter)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!jx, "extendedAttributes", SD_JSON_BUILD_VARIANT(jx)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(c->fields, MANIFEST_FIELD_MTIME) && FLAGS_SET(sx->stx_mask, STATX_MTIME) && sx->stx_mtime.tv_sec >= 0, "mTimeNSec", SD_JSON_BUILD_UNSIGNED(statx_timestamp_load_nsec(&sx->stx_mtime))));
+        if (r < 0)
+                return log_error_errno(r, "Failed to build JSON object: %m");
+
+        if (jid) {
+                r = sd_json_variant_merge_object(&j, jid);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add file system identity to JSON object: %m");
+        }
+
+        r = manifest_uapi16_extra_fields(c, path, inode_fd, sx, &j);
+        if (r < 0)
+                return r;
+
+        r = manifest_uapi16_write_object(c, j);
+        if (r < 0)
+                return r;
+
+        if (is_root)
+                c->top_level_covered = true;
+
+        return RECURSE_DIR_CONTINUE;
+}
+
+static int sums_escape(const char *s, char **ret) {
+        assert(s);
+        assert(ret);
+
+        if (!strpbrk(s, "\n\r\\")) {
+                /* No escaping required */
+                *ret = NULL;
+                return 0;
+        }
+
+        _cleanup_free_ char *buf = new(char, strlen(s) * 2 + 1);
+        if (!buf)
+                return -ENOMEM;
+
+        size_t n = 0;
+
+        for (const char *p = s; *p; p++)
+                switch (*p) {
+                case '\n':
+                        buf[n++] = '\\';
+                        buf[n++] = 'n';
+                        break;
+                case '\r':
+                        buf[n++] = '\\';
+                        buf[n++] = 'r';
+                        break;
+                case '\\':
+                        buf[n++] = '\\';
+                        buf[n++] = '\\';
+                        break;
+                default:
+                        buf[n++] = *p;
+                }
+
+        buf[n] = 0;
+        *ret = TAKE_PTR(buf);
+        return 1;
+}
+
+static int manifest_sha256sums_item(
+                RecurseDirEvent event,
+                const char *path,
+                int dir_fd,
+                int inode_fd,
+                const struct dirent *de,
+                const struct statx *sx,
+                void *userdata) {
+
+        ManifestContext *c = ASSERT_PTR(userdata);
+        int r;
+
+        /* Generates output compatible with sha256sum(1), i.e. what "sha256sum -c" (and systemd-sysupdate)
+         * consume. Only regular files are listed, like sha256sum would do it. */
+
+        assert(path);
+
+        if (manifest_handle_skip_event(c, event, path))
+                return RECURSE_DIR_CONTINUE;
+
+        if (event != RECURSE_DIR_ENTRY)
+                return RECURSE_DIR_CONTINUE;
+
+        assert(sx);
+
+        if (!FLAGS_SET(sx->stx_mask, STATX_TYPE)) {
+                log_warning("Skipping '%s' because its inode type is unknown.", path);
+                c->n_skipped++;
+                return RECURSE_DIR_CONTINUE;
+        }
+
+        /* The format only lists regular files by design, hence skipping anything else is expected */
+        if (!S_ISREG(sx->stx_mode)) {
+                log_info("Skipping non-regular file '%s' because not representable in SHA256SUMS format.", path);
+                c->n_skipped++;
+                c->n_skipped_expected++;
+                return RECURSE_DIR_CONTINUE;
+        }
+
+        /* We ignore this to avoid input-as-output cycles (only on top-level though!) */
+        if (streq(path, "SHA256SUMS") || (startswith(path, "SHA256SUMS.") && !strchr(path, '/'))) {
+                log_debug("Skipping directory entry '%s' to avoid recursive manifest generation.", path);
+                return RECURSE_DIR_CONTINUE;
+        }
+
+        assert(inode_fd >= 0);
+
+        uint8_t hash[MANIFEST_HASH_SIZE_MAX];
+        r = manifest_context_hash_fd(c, inode_fd, hash);
+        if (r < 0) {
+                log_warning_errno(r, "Failed to calculate hash of file '%s', ignoring: %m", path);
+                c->n_skipped++;
+                return RECURSE_DIR_CONTINUE;
+        }
+
+        _cleanup_free_ char *h = hexmem(hash, SHA256_DIGEST_SIZE);
+        if (!h)
+                return log_oom();
+
+        _cleanup_free_ char *escaped = NULL;
+        r = sums_escape(path, &escaped);
+        if (r < 0)
+                return log_error_errno(r, "Failed to escape string for manifest: %m");
+
+        fprintf(c->output,
+                "%s%s  %s\n",
+                escaped ? "\\" : "",
+                h,
+                escaped ?: path);
+
+        return RECURSE_DIR_CONTINUE;
+}
+
+static int manifest_context_check_hash(ManifestContext *c) {
+        assert(c);
+
+        if (!FLAGS_SET(c->fields, MANIFEST_FIELD_HASH) || c->hash == MANIFEST_HASH_SHA256)
+                return 0;
+
+        if (c->format != MANIFEST_FORMAT_MTREE)
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Only mtree manifests support hash algorithms other than SHA256.");
+
+        /* Check early if we can do SHA512, rather than failing for every single file */
+        assert(c->hash == MANIFEST_HASH_SHA512);
+#if HAVE_OPENSSL
+        return dlopen_libcrypto(LOG_ERR);
+#else
+        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "SHA512 hashes not supported, OpenSSL support disabled.");
+#endif
+}
+
+static int manifest_context_setup(ManifestContext *c) {
+        int r;
+
+        assert(c);
+
+        if (!c->output)
+                c->output = stdout;
+
+        if (!c->color)
+                c->json_format_flags &= ~(SD_JSON_FORMAT_COLOR|SD_JSON_FORMAT_COLOR_AUTO);
+
+        /* Resolve the automatic flags the same way sd_json_variant_dump() does, and drop SD_JSON_FORMAT_OFF
+         * (which sd_json_variant_dump() ignores, but sd_json_variant_format() refuses) once, so that the
+         * rendering we sign is exactly what we write. */
+        c->json_format_flags &= ~SD_JSON_FORMAT_OFF;
+        if ((c->json_format_flags & (SD_JSON_FORMAT_COLOR_AUTO|SD_JSON_FORMAT_COLOR)) == SD_JSON_FORMAT_COLOR_AUTO)
+                c->json_format_flags = (c->json_format_flags & ~SD_JSON_FORMAT_COLOR_AUTO) | (colors_enabled() ? SD_JSON_FORMAT_COLOR : 0);
+        if ((c->json_format_flags & (SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_PRETTY)) == SD_JSON_FORMAT_PRETTY_AUTO)
+                c->json_format_flags = (c->json_format_flags & ~SD_JSON_FORMAT_PRETTY_AUTO) | (on_tty() ? SD_JSON_FORMAT_PRETTY : SD_JSON_FORMAT_NEWLINE);
+
+        if (c->private_key) {
+                if (c->format != MANIFEST_FORMAT_UAPI16)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Signing is only supported for UAPI.16 manifests.");
+                if (!c->certificate)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Signing requires a certificate.");
+
+                assert(!c->signer);
+
+                r = uapi16_signer_new(c->certificate, c->private_key, &c->signer);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+int manifest_uapi16_begin(ManifestContext *c) {
+        assert(c);
+        assert(c->format == MANIFEST_FORMAT_UAPI16);
+
+        return manifest_context_setup(c);
+}
+
+int manifest_uapi16_end(ManifestContext *c) {
+        int r;
+
+        assert(c);
+        assert(c->format == MANIFEST_FORMAT_UAPI16);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        if (c->signer) {
+                r = uapi16_signer_finish(c->signer, &j);
+                if (r < 0)
+                        return r;
+
+                /* The signature object is appended as one more record, which is not covered by the
+                 * signature itself. Its leading record separator is by construction the first byte not
+                 * covered by the signature. */
+                r = manifest_uapi16_write_object_full(c, j, /* sign= */ false);
+                if (r < 0)
+                        return r;
+
+                j = sd_json_variant_unref(j);
+        }
+
+        r = sd_json_buildo(
+                        &j,
+                        SD_JSON_BUILD_PAIR("mediaType", JSON_BUILD_CONST_STRING(UAPI16_TRAILER_MEDIA_TYPE)));
+        if (r < 0)
+                return log_error_errno(r, "Failed to build JSON object: %m");
+
+        r = manifest_uapi16_write_object_full(c, j, /* sign= */ false);
+        if (r < 0)
+                return r;
+
+        r = fflush_and_check(c->output);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write manifest: %m");
+
+        return 0;
+}
+
+int manifest_make(ManifestContext *c, int dir_fd) {
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+
+        r = manifest_context_check_hash(c);
+        if (r < 0)
+                return r;
+
+        r = manifest_context_setup(c);
+        if (r < 0)
+                return r;
+
+        recurse_dir_func_t item_callback = NULL;
+        unsigned statx_mask = 0;
+        const char *path = NULL;
+        RecurseDirFlags flags = RECURSE_DIR_SORT;
+
+        switch (c->format) {
+
+        case MANIFEST_FORMAT_LIST:
+                item_callback = manifest_list_item;
+                break;
+
+        case MANIFEST_FORMAT_MTREE:
+                path = ".";
+                statx_mask |= manifest_mtree_fields_to_statx(c->fields);
+                flags |= RECURSE_DIR_INODE_FD|RECURSE_DIR_TOPLEVEL;
+                item_callback = manifest_mtree_item;
+                break;
+
+        case MANIFEST_FORMAT_SHA256SUMS:
+                if (!FLAGS_SET(c->fields, MANIFEST_FIELD_HASH))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot generate SHA256SUMS manifest without hash field.");
+
+                statx_mask = STATX_TYPE|STATX_SIZE;
+                flags |= RECURSE_DIR_INODE_FD;
+                item_callback = manifest_sha256sums_item;
+                break;
+
+        case MANIFEST_FORMAT_UAPI16:
+                statx_mask |= manifest_uapi16_fields_to_statx(c->fields);
+                flags |= RECURSE_DIR_INODE_FD|RECURSE_DIR_TOPLEVEL;
+                item_callback = manifest_uapi16_item;
+                break;
+
+        default:
+                assert_not_reached();
+        }
+
+        r = recurse_dir(dir_fd, path, statx_mask, /* n_depth_max= */ UINT_MAX, flags, item_callback, c);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enumerate directory tree: %m");
+
+        /* These formats do not list the top-level inode itself, hence enumerating it is all we can do */
+        if (IN_SET(c->format, MANIFEST_FORMAT_LIST, MANIFEST_FORMAT_SHA256SUMS))
+                c->top_level_covered = true;
+
+        if (c->format == MANIFEST_FORMAT_UAPI16)
+                return manifest_uapi16_end(c);
+
+        r = fflush_and_check(c->output);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write manifest: %m");
+
+        return 0;
+}
+
+static int sums_unescape(const char *s, char **ret) {
+        _cleanup_free_ char *buf = NULL;
+        size_t n = 0;
+
+        assert(s);
+        assert(ret);
+
+        /* Reverses sums_escape() */
+
+        buf = new(char, strlen(s) + 1);
+        if (!buf)
+                return -ENOMEM;
+
+        for (const char *p = s; *p; p++) {
+                if (*p != '\\') {
+                        buf[n++] = *p;
+                        continue;
+                }
+
+                p++;
+                switch (*p) {
+                case 'n':
+                        buf[n++] = '\n';
+                        break;
+                case 'r':
+                        buf[n++] = '\r';
+                        break;
+                case '\\':
+                        buf[n++] = '\\';
+                        break;
+                default:
+                        return -EINVAL;
+                }
+        }
+
+        buf[n] = 0;
+        *ret = TAKE_PTR(buf);
+        return 0;
+}
+
+int manifest_parse_sums(
+                FILE *f,
+                size_t *line_nr,
+                char **ret_filename,
+                struct iovec *ret_digest) {
+
+        int r;
+
+        assert(f);
+        assert(line_nr);
+        assert(ret_filename);
+        assert(ret_digest);
+
+        size_t hash_len = SHA256_DIGEST_SIZE * 2;
+
+        _cleanup_free_ char *line = NULL;
+        r = read_line(f, LONG_LINE_MAX, &line);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read manifest line %zu: %m", *line_nr + 1);
+        if (r == 0) {
+                *ret_filename = NULL;
+                *ret_digest = (struct iovec) {};
+                return 0;
+        }
+
+        size_t n = ++(*line_nr);
+
+        if (!utf8_is_valid(line))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Manifest line %zu is not valid UTF-8, refusing.", n);
+
+        const char *p = line;
+
+        /* coreutils prefixes lines whose file names contain characters that need escaping with a
+         * backslash. */
+        bool escaped = p[0] == '\\';
+        if (escaped)
+                p++;
+
+        /* hash + separator + filename */
+        if (strlen(p) < hash_len + 3)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Corrupt manifest at line %zu, refusing.", n);
+
+        _cleanup_(iovec_done) struct iovec digest = {};
+        r = unhexmem_full(p, hash_len, /* secure= */ false, &digest.iov_base, &digest.iov_len);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) /* Any other error (EINVAL, EPIPE, …) means the digest is malformed */
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse digest at manifest line %zu, refusing.", n);
+        /* unhexmem_full() skips whitespace, hence the result might be shorter than expected */
+        if (digest.iov_len != SHA256_DIGEST_SIZE)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Manifest hash at line %zu decoded to %zu bytes, refusing.",
+                                       n, digest.iov_len);
+        p += hash_len;
+
+        if (*p != ' ')
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Missing space separator at manifest line %zu, refusing.", n);
+        p++;
+
+        if (!IN_SET(*p, '*', ' '))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Missing binary/text input marker at manifest line %zu, refusing.", n);
+        p++;
+
+        if (isempty(p))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Empty filename specified at manifest line %zu, refusing.", n);
+
+        _cleanup_free_ char *fn = NULL;
+        if (escaped) {
+                r = sums_unescape(p, &fn);
+                if (r < 0)
+                        return log_error_errno(r, "Invalid escaping in filename at manifest line %zu, refusing.", n);
+        } else {
+                fn = strdup(p);
+                if (!fn)
+                        return log_oom();
+        }
+
+        /* Accept either a plain filename or a relative subpath like "subdir/file" but reject
+         * absolute paths and any paths containing "." or ".." */
+        if (path_is_absolute(fn) || !path_is_normalized(fn))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid filename specified at manifest line %zu, refusing.", n);
+
+        *ret_filename = TAKE_PTR(fn);
+        *ret_digest = TAKE_STRUCT(digest);
+        return 1;
+}
+
+_printf_(3, 4) static void manifest_verify_error(ManifestContext *c, const char *path, const char *format, ...) {
+        int r;
+
+        assert(c);
+        assert(format);
+
+        /* Reports a mismatch. We count them, and continue with the next entry, so that users get a full
+         * picture. */
+
+        va_list ap;
+        va_start(ap, format);
+        _cleanup_free_ char *m = NULL;
+        r = vasprintf(&m, format, ap);
+        va_end(ap);
+        if (r < 0)
+                (void) log_oom();
+        else
+                log_error("%s: %s", path ?: ".", m);
+
+        c->n_errors++;
+}
+
+static int manifest_verify_hash(
+                ManifestContext *c,
+                const char *path,
+                int inode_fd,
+                const struct iovec *expected) {
+
+        uint8_t hash[MANIFEST_HASH_SIZE_MAX];
+        int r;
+
+        assert(c);
+        assert(path);
+        assert(inode_fd >= 0);
+        assert(iovec_is_set(expected));
+
+        if (expected->iov_len != SHA256_DIGEST_SIZE)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unexpected hash size for '%s'.", path);
+
+        r = manifest_context_hash_fd(c, inode_fd, hash);
+        if (r < 0)
+                return log_error_errno(r, "Failed to calculate hash of '%s': %m", path);
+
+        if (memcmp_nn(hash, SHA256_DIGEST_SIZE, expected->iov_base, expected->iov_len) != 0) {
+                manifest_verify_error(c, path, "Hash mismatch.");
+                return -ENXIO;
+        }
+
+        return 0;
+}
+
+static int manifest_stat_file(
+                ManifestContext *c,
+                int dir_fd,
+                const char *path,
+                unsigned statx_mask,
+                struct statx *ret_sx,
+                struct iovec *ret_hash,
+                int *ret_fd) {
+
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+
+        /* Opens the specified relative path below the specified directory fd as O_PATH fd, without ever
+         * following symlinks, mirroring how recurse_dir() enumerates the tree. */
+
+        if (path) {
+                assert(!path_is_absolute(path));
+                assert(path_is_normalized(path));
+        } else
+                path = ".";
+
+        r = chaseat(dir_fd, dir_fd, path, CHASE_NOFOLLOW|CHASE_PROHIBIT_SYMLINKS, /* ret_path= */ NULL, &fd);
+        if (IN_SET(r, -ENOENT, -ENOTDIR)) {
+                manifest_verify_error(c, path, "Listed in manifest, but missing in tree.");
+                return 0;
+        }
+        if (IN_SET(r, -EREMCHG, -ELOOP)) { /* chase() reports prohibited symlinks as EREMCHG, openat2() as ELOOP */
+                manifest_verify_error(c, path, "Listed in manifest, but a symlink is in the way.");
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to open '%s': %m", path);
+
+        struct statx sx;
+        if (ret_sx || ret_hash) {
+                r = xstatx(fd, "", AT_EMPTY_PATH, (ret_sx ? statx_mask : 0) | (ret_hash ? STATX_TYPE : 0), &sx);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to stat '%s': %m", path);
+        }
+
+        if (ret_hash) {
+                if (S_ISREG(sx.stx_mode)) {
+                        _cleanup_free_ uint8_t *h = new(uint8_t, MANIFEST_HASH_SIZE_MAX);
+                        if (!h)
+                                return log_oom();
+
+                        r = manifest_context_hash_fd(c, fd, h);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to calculate hash of '%s': %m", path);
+
+                        *ret_hash = IOVEC_MAKE(TAKE_PTR(h), SHA256_DIGEST_SIZE);
+                } else
+                        *ret_hash = (struct iovec) {};
+        }
+
+        if (ret_sx)
+                *ret_sx = sx;
+
+        if (ret_fd)
+                *ret_fd = TAKE_FD(fd);
+
+        return 1;
+}
+
+static int verify_list(ManifestContext *c, int dir_fd, FILE *f) {
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+        assert(f);
+
+        for (size_t line_nr = 1;; line_nr++) {
+                _cleanup_free_ char *line = NULL;
+                r = read_line(f, LONG_LINE_MAX, &line);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read manifest line %zu: %m", line_nr);
+                if (r == 0)
+                        break;
+
+                if (isempty(line))
+                        continue;
+
+                char *is_dir = endswith(line, "/");
+                if (is_dir)
+                        *is_dir = 0;
+
+                if (isempty(line) || path_is_absolute(line) || !path_is_normalized(line))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid path specified at manifest line %zu, refusing.", line_nr);
+
+                struct statx sx;
+                r = manifest_stat_file(
+                                c,
+                                dir_fd,
+                                line,
+                                STATX_TYPE,
+                                &sx,
+                                /* ret_hash= */ NULL,
+                                /* ret_fd= */ NULL);
+                if (r < 0)
+                        return r;
+                if (r == 0) /* check already failed */
+                        continue;
+
+                if (is_dir) {
+                        if (!S_ISDIR(sx.stx_mode))
+                                manifest_verify_error(c, line, "Expected directory, but found non-directory.");
+                        else
+                                log_debug("'%s' exists and is a directory as expected.", line);
+                } else {
+                        /* Directories are always listed with a trailing slash, hence an entry without one
+                         * refers to a non-directory */
+                        if (S_ISDIR(sx.stx_mode))
+                                manifest_verify_error(c, line, "Expected non-directory, but found directory.");
+                        else
+                                log_debug("'%s' exists.", line);
+                }
+        }
+
+        return 0;
+}
+
+static int verify_sha256sums_line(
+                ManifestContext *c,
+                int dir_fd,
+                const char *filename,
+                const struct iovec *digest) {
+
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+        assert(filename);
+
+        struct statx sx;
+        _cleanup_(iovec_done) struct iovec hash = {};
+        r = manifest_stat_file(
+                        c,
+                        dir_fd,
+                        filename,
+                        STATX_TYPE,
+                        &sx,
+                        FLAGS_SET(c->fields, MANIFEST_FIELD_HASH) ? &hash : NULL,
+                        /* ret_fd= */ NULL);
+        if (r < 0)
+                return r;
+        if (r == 0) /* check already failed */
+                return 0;
+
+        if (!S_ISREG(sx.stx_mode)) {
+                manifest_verify_error(c, filename, "Expected regular file, but found %s.", strna(inode_type_to_string(sx.stx_mode)));
+                return 0;
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_HASH)) {
+                if (!iovec_equal(digest, &hash))
+                        manifest_verify_error(c, filename, "Hash mismatch.");
+                else
+                        log_debug("'%s' exists and matches manifest.", filename);
+        } else
+                log_debug("'%s' exists.", filename);
+
+        return 0;
+}
+
+static int verify_sha256sums(ManifestContext *c, int dir_fd, FILE *f) {
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+        assert(f);
+
+        for (size_t line_nr = 0;;) {
+                _cleanup_free_ char *fn = NULL;
+                _cleanup_(iovec_done) struct iovec digest = {};
+                r = manifest_parse_sums(f, &line_nr, &fn, &digest);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 0;
+
+                r = verify_sha256sums_line(c, dir_fd, fn, &digest);
+                if (r < 0)
+                        return r;
+        }
+}
+
+static int hardlink_db_verify(
+                ManifestContext *c,
+                const char *path,
+                int inode_fd,
+                uint64_t token) {
+
+        _cleanup_free_ char *fhs = NULL, *ts = NULL, *stored = NULL;
+        int r;
+
+        assert(c);
+        assert(inode_fd >= 0);
+        assert(!IN_SET(token, 0, UINT64_MAX));
+
+        /* Checks that all names carrying the same inode token refer to the same inode, and that no two
+         * distinct inodes share a token. We store two symlinks per hardlinked inode in the database: one
+         * named after the FID pointing to the token, and one named after the token pointing to the FID. */
+
+        r = inode_fid_hex(inode_fd, &fhs);
+        if (r <= 0)
+                return r;
+
+        r = hardlink_db_acquire(c);
+        if (r < 0)
+                return r;
+
+        ts = asprintf_safe("token-%" PRIu64, token);
+        if (!ts)
+                return log_oom();
+
+        r = readlinkat_malloc(c->db_fd, fhs, &stored);
+        if (r < 0 && r != -ENOENT)
+                return log_error_errno(r, "Failed to read hardlink database symlink '%s': %m", fhs);
+        if (r >= 0) {
+                if (!streq(stored, ts))
+                        manifest_verify_error(c, path, "Inode token %" PRIu64 " in manifest, but inode already seen with a different token.", token);
+                return 0;
+        }
+
+        stored = mfree(stored);
+        r = readlinkat_malloc(c->db_fd, ts, &stored);
+        if (r < 0 && r != -ENOENT)
+                return log_error_errno(r, "Failed to read hardlink database symlink '%s': %m", ts);
+        if (r >= 0) {
+                /* We haven't seen this inode before, but the token: hence two different inodes share a token */
+                manifest_verify_error(c, path, "Inode token %" PRIu64 " in manifest already used by a different inode, not a hardlink.", token);
+                return 0;
+        }
+
+        if (symlinkat(ts, c->db_fd, fhs) < 0)
+                return log_error_errno(errno, "Failed to create hardlink database symlink '%s': %m", fhs);
+        if (symlinkat(fhs, c->db_fd, ts) < 0)
+                return log_error_errno(errno, "Failed to create hardlink database symlink '%s': %m", ts);
+
+        return 0;
+}
+
+static int verify_user_xattrs(ManifestContext *c, const Uapi16Object *o, int fd) {
+        int r;
+
+        assert(c);
+        assert(o);
+        assert(o->user_xattrs_set);
+        assert(fd >= 0);
+
+        Uapi16Xattr *x = NULL;
+        size_t n = 0;
+        CLEANUP_ARRAY(x, n, uapi16_xattr_array_free);
+
+        r = manifest_read_user_xattrs(fd, &x, &n);
+        if (r == -EUCLEAN) {
+                manifest_verify_error(c, o->name, "Inode carries an extended attribute whose name cannot be represented in a manifest.");
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to read extended attributes of '%s': %m", o->name ?: ".");
+
+        /* Both lists are sorted by name, hence compare them in one pass */
+        size_t i = 0, j = 0;
+        while (i < o->n_user_xattrs || j < n) {
+                int d = i >= o->n_user_xattrs ? 1 :
+                        j >= n ? -1 :
+                        strcmp(o->user_xattrs[i].name, x[j].name);
+
+                if (d < 0) {
+                        manifest_verify_error(c, o->name, "Extended attribute 'user.%s' is missing.", o->user_xattrs[i].name);
+                        i++;
+                } else if (d > 0) {
+                        manifest_verify_error(c, o->name, "Unexpected extended attribute 'user.%s'.", x[j].name);
+                        j++;
+                } else {
+                        if (iovec_memcmp(&o->user_xattrs[i].value, &x[j].value) != 0)
+                                manifest_verify_error(c, o->name, "Value of extended attribute 'user.%s' does not match.", x[j].name);
+                        i++;
+                        j++;
+                }
+        }
+
+        return 0;
+}
+
+static int verify_inode_flags(ManifestContext *c, const Uapi16Object *o, int fd) {
+        unsigned value, mask, f;
+        int r;
+
+        assert(c);
+        assert(o);
+        assert(fd >= 0);
+
+        uapi16_object_inode_flags(o, &value, &mask);
+        mask &= manifest_fields_to_inode_flags(c->fields);
+        if (mask == 0)
+                return 0;
+
+        r = manifest_read_inode_flags(fd, &f);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read inode flags of '%s': %m", o->name ?: ".");
+
+        BIT_FOREACH(b, (value ^ f) & mask) {
+                unsigned flag = 1U << b;
+                manifest_verify_error(c, o->name, "Expected inode flag '%s' to be %s, but it is not.",
+                                      uapi16_inode_flag_to_field(flag), FLAGS_SET(value, flag) ? "set" : "unset");
+        }
+
+        return 0;
+}
+
+static int verify_fat_attrs(ManifestContext *c, const Uapi16Object *o, int fd, const struct statx *sx) {
+        uint32_t value, mask, a;
+        int r;
+
+        assert(c);
+        assert(o);
+        assert(fd >= 0);
+        assert(sx);
+        assert(FLAGS_SET(sx->stx_mask, STATX_MODE));
+
+        /* Symlinks have neither attributes nor an access mode. The dispatcher refuses the FAT-specific
+         * fields on them, but the generic "readOnly" field may show up anywhere. */
+        if (o->type == S_IFLNK)
+                return 0;
+
+        uapi16_object_fat_attrs(o, &value, &mask);
+        mask &= manifest_fields_to_fat_attrs(c->fields);
+        if (mask == 0)
+                return 0;
+
+        /* Only directory entries of regular files and directories carry attributes, and the root directory
+         * of a FAT file system has no directory entry. The read-only state of directories is derived from
+         * the access mode, as vfat (unless mounted with "rodir") does not reflect ATTR_RO of directories in
+         * it, see manifest_uapi16_extra_fields(). */
+        uint32_t fat_mask = mask;
+        if (o->type == S_IFDIR)
+                fat_mask &= ~ATTR_RO;
+        if (o->name && IN_SET(o->type, S_IFREG, S_IFDIR) && fat_mask != 0) {
+                r = manifest_read_fat_attrs(fd, &a);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read FAT attributes of '%s': %m", o->name);
+                if (r > 0) {
+                        BIT_FOREACH(b, (value ^ a) & fat_mask) {
+                                uint32_t attr = UINT32_C(1) << b;
+                                manifest_verify_error(c, o->name, "Expected FAT attribute '%s' to be %s, but it is not.",
+                                                      uapi16_fat_attr_to_field(attr), FLAGS_SET(value, attr) ? "set" : "unset");
+                        }
+
+                        mask &= ~fat_mask;
+                }
+        }
+
+        /* Everywhere else the read-only state is derived from the access mode */
+        if (FLAGS_SET(mask, ATTR_RO)) {
+                bool ro = (sx->stx_mode & 0222) == 0;
+
+                if (FLAGS_SET(value, ATTR_RO) != ro)
+                        manifest_verify_error(c, o->name, "Expected inode to be %s, but it is not.",
+                                              FLAGS_SET(value, ATTR_RO) ? "read-only" : "writable");
+
+                mask &= ~ATTR_RO;
+        }
+
+        /* The specification says the FAT-specific fields have no effect on other file systems */
+        if (mask != 0) {
+                log_debug("'%s' is not located on a FAT file system, not verifying FAT attributes.", empty_to_root(o->name));
+                c->n_not_applicable += popcount(mask);
+        }
+
+        return 0;
+}
+
+static int verify_fs_identity(ManifestContext *c, const Uapi16Object *o, int fd) {
+        int r;
+
+        assert(c);
+        assert(o);
+        assert(fd >= 0);
+
+        bool check_uuid = FLAGS_SET(c->fields, MANIFEST_FIELD_FS_UUID) && o->fs_uuid_set,
+                check_label = FLAGS_SET(c->fields, MANIFEST_FIELD_FS_LABEL) && o->fs_label,
+                check_serial = FLAGS_SET(c->fields, MANIFEST_FIELD_FAT_SERIAL) && o->fat_serial_set;
+        if (!check_uuid && !check_label && !check_serial)
+                return 0;
+
+        _cleanup_(fs_identity_done) FsIdentity id = {};
+        r = manifest_read_fs_identity(fd, &id);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0)
+                return log_error_errno(r, "Failed to read file system identity: %m");
+
+        /* If the file system has no such property, or it cannot be queried, the field does not apply here
+         * and is ignored (but counted). But if it has one, it must match. Note that FAT has no UUID, but a
+         * volume serial number instead, and other file systems have no FAT volume serial number. */
+        if (check_label) {
+                if (!id.label) {
+                        log_debug("File system has no label that can be queried, not verifying it.");
+                        c->n_not_applicable++;
+                } else if (!streq(id.label, o->fs_label)) {
+                        /* The label comes from the file system we are verifying, which might be untrusted */
+                        _cleanup_free_ char *e = cescape(id.label);
+                        if (!e)
+                                return log_oom();
+
+                        manifest_verify_error(c, o->name, "Expected file system label '%s', but found '%s'.", o->fs_label, e);
+                }
+        }
+
+        if (check_serial) {
+                char a[UAPI16_FAT_SERIAL_STRING_MAX], b[UAPI16_FAT_SERIAL_STRING_MAX];
+
+                if (!id.fat_serial_set) {
+                        log_debug("File system has no FAT volume serial number that can be queried, not verifying it.");
+                        c->n_not_applicable++;
+                } else if (id.fat_serial != o->fat_serial)
+                        manifest_verify_error(c, o->name, "Expected FAT volume serial number %s, but found %s.",
+                                              uapi16_fat_serial_to_string(o->fat_serial, a),
+                                              uapi16_fat_serial_to_string(id.fat_serial, b));
+        }
+
+        if (check_uuid) {
+                if (!id.uuid_set) {
+                        log_debug("File system has no UUID that can be queried, not verifying it.");
+                        c->n_not_applicable++;
+                } else if (!sd_id128_equal(id.uuid, o->fs_uuid))
+                        manifest_verify_error(c, o->name, "Expected file system UUID " SD_ID128_UUID_FORMAT_STR ", but found " SD_ID128_UUID_FORMAT_STR ".",
+                                              SD_ID128_FORMAT_VAL(o->fs_uuid), SD_ID128_FORMAT_VAL(id.uuid));
+        }
+
+        return 0;
+}
+
+static int verify_object(ManifestContext *c, int dir_fd, const Uapi16Object *o) {
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+        assert(o);
+
+        uint64_t saved_errors = c->n_errors;
+
+        struct statx sx;
+        _cleanup_close_ int fd = -EBADF;
+        r = manifest_stat_file(
+                        c,
+                        dir_fd,
+                        o->name,
+                        STATX_TYPE|STATX_MODE|STATX_UID|STATX_GID|STATX_SIZE|STATX_MTIME,
+                        &sx,
+                        /* ret_hash= */ NULL,
+                        &fd);
+        if (r <= 0)
+                return r;
+
+        if ((sx.stx_mode & S_IFMT) != o->type) {
+                manifest_verify_error(c, o->name, "Expected inode type '%s', but found '%s'.",
+                                      strna(inode_type_to_string(o->type)),
+                                      strna(inode_type_to_string(sx.stx_mode)));
+                return 0; /* No point in checking anything else */
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_MODE) && o->mode != MODE_INVALID && (sx.stx_mode & 07777) != o->mode)
+                manifest_verify_error(c, o->name, "Expected access mode 0%04o, but found 0%04o.", (unsigned) o->mode, (unsigned) (sx.stx_mode & 07777));
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_UID) && uid_is_valid(o->uid) && sx.stx_uid != o->uid)
+                manifest_verify_error(c, o->name, "Expected UID " UID_FMT ", but found " UID_FMT ".", o->uid, sx.stx_uid);
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_GID) && gid_is_valid(o->gid) && sx.stx_gid != o->gid)
+                manifest_verify_error(c, o->name, "Expected GID " GID_FMT ", but found " GID_FMT ".", o->gid, sx.stx_gid);
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_USER_NAME) && o->user_name) {
+                const char *n;
+                r = manifest_resolve_name(c, /* group= */ false, sx.stx_uid, &n);
+                if (r < 0)
+                        return r;
+                if (!streq_ptr(n, o->user_name))
+                        manifest_verify_error(c, o->name, "Expected user name '%s', but found %s%s%s.", o->user_name, n ? "'" : "", n ?: "unresolvable UID", n ? "'" : "");
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_GROUP_NAME) && o->group_name) {
+                const char *n;
+                r = manifest_resolve_name(c, /* group= */ true, sx.stx_gid, &n);
+                if (r < 0)
+                        return r;
+                if (!streq_ptr(n, o->group_name))
+                        manifest_verify_error(c, o->name, "Expected group name '%s', but found %s%s%s.", o->group_name, n ? "'" : "", n ?: "unresolvable GID", n ? "'" : "");
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_MTIME) && o->mtime_nsec != NSEC_INFINITY) {
+                nsec_t d = ABS_DIFF(statx_timestamp_load_nsec(&sx.stx_mtime), o->mtime_nsec);
+
+                if (d > c->timestamp_accuracy_nsec)
+                        manifest_verify_error(c, o->name, "Modification time deviates by %" PRIu64 "ns, which is more than the accepted %" PRIu64 "ns.",
+                                              d, c->timestamp_accuracy_nsec);
+        }
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_USER_XATTR) && o->user_xattrs_set) {
+                r = verify_user_xattrs(c, o, fd);
+                if (r < 0)
+                        return r;
+        }
+
+        r = verify_inode_flags(c, o, fd);
+        if (r < 0)
+                return r;
+
+        r = verify_fat_attrs(c, o, fd, &sx);
+        if (r < 0)
+                return r;
+
+        r = verify_fs_identity(c, o, fd);
+        if (r < 0)
+                return r;
+
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_DEVICE) && (S_ISBLK(o->type) || S_ISCHR(o->type))) {
+                if (o->major != UINT64_MAX && sx.stx_rdev_major != o->major)
+                        manifest_verify_error(c, o->name, "Expected device major %" PRIu64 ", but found %" PRIu32 ".", o->major, sx.stx_rdev_major);
+                if (o->minor != UINT64_MAX && sx.stx_rdev_minor != o->minor)
+                        manifest_verify_error(c, o->name, "Expected device minor %" PRIu64 ", but found %" PRIu32 ".", o->minor, sx.stx_rdev_minor);
+        }
+
+        /* Inode tokens are only assigned to non-directory inodes, the dispatcher refuses them otherwise */
+        if (FLAGS_SET(c->fields, MANIFEST_FIELD_HARDLINK) && !IN_SET(o->inode_token, 0, UINT64_MAX)) {
+                r = hardlink_db_verify(c, o->name, fd, o->inode_token);
+                if (r < 0)
+                        return r;
+        }
+
+        if (S_ISREG(o->type)) {
+                if (FLAGS_SET(c->fields, MANIFEST_FIELD_SIZE) && o->size != UINT64_MAX && sx.stx_size != o->size)
+                        manifest_verify_error(c, o->name, "Expected size %" PRIu64 ", but found %" PRIu64 ".", o->size, (uint64_t) sx.stx_size);
+                else if (FLAGS_SET(c->fields, MANIFEST_FIELD_HASH) && iovec_is_set(&o->sha256)) {
+                        r = manifest_verify_hash(c, o->name, fd, &o->sha256);
+                        if (r < 0 && r != -ENXIO) /* -ENXIO → mismatch, already counted */
+                                return r;
+                }
+        }
+
+        if (S_ISLNK(o->type) && FLAGS_SET(c->fields, MANIFEST_FIELD_SYMLINK)) {
+                /* We generate the symlink target as first "contents" entry with a literal */
+                const Uapi16Contents *literal = NULL;
+                FOREACH_ARRAY(i, o->contents, o->n_contents)
+                        if (iovec_is_set(&i->literal)) {
+                                literal = i;
+                                break;
+                        }
+
+                if (literal) {
+                        _cleanup_free_ char *target = NULL;
+                        r = readlinkat_malloc(fd, "", &target);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to read symlink '%s': %m", o->name ?: ".");
+
+                        if (iovec_memcmp(&IOVEC_MAKE_STRING(target), &literal->literal) != 0)
+                                manifest_verify_error(c, o->name, "Symlink target mismatch.");
+                }
+        }
+
+        log_debug(c->n_errors == saved_errors ?
+                  "'%s' exists and matches manifest." :
+                  "'%s' exists but does not fully match manifest.", o->name ?: ".");
+
+        return 0;
+}
+
+typedef struct VerifyObjectContext {
+        ManifestContext *context;
+        int dir_fd;
+} VerifyObjectContext;
+
+static int verify_object_handler(Uapi16Object *o, size_t index, void *userdata) {
+        VerifyObjectContext *vc = ASSERT_PTR(userdata);
+        int r;
+
+        assert(o);
+
+        r = uapi16_object_check_validity(o);
+        if (r == -ESTALE)
+                log_warning_errno(r, "File object not within its validity time window, processing anyway.");
+        else if (r == -EHWPOISON)
+                log_warning_errno(r, "File object has been revoked, processing anyway.");
+        else if (r < 0)
+                return log_error_errno(r, "Failed to check file object validity: %m");
+
+        return verify_object(vc->context, vc->dir_fd, o);
+}
+
+static int uapi16_manifest_verify(ManifestContext *c, int dir_fd, FILE *f) {
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+        assert(f);
+
+        r = uapi16_manifest_read(
+                        f,
+                        c->certificates,
+                        c->n_certificates,
+                        verify_object_handler,
+                        &(VerifyObjectContext) {
+                                .context = c,
+                                .dir_fd = dir_fd,
+                        });
+        if (r < 0)
+                return r;
+
+        if (c->n_certificates > 0)
+                log_info("Manifest signature verified successfully.");
+
+        return 0;
+}
+
+int manifest_verify(ManifestContext *c, int dir_fd, FILE *f) {
+        int r;
+
+        assert(c);
+        assert(dir_fd >= 0);
+        assert(f);
+
+        r = manifest_context_check_hash(c);
+        if (r < 0)
+                return r;
+
+        switch (c->format) {
+
+        case MANIFEST_FORMAT_LIST:
+                r = verify_list(c, dir_fd, f);
+                break;
+
+        case MANIFEST_FORMAT_SHA256SUMS:
+                r = verify_sha256sums(c, dir_fd, f);
+                break;
+
+        case MANIFEST_FORMAT_MTREE:
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Verification of mtree manifests is not supported.");
+
+        case MANIFEST_FORMAT_UAPI16:
+                r = uapi16_manifest_verify(c, dir_fd, f);
+                break;
+
+        default:
+                assert_not_reached();
+        }
+        if (r < 0)
+                return r;
+
+        if (c->n_errors > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Found %" PRIu64 " mismatches between manifest and directory tree.", c->n_errors);
+
+        log_info("Directory tree matches manifest.");
+        return 0;
+}

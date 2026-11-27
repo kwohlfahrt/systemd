@@ -12,21 +12,36 @@ on:
   pull_request:
     paths:
       - '**/meson.build'
-      - '.github/workflows/**'
+      - '.github/workflows/cifuzz.yml'
+      - '.github/workflows/requirements.txt'
       - 'meson_options.txt'
       - 'src/**'
       - 'test/fuzz/**'
+      - 'test/test-bcd/**'
       - 'tools/oss-fuzz.sh'
+  pull_request_target:
+    types: [closed]
   push:
+    paths:
+      - '**/meson.build'
+      - '.github/workflows/cifuzz.yml'
+      - '.github/workflows/requirements.txt'
+      - 'meson_options.txt'
+      - 'src/**'
+      - 'test/fuzz/**'
+      - 'test/test-bcd/**'
+      - 'tools/oss-fuzz.sh'
     branches:
       - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   Fuzzing:
     runs-on: ubuntu-24.04
-    if: github.repository == 'systemd/systemd'
-    concurrency:
-      group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ matrix.architecture }}-${{ github.ref }}
-      cancel-in-progress: true
+    if: github.event_name != 'pull_request_target' && github.repository == 'systemd/systemd'
     strategy:
       fail-fast: false
       matrix:
@@ -67,7 +82,7 @@ jobs:
           path: ./out/artifacts
       - name: Upload Sarif
         if: always() && steps.build.outcome == 'success'
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370
         with:
           # Path to SARIF file relative to the root of the repository
           sarif_file: cifuzz-sarif/results.sarif

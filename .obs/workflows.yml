@@ -17,23 +17,28 @@ ci:
     # Also prepare some images, but disabled by default to avoid wasting cpu/disk
     - link_package:
         source_project: system:systemd
-        source_package: particleos-debian
-        target_project: system:systemd:ci
-    - link_package:
-        source_project: system:systemd
-        source_package: particleos-debian-arm
-        target_project: system:systemd:ci
-    - link_package:
-        source_project: system:systemd
         source_package: particleos-fedora
         target_project: system:systemd:ci
     - link_package:
         source_project: system:systemd
-        source_package: uki-debian
+        source_package: uki-fedora
+        target_project: system:systemd:ci
+    # Also prepare sysexts, also disabled by default
+    - link_package:
+        source_project: system:systemd
+        source_package: systemd-sysext-rh
         target_project: system:systemd:ci
     - link_package:
         source_project: system:systemd
-        source_package: uki-fedora
+        source_package: systemd-sysext-suse
+        target_project: system:systemd:ci
+    - link_package:
+        source_project: system:systemd
+        source_package: systemd-sysext-deb
+        target_project: system:systemd:ci
+    - link_package:
+        source_project: system:systemd
+        source_package: systemd-sysext-arch
         target_project: system:systemd:ci
     - set_flags:
         flags:

@@ -13,7 +13,6 @@
 #include "bus-locator.h"
 #include "cgroup-util.h"
 #include "conf-parser.h"
-#include "device-private.h"
 #include "device-util.h"
 #include "efi-loader.h"
 #include "errno-util.h"
@@ -458,7 +457,7 @@ bool manager_get_idle_hint(Manager *m, dual_timestamp *ret_timestamp) {
          * unreasonable large idle periods starting with the Unix epoch. */
         ts = m->init_ts;
 
-        idle_hint = !manager_is_inhibited(m, INHIBIT_IDLE, /* since= */ NULL, /* flags= */ 0, UID_INVALID, NULL);
+        idle_hint = !manager_is_inhibited(m, INHIBIT_IDLE, /* since= */ NULL, /* flags= */ 0, UID_INVALID, /* ret_offending= */ NULL);
 
         HASHMAP_FOREACH(s, m->sessions) {
                 dual_timestamp k;
@@ -526,11 +525,8 @@ int config_parse_n_autovts(
         assert(rvalue);
 
         r = safe_atou(rvalue, &o);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse number of autovts, ignoring: %s", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         if (o > 15) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
@@ -558,9 +554,9 @@ static int vt_is_busy(unsigned vtnr) {
          * we avoid this. Since tty1 is special and needs to be an
          * explicitly loaded getty or DM this is safe. */
 
-        fd = open_terminal("/dev/tty1", O_RDWR|O_NOCTTY|O_CLOEXEC);
+        fd = open_terminal("/dev/tty1", O_RDWR|O_NOCTTY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         if (ioctl(fd, VT_GETSTATE, &vt_stat) < 0)
                 r = -errno;
@@ -595,7 +591,7 @@ int manager_spawn_autovt(Manager *m, unsigned vtnr) {
         }
 
         xsprintf(name, "autovt@tty%u.service", vtnr);
-        r = bus_call_method(m->bus, bus_systemd_mgr, "StartUnit", &error, NULL, "ss", name, "fail");
+        r = bus_call_method(m->bus, bus_systemd_mgr, "StartUnit", &error, /* ret_reply= */ NULL, "ss", name, "fail");
         if (r < 0)
                 return log_error_errno(r, "Failed to start %s: %s", name, bus_error_message(&error, r));
 
@@ -612,7 +608,7 @@ bool manager_is_lid_closed(Manager *m) {
         return false;
 }
 
-static bool manager_is_docked(Manager *m) {
+static bool manager_dock_switch_engaged(Manager *m) {
         Button *b;
 
         HASHMAP_FOREACH(b, m->buttons)
@@ -622,9 +618,43 @@ static bool manager_is_docked(Manager *m) {
         return false;
 }
 
-static int manager_count_external_displays(Manager *m) {
+bool drm_connector_is_external(const char *sysname) {
+        assert(sysname);
+
+        /* The connector type is the second dash-separated item of the sysfs
+         * name, the first being the card name and the last the connector
+         * number. */
+        const char *dash = strchr(sysname, '-');
+        if (!dash)
+                return false;
+
+        return STARTSWITH_SET(dash + 1,
+                              "Component-", "Composite-", "DIN-", "DP-", "DVI-A-", "DVI-D-", "DVI-I-",
+                              "HDMI-A-", "HDMI-B-", "SVIDEO-", "TV-", "VGA-");
+}
+
+/* Returns true if the given values of a DRM connector's 'status' and 'enabled' sysfs
+ * attributes show that a display is currently being driven on it. Passing in NULL as
+ * a value is interpreted as the attribute not existing. */
+bool drm_connector_is_active(const char *status, const char *enabled) {
+        if (!streq_ptr(enabled, "enabled"))
+                return false;
+
+        /* Connectors without reliable hotplug detection have a status of
+         * "unknown", so count anything that is not explicitly "disconnected". */
+        return status && !streq(status, "disconnected");
+}
+
+/* Counts the external display connectors of the system. A display is counted as
+ * active if it's driven by a display server. A display is counted as attached if
+ * its "status" sysattr equals "connected".  */
+static int count_external_displays(unsigned *ret_active, unsigned *ret_attached) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
-        int r, n = 0;
+        unsigned active = 0, attached = 0;
+        int r;
+
+        assert(ret_active);
+        assert(ret_attached);
 
         r = sd_device_enumerator_new(&e);
         if (r < 0)
@@ -634,7 +664,7 @@ static int manager_count_external_displays(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_device_enumerator_add_match_subsystem(e, "drm", true);
+        r = sd_device_enumerator_add_match_subsystem(e, "drm", /* match= */ true);
         if (r < 0)
                 return r;
 
@@ -653,64 +683,112 @@ static int manager_count_external_displays(Manager *m) {
                 if (r == 0)
                         continue;
 
-                const char *nn;
-                r = sd_device_get_sysname(d, &nn);
+                const char *sysname;
+                r = sd_device_get_sysname(d, &sysname);
                 if (r < 0)
                         return r;
 
-                /* Ignore internal displays: the type is encoded in the sysfs name, as the second dash
-                 * separated item (the first is the card name, the last the connector number). We implement a
-                 * deny list of external displays here, rather than an allow list of internal ones, to ensure
-                 * we don't block suspends too eagerly. */
-                const char *dash = strchr(nn, '-');
-                if (!dash)
+                if (!drm_connector_is_external(sysname))
                         continue;
 
-                dash++;
-                if (!STARTSWITH_SET(dash,
-                                    "VGA-", "DVI-I-", "DVI-D-", "DVI-A-"
-                                    "Composite-", "SVIDEO-", "Component-",
-                                    "DIN-", "DP-", "HDMI-A-", "HDMI-B-", "TV-"))
-                        continue;
+                /* A connector may lack either attribute, which leaves the respective pointer at NULL. */
+                const char *status = NULL, *enabled = NULL;
 
-                /* Ignore ports that are not enabled */
-                r = device_get_sysattr_streq(d, "enabled", "enabled");
-                if (IN_SET(r, 0, -ENOENT))
-                        continue;
-                if (r < 0)
-                        return r;
-
-                /* We count any connector which is not explicitly "disconnected" as connected. */
-                r = device_get_sysattr_streq(d, "status", "disconnected");
+                r = sd_device_get_sysattr_value(d, "status", &status);
                 if (r < 0 && r != -ENOENT)
                         return r;
-                if (r <= 0)
-                        n++;
+
+                r = sd_device_get_sysattr_value(d, "enabled", &enabled);
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
+                if (drm_connector_is_active(status, enabled))
+                        active++;
+
+                /* Hotplug detection is the one signal that survives the display being put to sleep. */
+                if (streq_ptr(status, "connected"))
+                        attached++;
         }
 
-        return n;
+        *ret_active = active;
+        *ret_attached = attached;
+        return 0;
 }
 
-bool manager_is_docked_or_external_displays(Manager *m) {
-        int n;
+/* Looks for a keyboard that is not part of the chassis, i.e. one somebody plugged in or paired. Returns > 0
+ * if there is one. */
+static int has_external_keyboard(void) {
+        _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
+        int r;
 
-        /* If we are docked don't react to lid closing */
-        if (manager_is_docked(m)) {
+        r = sd_device_enumerator_new(&e);
+        if (r < 0)
+                return r;
+
+        /* Stick to initialized devices so we can match udev properties */
+        r = sd_device_enumerator_add_match_subsystem(e, "input", /* match = */ true);
+        if (r < 0)
+                return r;
+
+        r = sd_device_enumerator_add_match_property_required(e, "ID_INPUT_KEYBOARD", "1");
+        if (r < 0)
+                return r;
+
+        r = sd_device_enumerator_add_match_property_required(e, "ID_INTEGRATION", "external");
+        if (r < 0)
+                return r;
+
+        sd_device *d = sd_device_enumerator_get_device_first(e);
+        if (!d) {
+                log_debug("No external keyboard found.");
+                return 0;
+        }
+
+        log_device_debug(d, "Found external keyboard.");
+        return 1;
+}
+
+bool manager_is_docked(Manager *m) {
+        unsigned active, attached;
+        int r;
+
+        assert(m);
+
+        if (manager_dock_switch_engaged(m)) {
                 log_debug("System is docked.");
                 return true;
         }
 
-        /* If we have more than one display connected,
-         * assume that we are docked. */
-        n = manager_count_external_displays(m);
-        if (n < 0)
-                log_warning_errno(n, "Display counting failed: %m");
-        else if (n >= 1) {
-                log_debug("External (%i) displays connected.", n);
+        r = count_external_displays(&active, &attached);
+        if (r < 0) {
+                log_warning_errno(r, "Display counting failed, assuming no external displays: %m");
+                return false;
+        }
+
+        /* A display that is being driven is enough on its own. */
+        if (active > 0) {
+                log_debug("%u external display(s) enabled.", active);
                 return true;
         }
 
-        return false;
+        /* Failing that, a display may still be plugged in but asleep. That alone is too weak to act on (a
+         * laptop can have a cable dangling from it anywhere), so we also require an external keyboard as
+         * corroboration that somebody set the machine up on a desk. Without this, the system would suspend
+         * the moment its monitor blanked on an idle timer, see
+         * https://github.com/systemd/systemd/issues/41898. */
+        if (attached == 0)
+                return false;
+
+        r = has_external_keyboard();
+        if (r < 0) {
+                log_warning_errno(r, "Failed to look for external keyboards, assuming none: %m");
+                return false;
+        }
+        if (r == 0)
+                return false;
+
+        log_debug("%u external display(s) attached, along with an external keyboard.", attached);
+        return true;
 }
 
 bool manager_is_on_external_power(void) {
@@ -779,4 +857,32 @@ int manager_read_efi_boot_loader_entries(Manager *m) {
 #else
         return 0;
 #endif
+}
+
+int config_parse_kill_exclude_users(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char ***users = ASSERT_PTR(data);
+
+        if (isempty(rvalue)) {
+                /* NULL represents the default, i.e. only root is excluded. An empty (non-NULL) strv means
+                 * that no user is excluded. Hence, allocate an empty strv instead of freeing it. */
+                char **v = strv_new(NULL);
+                if (!v)
+                        return log_oom();
+
+                return strv_free_and_replace(*users, v);
+        }
+
+        return config_parse_strv(unit, filename, line, section, section_line,
+                                 lvalue, ltype, rvalue, data, userdata);
 }

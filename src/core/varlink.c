@@ -11,6 +11,7 @@
 #include "metrics.h"
 #include "path-util.h"
 #include "pidref.h"
+#include "socket-label.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -29,7 +30,6 @@
 #include "varlink-serialize.h"
 #include "varlink-unit.h"
 #include "varlink-util.h"
-#include "xattr-util.h"
 
 static const char* const managed_oom_mode_properties[] = {
         "ManagedOOMSwap",
@@ -337,12 +337,12 @@ static int vl_method_subscribe_managed_oom_cgroups(
 
         u = manager_get_unit_by_pidref(m, &pidref);
         if (!u)
-                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
 
         /* This is meant to be a deterrent and not actual security. The alternative is to check for the systemd-oom
          * user that this unit runs as, but NSS lookups are blocking and not allowed from PID 1. */
         if (!streq(u->id, "systemd-oomd.service"))
-                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
 
         r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
@@ -351,7 +351,7 @@ static int vl_method_subscribe_managed_oom_cgroups(
         /* We only take one subscriber for this method so return an error if there's already an existing one.
          * This shouldn't happen since systemd-oomd is the only client of this method. */
         if (FLAGS_SET(flags, SD_VARLINK_METHOD_MORE) && m->managed_oom_varlink)
-                return sd_varlink_error(link, "io.systemd.ManagedOOM.SubscriptionTaken", NULL);
+                return sd_varlink_error(link, "io.systemd.ManagedOOM.SubscriptionTaken", /* parameters= */ NULL);
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
 
@@ -364,6 +364,12 @@ static int vl_method_subscribe_managed_oom_cgroups(
 
         assert(!m->managed_oom_varlink);
         m->managed_oom_varlink = sd_varlink_ref(link);
+
+        /* Keep the subscription across reexecution */
+        r = sd_varlink_set_serialize_pending(link, true);
+        if (r < 0)
+                return r;
+
         return sd_varlink_notify(m->managed_oom_varlink, v);
 }
 
@@ -375,6 +381,11 @@ static void vl_disconnect(sd_varlink_server *s, sd_varlink *link, void *userdata
 
         if (link == m->managed_oom_varlink)
                 m->managed_oom_varlink = sd_varlink_unref(link);
+        if (link == m->pending_reexecute_message_vl)
+                m->pending_reexecute_message_vl = sd_varlink_unref(link);
+
+        if (link == m->pending_reload_message_vl)
+                m->pending_reload_message_vl = sd_varlink_unref(link);
 
         /* Drop any job varlink references for the disconnecting client.
          * A varlink link can stream at most one job, so stop after the first match. */
@@ -393,6 +404,8 @@ static void vl_disconnect(sd_varlink_server *s, sd_varlink *link, void *userdata
                         u->varlink_unit_change = sd_varlink_unref(u->varlink_unit_change);
                         break;
                 }
+
+        varlink_job_drop_stashed_client(m, link);
 }
 
 int manager_setup_varlink_server(Manager *m) {
@@ -561,8 +574,11 @@ static int manager_varlink_init_system_api(Manager *m) {
                 /* Reduce the noise routed to us: advertise that only look-ups for the dynamic UID range should go to us */
                 char text[DECIMAL_STR_MAX(uid_t) + 1 + DECIMAL_STR_MAX(gid_t) + 1];
                 xsprintf(text, UID_FMT "-" UID_FMT, (uid_t) DYNAMIC_UID_MIN, (uid_t) DYNAMIC_UID_MAX);
-                FOREACH_STRING(xattr, "user.userdb.uid", "user.userdb.gid")
-                        (void) xsetxattr(AT_FDCWD, "/run/systemd/userdb/io.systemd.DynamicUser", /* at_flags= */ 0, xattr, text);
+                (void) socket_set_xattrs(
+                                AT_FDCWD,
+                                "/run/systemd/userdb/io.systemd.DynamicUser",
+                                STRV_MAKE("user.userdb.uid", text,
+                                          "user.userdb.gid", text));
         }
 
         return 0;
@@ -633,6 +649,8 @@ void manager_varlink_done(Manager *m) {
         sd_varlink_close_unref(TAKE_PTR(m->managed_oom_varlink));
 
         m->pending_reload_message_vl = sd_varlink_unref(m->pending_reload_message_vl);
+        m->pending_reexecute_message_vl = sd_varlink_unref(m->pending_reexecute_message_vl);
+        m->stashed_varlink_job_clients = hashmap_free(m->stashed_varlink_job_clients);
 
         m->varlink_server = sd_varlink_server_unref(m->varlink_server);
         m->managed_oom_varlink = sd_varlink_close_unref(m->managed_oom_varlink);
@@ -653,4 +671,63 @@ void manager_varlink_send_pending_reload_message(Manager *m) {
                 log_warning_errno(r, "Failed to send queued reload message, ignoring: %m");
 
         m->pending_reload_message_vl = sd_varlink_unref(m->pending_reload_message_vl);
+}
+
+void manager_varlink_send_pending_reexecute_error(Manager *m, int error) {
+        int r;
+
+        assert(m);
+
+        if (!m->pending_reexecute_message_vl)
+                return;
+
+        r = sd_varlink_error_errno(m->pending_reexecute_message_vl, error);
+        if (r < 0)
+                log_warning_errno(r, "Failed to send queued reexecute error reply, ignoring: %m");
+
+        /* vl_method_reexecute_manager() stores the link in pending_reload_message_vl too, so that the
+         * reply is sent by the new manager once the reexecution succeeded. The call is answered now,
+         * hence clear that too, and don't reply a second time later. */
+        if (m->pending_reload_message_vl == m->pending_reexecute_message_vl)
+                m->pending_reload_message_vl = sd_varlink_unref(m->pending_reload_message_vl);
+
+        m->pending_reexecute_message_vl = sd_varlink_unref(m->pending_reexecute_message_vl);
+}
+
+int manager_varlink_claim_connection(Manager *m, const char *id, sd_varlink_server_claim_flags_t flags, sd_varlink **ret) {
+        int r;
+
+        assert(m);
+        assert(id);
+        assert(ret);
+
+        /* Picks up a connection with a pending method call that was passed to us across reexecution. The
+         * callers handle failure gracefully, but we log about it here. */
+
+        if (!m->varlink_server)
+                return log_warning_errno(SYNTHETIC_ERRNO(ESRCH), "Varlink server not set up, cannot claim connection '%s'.", id);
+
+        r = sd_varlink_server_claim_connection(m->varlink_server, id, flags, ret);
+        if (r == -ESRCH) /* Expected, the connection might have been closed before serialization */
+                return log_debug_errno(r, "Varlink connection '%s' not passed on across reexecution, ignoring.", id);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to claim varlink connection '%s', ignoring: %m", id);
+
+        return 0;
+}
+
+void manager_varlink_disconnect_unclaimed(Manager *m) {
+        sd_varlink_server *s;
+        int r;
+
+        assert(m);
+
+        FOREACH_ARGUMENT(s, m->varlink_server, m->metrics_varlink_server) {
+                if (!s)
+                        continue;
+
+                r = sd_varlink_server_disconnect_unclaimed_connections(s);
+                if (r > 0)
+                        log_debug("Disconnected %i varlink connections with pending method calls nobody claimed after deserialization.", r);
+        }
 }

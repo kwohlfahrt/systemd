@@ -11,11 +11,14 @@
 
 #include "alloc-util.h"
 #include "ansi-color.h"
+#include "ansi-seq.h"
+#include "csi-inband-resize.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "glyph-util.h"
+#include "hexdecoct.h"
 #include "hostname-setup.h"
 #include "io-util.h"
 #include "log.h"
@@ -37,7 +40,10 @@ typedef enum AnsiColorState  {
         _ANSI_COLOR_STATE_INVALID = -EINVAL,
 } AnsiColorState;
 
-#define ANSI_SEQUENCE_LENGTH_MAX 192U
+/* Use the same limit as the AnsiSeqParser, so that a sequence that ptybrokerd considers too long (and hence
+ * passes on unscathed) is considered too long by us as well, and vice versa. Note that for CSI sequences
+ * the limit covers the parameter and intermediate bytes plus the final byte. */
+#define ANSI_SEQUENCE_LENGTH_MAX ANSI_SEQ_STRING_MAX
 #define ANSI_SEQUENCE_WINDOW_TITLE_MAX 128U
 
 assert_cc(ANSI_SEQUENCE_LENGTH_MAX > ANSI_SEQUENCE_WINDOW_TITLE_MAX);
@@ -110,9 +116,49 @@ struct PTYForward {
 
         char *title;           /* Window title to show by default */
         char *title_prefix;    /* If terminal client overrides window title, prefix this string */
+
+        /* CSI 2048/48 (in-band window resize notifications): we implement the terminal side towards
+         * the pty, i.e. we handle the requests to enable/disable/query the mode arriving via the master fd,
+         * and generate size reports into the input stream while it is enabled. */
+        bool inband_resize_enabled;               /* CSI 2048/48 is currently enabled */
+        char *inband_resize_report;               /* A generated size report, waiting for insertion into the input stream */
+
+        /* Tracks ANSI sequence boundaries on the input (stdin → master) stream, so that we know where
+         * generated replies (CSI 2048/48, terminal query replies) may be inserted safely */
+        AnsiSeqParser input_parser;
+
+        /* PTY_FORWARD_ANSWER_QUERIES: we answer terminal queries arriving via the master fd ourselves */
+        AnsiSeqParser query_parser;               /* Tracks + captures sequences on the output (master → stdout) stream */
+        size_t query_start;                       /* Offset in out_buffer where the sequence query_parser is currently in started */
+
+        /* Generated replies to queries (CSI 2048/48 DECRPM replies, terminal query replies), in the order
+         * the queries were made, waiting for insertion into the input stream */
+        char *replies;
+        char *term;                               /* The terminfo name to report via XTGETTCAP, if any */
+        bool cursor_known;                        /* Whether we know the cursor position for sure (directly after CUP) */
+        unsigned cursor_row, cursor_column;
 };
 
+/* Our reply to DA1: VT220 with ANSI color */
+#define DA1_REPLY "\x1B[?62;22c"
+
 #define ESCAPE_USEC (1*USEC_PER_SEC)
+
+/* Maximum size of the replies we keep queued for insertion into the input stream. Must be well below
+ * LINE_MAX, since the queue is inserted into the input buffer in one go. */
+#define REPLIES_MAX 1024U
+
+static int pty_forward_add_defer(PTYForward *f);
+
+static void pty_forward_inband_resize_disable(PTYForward *f) {
+        assert(f);
+
+        /* Disables CSI 2048/48, and drops a size report that has been generated already but not been
+         * inserted into the input stream yet. A pending DECRPM reply is left in place however: it answers a
+         * query made before, and the query deserves its answer. */
+        f->inband_resize_enabled = false;
+        f->inband_resize_report = mfree(f->inband_resize_report);
+}
 
 static void pty_forward_disconnect(PTYForward *f) {
 
@@ -152,7 +198,7 @@ static void pty_forward_disconnect(PTYForward *f) {
                 }
 
                 /* STDIN/STDOUT should not be non-blocking normally, so let's reset it */
-                (void) fd_nonblock(f->output_fd, false);
+                (void) fd_nonblock(f->output_fd, /* nonblock= */ false);
 
                 if (f->close_output_fd)
                         f->output_fd = safe_close(f->output_fd);
@@ -162,7 +208,7 @@ static void pty_forward_disconnect(PTYForward *f) {
                 if (f->saved_stdin)
                         (void) tcsetattr(f->input_fd, TCSANOW, &f->saved_stdin_attr);
 
-                (void) fd_nonblock(f->input_fd, false);
+                (void) fd_nonblock(f->input_fd, /* nonblock= */ false);
                 if (f->close_input_fd)
                         f->input_fd = safe_close(f->input_fd);
         }
@@ -178,6 +224,14 @@ static void pty_forward_disconnect(PTYForward *f) {
         f->csi_sequence = mfree(f->csi_sequence);
         f->osc_sequence = mfree(f->osc_sequence);
         f->ansi_color_state = _ANSI_COLOR_STATE_INVALID;
+
+        pty_forward_inband_resize_disable(f);
+        ansi_seq_parser_done(&f->input_parser);
+
+        f->replies = mfree(f->replies);
+        f->cursor_known = false;
+        ansi_seq_parser_done(&f->query_parser);
+        f->query_start = 0;
 }
 
 static int pty_forward_done(PTYForward *f, int rcode) {
@@ -459,6 +513,436 @@ static int insert_window_title_fix(PTYForward *f, size_t offset) {
         return insert_string(f, offset, joined);
 }
 
+static int pty_forward_flush_reply(PTYForward *f, char **reply) {
+        assert(f);
+        assert(reply);
+
+        /* Inserts a pending generated reply into the input stream, but only at a safe position, i.e. never
+         * in the middle of an ANSI sequence the terminal is currently sending us, and only if there's room
+         * in the input buffer. Returns > 0 if the reply was inserted (and freed), 0 otherwise. */
+
+        if (!*reply)
+                return 0;
+
+        if (f->input_parser.state != ANSI_SEQ_STATE_GROUND)
+                return 0;
+
+        size_t l = strlen(*reply);
+        if (f->in_buffer_full + l > LINE_MAX)
+                return 0;
+
+        memcpy(f->in_buffer + f->in_buffer_full, *reply, l);
+        f->in_buffer_full += l;
+
+        *reply = mfree(*reply);
+        return 1;
+}
+
+static int pty_forward_flush_replies(PTYForward *f) {
+        int r, ret;
+
+        assert(f);
+
+        /* Inserts the pending generated replies into the input stream, if possible. Replies to queries go
+         * first (in the order the queries were made), so that a CSI 2048/48 size report is never ahead of a
+         * DECRPM reply. */
+
+        ret = r = pty_forward_flush_reply(f, &f->replies);
+        if (r < 0 || f->replies)
+                return r;
+
+        r = pty_forward_flush_reply(f, &f->inband_resize_report);
+        if (r < 0)
+                return r;
+
+        return ret > 0 || r > 0;
+}
+
+static int pty_forward_get_winsize(PTYForward *f, struct winsize *ret) {
+        assert(f);
+        assert(ret);
+
+        /* Take the dimensions from the master if we can (it's authoritative: explicitly set dimensions end
+         * up there), with a fallback to the output fd (the master might not be a tty at all, for example
+         * when we are forwarding a monitor stream of ptybrokerd). */
+        if (ioctl(f->master, TIOCGWINSZ, ret) < 0 &&
+            ioctl(f->output_fd, TIOCGWINSZ, ret) < 0)
+                return -errno;
+
+        return 0;
+}
+
+static int pty_forward_inband_resize_maybe_report(PTYForward *f) {
+        int r;
+
+        assert(f);
+
+        /* Generates a size report if CSI 2048/48 is enabled */
+
+        if (!f->inband_resize_enabled)
+                return 0;
+
+        struct winsize ws;
+        r = pty_forward_get_winsize(f, &ws);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to query terminal dimensions, ignoring: %m");
+                return 0;
+        }
+
+        /* If an earlier report is still waiting for insertion into the input stream, it is outdated now,
+         * hence replace it. */
+        _cleanup_free_ char *report = NULL;
+        r = inband_resize_format_report(
+                        &(const InbandResizeReport) {
+                                .lines = ws.ws_row,
+                                .columns = ws.ws_col,
+                                .height_pixels = ws.ws_ypixel,
+                                .width_pixels = ws.ws_xpixel,
+                        },
+                        &report);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to format window size report: %m");
+
+        free_and_replace(f->inband_resize_report, report);
+
+        return pty_forward_flush_replies(f);
+}
+
+static bool pty_forward_answers_queries(PTYForward *f) {
+        assert(f);
+
+        return FLAGS_SET(f->flags, PTY_FORWARD_ANSWER_QUERIES) &&
+                !FLAGS_SET(f->flags, PTY_FORWARD_TRANSPARENT);
+}
+
+static bool pty_forward_query_pending(PTYForward *f) {
+        assert(f);
+
+        /* Returns true if we are in the middle of a sequence that might turn out to be a query we answer,
+         * in which case the output from f->query_start on must be held back, so that we can excise it. */
+
+        return pty_forward_answers_queries(f) && f->query_parser.state != ANSI_SEQ_STATE_GROUND;
+}
+
+static int pty_forward_queue_reply(PTYForward *f, const char *reply) {
+        assert(f);
+        assert(reply);
+
+        /* Queues a reply to a query for insertion into the input stream, after all replies queued
+         * earlier. Returns > 0 if the reply was queued, 0 if it was dropped. */
+
+        /* Safety check: put a limit on the queue, so that a payload flooding us with queries while the
+         * input stream is stalled can't make us grow the queue without bounds. */
+        if (strlen_ptr(f->replies) + strlen(reply) > REPLIES_MAX) {
+                log_debug("Too many pending replies, not answering query.");
+                return 0;
+        }
+
+        if (!strextend(&f->replies, reply))
+                return -ENOMEM;
+
+        return 1;
+}
+
+static int pty_forward_inband_resize_process(PTYForward *f, size_t *i) {
+        int r;
+
+        assert(f);
+        assert(i);
+        assert(*i < f->out_buffer_full);
+
+        /* Checks whether the CSI sequence that just completed at offset *i of the output buffer is a request
+         * regarding CSI 2048/48. If so, consumes it: we implement the terminal side towards the pty, hence
+         * such requests are addressed to us and must not leak to the outer terminal. If the request also
+         * covers other modes, the sequence is rewritten to cover only those. Returns > 0 if the sequence was
+         * consumed (and possibly rewritten), 0 otherwise. */
+
+        if (FLAGS_SET(f->flags, PTY_FORWARD_TRANSPARENT))
+                return 0;
+
+        /* All CSI 2048/48 requests are DEC private mode sequences, hence quickly skip everything else */
+        if (!f->csi_sequence || f->csi_sequence[0] != '?')
+                return 0;
+
+        _cleanup_free_ char *csi = strjoin(f->csi_sequence, CHAR_TO_STR(f->out_buffer[*i]));
+        if (!csi)
+                return -ENOMEM;
+
+        _cleanup_free_ char *remaining = NULL;
+        InbandResizeRequest request;
+        r = inband_resize_parse_request(csi, &request, &remaining);
+        if (r <= 0)
+                return r;
+
+        /* Excise the full sequence from the output buffer: CSI (2 bytes) + parameters + final byte. None of
+         * it can have been flushed yet, since out_buffer_write_len is only advanced outside of ANSI
+         * sequences. */
+        size_t l = 2 + strlen(csi);
+        assert(*i + 1 >= l);
+        size_t begin = *i + 1 - l;
+        assert(f->out_buffer_write_len <= begin);
+
+        memmove(f->out_buffer + begin, f->out_buffer + *i + 1, f->out_buffer_full - *i - 1);
+        f->out_buffer_full -= l;
+        *i = begin - 1; /* NB: this may wrap around to SIZE_MAX if the sequence started the buffer, which the
+                         * caller's loop increment brings back to 0 */
+
+        /* If the query tracker is in the middle of a sequence that started within the excised range, then
+         * hold back output from where the excised range began */
+        if (pty_forward_query_pending(f))
+                f->query_start = MIN(f->query_start, begin);
+
+        if (remaining) {
+                /* Put the request for the other modes back in */
+                _cleanup_free_ char *s = strjoin("\x1B[", remaining);
+                if (!s)
+                        return -ENOMEM;
+
+                r = insert_string(f, begin, s);
+                if (r < 0)
+                        return r;
+
+                *i += r;
+        }
+
+        switch (request) {
+
+        case INBAND_RESIZE_ENABLE:
+                /* As per spec, enabling the mode results in an immediate report, even if it was enabled
+                 * already */
+                f->inband_resize_enabled = true;
+                r = pty_forward_inband_resize_maybe_report(f);
+                if (r < 0)
+                        return r;
+                break;
+
+        case INBAND_RESIZE_DISABLE:
+                pty_forward_inband_resize_disable(f);
+                break;
+
+        case INBAND_RESIZE_QUERY: {
+                _cleanup_free_ char *reply = NULL;
+                r = inband_resize_format_mode_report(
+                                f->inband_resize_enabled ? INBAND_RESIZE_MODE_SET : INBAND_RESIZE_MODE_RESET,
+                                &reply);
+                if (r < 0)
+                        return r;
+
+                /* Queue the reply after any replies to earlier queries still waiting for insertion into
+                 * the input stream, so that replies arrive in order. The request is consumed even if the
+                 * queue is full: it's addressed to us, not to the outer terminal. */
+                r = pty_forward_queue_reply(f, reply);
+                if (r < 0)
+                        return r;
+
+                r = pty_forward_flush_replies(f);
+                if (r < 0)
+                        return r;
+                break;
+        }
+
+        default:
+                assert_not_reached();
+        }
+
+        return 1;
+}
+
+static bool parse_cup_parameters(const char *s, unsigned *ret_row, unsigned *ret_column) {
+        unsigned v[2] = {};
+        size_t k = 0;
+
+        assert(s);
+        assert(ret_row);
+        assert(ret_column);
+
+        /* Parses the payload of a CUP or HVP sequence, i.e. "[<row>][;<column>]H" (or …f). Missing or zero
+         * parameters default to 1. */
+
+        size_t n = strlen(s);
+        if (n == 0 || !IN_SET(s[n-1], 'H', 'f'))
+                return false;
+
+        for (const char *q = s; q < s + n - 1; q++) {
+                if (*q == ';') {
+                        if (++k >= ELEMENTSOF(v))
+                                return false;
+                        continue;
+                }
+
+                int d = undecchar(*q);
+                if (d < 0 || v[k] > (UINT_MAX - d) / 10)
+                        return false;
+
+                v[k] = v[k] * 10 + d;
+        }
+
+        *ret_row = MAX(v[0], 1U);
+        *ret_column = MAX(v[1], 1U);
+        return true;
+}
+
+static int pty_forward_answer_query(PTYForward *f, char introducer, const char *s) {
+        _cleanup_free_ char *reply = NULL;
+        struct winsize ws;
+
+        assert(f);
+        assert(s);
+
+        /* Checks if the sequence that just completed is a terminal query we can answer, and if so, queues
+         * the reply. Returns > 0 if so, in which case the query shall not be forwarded. */
+
+        switch (introducer) {
+
+        case 'P': { /* DCS */
+                const char *p = startswith(s, "+q");
+                if (!p)
+                        return 0;
+
+                /* XTGETTCAP: we only know the "name" capability, and only if we have a terminfo name to
+                 * report. In all other cases we report the capability as unsupported, so that the program
+                 * can apply its fallback logic right away. */
+                if (f->term && ascii_strcasecmp_nn(p, strlen(p), XTGETTCAP_NAME_HEX, STRLEN(XTGETTCAP_NAME_HEX)) == 0) {
+                        _cleanup_free_ char *hex = hexmem(f->term, strlen(f->term));
+                        if (!hex)
+                                return -ENOMEM;
+
+                        reply = strjoin(ANSI_DCS XTGETTCAP_NAME_REPLY, hex, ANSI_ST);
+                } else
+                        reply = strdup(ANSI_DCS "0+r" ANSI_ST);
+                if (!reply)
+                        return -ENOMEM;
+
+                break;
+        }
+
+        case '[': /* CSI */
+                if (streq(s, "18t")) {
+                        /* Report the size of the text area in characters */
+                        if (pty_forward_get_winsize(f, &ws) < 0 || ws.ws_row == 0 || ws.ws_col == 0)
+                                return 0;
+
+                        if (asprintf(&reply, "\x1B[8;%u;%ut", ws.ws_row, ws.ws_col) < 0)
+                                return -ENOMEM;
+
+                } else if (STR_IN_SET(s, "c", "0c")) {
+                        /* DA1 */
+                        reply = strdup(DA1_REPLY);
+                        if (!reply)
+                                return -ENOMEM;
+
+                } else if (streq(s, "6n")) {
+                        /* DSR, cursor position report (CPR). We don't track the cursor position in general,
+                         * hence we can only answer this directly after an absolute cursor positioning, which
+                         * is what programs determining the terminal size do. */
+                        if (!f->cursor_known)
+                                return 0;
+
+                        if (asprintf(&reply, "\x1B[%u;%uR", f->cursor_row, f->cursor_column) < 0)
+                                return -ENOMEM;
+                } else
+                        return 0;
+
+                break;
+
+        default:
+                return 0;
+        }
+
+        return pty_forward_queue_reply(f, reply);
+}
+
+static int pty_forward_query_process(PTYForward *f, size_t *i) {
+        int r;
+
+        assert(f);
+        assert(i);
+        assert(*i < f->out_buffer_full);
+
+        /* Feeds the character at offset *i of the output buffer into our sequence tracker, and if it
+         * completes a terminal query we can answer, answers it and excises the query from the output buffer.
+         * Returns > 0 in that case, 0 otherwise. */
+
+        if (!pty_forward_answers_queries(f))
+                return 0;
+
+        AnsiSeqState previous_state = f->query_parser.state;
+
+        do {
+                r = ansi_seq_parser_feed(&f->query_parser, f->out_buffer[*i]);
+                if (r < 0)
+                        return r;
+                if (r == ANSI_SEQ_EVENT_RESTART) {
+                        /* A string sequence got aborted by an ESC not followed by '\', and that ESC begins
+                         * a new sequence. It precedes the current character, and is still in the buffer,
+                         * since we held back output from where the aborted sequence began. */
+                        assert(*i > 0);
+                        assert(f->out_buffer[*i - 1] == 0x1B);
+                        f->query_start = *i - 1;
+                }
+        } while (ANSI_SEQ_EVENT_NEEDS_REFEED(r));
+
+        if (f->query_parser.state == ANSI_SEQ_STATE_ESC && f->out_buffer[*i] == 0x1B)
+                /* An ESC moving the parser into ESC state always starts a new sequence (possibly after
+                 * aborting the previous one): remember where, so that we can hold back output from there */
+                f->query_start = *i;
+        if (r == ANSI_SEQ_EVENT_TEXT) {
+                /* Regular output moves the cursor, and we don't track where to */
+                f->cursor_known = false;
+                return 0;
+        }
+        if (r != ANSI_SEQ_EVENT_END)
+                return 0;
+
+        char introducer = f->query_parser.introducer;
+        const char *s = ansi_seq_parser_string(&f->query_parser);
+        if (!s) {
+                f->cursor_known = false;
+                return 0;
+        }
+
+        unsigned row, column;
+        if (introducer == '[' && parse_cup_parameters(s, &row, &column)) {
+                /* An absolute cursor positioning: now we know where the cursor is, taking into account
+                 * that it is clamped to the terminal dimensions. */
+                struct winsize ws;
+                if (pty_forward_get_winsize(f, &ws) >= 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+                        f->cursor_known = true;
+                        f->cursor_row = MIN(row, (unsigned) ws.ws_row);
+                        f->cursor_column = MIN(column, (unsigned) ws.ws_col);
+                } else
+                        f->cursor_known = false;
+
+                return 0;
+        }
+
+        r = pty_forward_answer_query(f, introducer, s);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                /* Any other sequence might move the cursor, except for DECSC (save cursor) */
+                if (introducer != '7')
+                        f->cursor_known = false;
+                return 0;
+        }
+
+        /* Excise the full query from the output buffer: introducer (2 bytes) + payload + terminator (for
+         * string sequences: BEL or ST). None of it can have been flushed yet, since out_buffer_write_len is
+         * only advanced outside of ANSI sequences. */
+        size_t l = 2 + strlen(s);
+        if (introducer == 'P')
+                l += previous_state == ANSI_SEQ_STATE_STRING_ESC ? 2 : 1;
+        assert(*i + 1 >= l);
+        size_t begin = *i + 1 - l;
+        assert(f->out_buffer_write_len <= begin);
+
+        memmove(f->out_buffer + begin, f->out_buffer + *i + 1, f->out_buffer_full - *i - 1);
+        f->out_buffer_full -= l;
+        *i = begin - 1; /* NB: this may wrap around to SIZE_MAX if the sequence started the buffer, which the
+                         * caller's loop increment brings back to 0 */
+        return 1;
+}
+
 static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
         int r;
 
@@ -466,6 +950,18 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
         assert(offset <= f->out_buffer_full);
 
         for (size_t i = offset; i < f->out_buffer_full; i++) {
+                r = pty_forward_query_process(f, &i);
+                if (r < 0)
+                        return r;
+                if (r > 0) {
+                        /* The query has been excised, reset the color tracking state machine, which might
+                         * still be in the middle of it. */
+                        f->csi_sequence = mfree(f->csi_sequence);
+                        f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
+                        f->out_buffer_write_len = i + 1;
+                        continue;
+                }
+
                 char c = f->out_buffer[i];
 
                 switch (f->ansi_color_state) {
@@ -498,6 +994,10 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                         return r;
 
                                 i += r;
+
+                                /* A full reset resets all modes, including CSI 2048/48 */
+                                pty_forward_inband_resize_disable(f);
+
                                 f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
                         } else
                                 f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
@@ -509,8 +1009,9 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                 /* If this is a "parameter" or "intermediary" byte (i.e. ranges 0x20…0x2F and
                                  * 0x30…0x3F) then we are still in the CSI sequence */
 
-                                if (strlen_ptr(f->csi_sequence) >= ANSI_SEQUENCE_LENGTH_MAX) {
-                                        /* Safety check: lets not accept unbounded CSI sequences */
+                                if (strlen_ptr(f->csi_sequence) + 1 >= ANSI_SEQUENCE_LENGTH_MAX) {
+                                        /* Safety check: lets not accept unbounded CSI sequences (leave
+                                         * room for the final byte) */
 
                                         f->csi_sequence = mfree(f->csi_sequence);
                                         f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
@@ -534,6 +1035,11 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                                 return r;
 
                                         i += r;
+                                } else {
+                                        /* Maybe a CSI 2048/48 request, which we handle ourselves */
+                                        r = pty_forward_inband_resize_process(f, &i);
+                                        if (r < 0)
+                                                return r;
                                 }
 
                                 f->csi_sequence = mfree(f->csi_sequence);
@@ -594,11 +1100,31 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                         assert_not_reached();
                 }
 
-                if (f->ansi_color_state == ANSI_COLOR_STATE_TEXT)
-                        f->out_buffer_write_len = i + 1;
+                /* Hold back output while we are in the middle of a sequence, so that we can still patch or
+                 * excise it once it is complete. Note that the two state machines track sequences
+                 * independently and hence might disagree on where they begin and end. Hence, never wait
+                 * for both of them to be idle at the same time (which might never happen), but only hold
+                 * back output from where the pending query sequence began. */
+                if (f->ansi_color_state == ANSI_COLOR_STATE_TEXT) {
+                        size_t n = pty_forward_query_pending(f) ? f->query_start : i + 1;
+
+                        assert(n >= f->out_buffer_write_len);
+                        f->out_buffer_write_len = n;
+                }
         }
 
         return 0;
+}
+
+static void pty_forward_master_hangup(PTYForward *f) {
+        assert(f);
+
+        /* The master side is gone: stop all I/O on it */
+
+        f->master_readable = f->master_writable = false;
+        f->master_hangup = true;
+
+        f->master_event_source = sd_event_source_unref(f->master_event_source);
 }
 
 static int do_shovel(PTYForward *f) {
@@ -648,6 +1174,16 @@ static int do_shovel(PTYForward *f) {
         for (;;) {
                 bool did_something = false;
 
+                /* If a generated reply is still waiting for insertion into the input stream, try again
+                 * now: the input sequence tracker might have progressed or the input buffer might have
+                 * drained since we last tried. Do this independently of stdin readability, so that a reply
+                 * is never stuck just because the user doesn't type. */
+                r = pty_forward_flush_replies(f);
+                if (r < 0)
+                        return r;
+                if (r > 0)
+                        did_something = true;
+
                 if (f->stdin_readable && f->in_buffer_full < LINE_MAX) {
 
                         k = read(f->input_fd, f->in_buffer + f->in_buffer_full, LINE_MAX - f->in_buffer_full);
@@ -670,6 +1206,11 @@ static int do_shovel(PTYForward *f) {
                                 f->stdin_event_source = sd_event_source_unref(f->stdin_event_source);
                         } else {
                                 if (!FLAGS_SET(f->flags, PTY_FORWARD_TRANSPARENT)) {
+                                        /* Keep the input ANSI sequence tracker up-to-date, so that we know
+                                         * where generated replies may be inserted safely */
+                                        for (ssize_t j = 0; j < k; j++)
+                                                (void) ansi_seq_parser_feed_harder(&f->input_parser, f->in_buffer[f->in_buffer_full + j]);
+
                                         /* Check if ^] has been pressed three times within one second. If we get this we quit
                                          * immediately. */
                                         RequestOperation q = look_for_escape(f, f->in_buffer + f->in_buffer_full, k);
@@ -697,12 +1238,9 @@ static int do_shovel(PTYForward *f) {
 
                                 if (IN_SET(errno, EAGAIN, EIO))
                                         f->master_writable = false;
-                                else if (IN_SET(errno, EPIPE, ECONNRESET)) {
-                                        f->master_writable = f->master_readable = false;
-                                        f->master_hangup = true;
-
-                                        f->master_event_source = sd_event_source_unref(f->master_event_source);
-                                } else
+                                else if (ERRNO_IS_DISCONNECT(errno))
+                                        pty_forward_master_hangup(f);
+                                else
                                         return log_error_errno(errno, "write(): %m");
                         } else {
                                 assert(f->in_buffer_full >= (size_t) k);
@@ -724,14 +1262,14 @@ static int do_shovel(PTYForward *f) {
 
                                 if (errno == EAGAIN || (errno == EIO && !pty_forward_vhangup_honored(f)))
                                         f->master_readable = false;
-                                else if (IN_SET(errno, EPIPE, ECONNRESET, EIO)) {
-                                        f->master_readable = f->master_writable = false;
-                                        f->master_hangup = true;
-
-                                        f->master_event_source = sd_event_source_unref(f->master_event_source);
-                                } else
+                                else if (errno == EIO || ERRNO_IS_DISCONNECT(errno))
+                                        pty_forward_master_hangup(f);
+                                else
                                         return log_error_errno(errno, "Failed to read from pty master fd: %m");
-                        } else {
+                        } else if (k == 0)
+                                /* EOF on master? (can only really happen if the master wasn't really a master) */
+                                pty_forward_master_hangup(f);
+                        else {
                                 f->read_from_master = true;
                                 size_t scan_index = f->out_buffer_full;
                                 f->out_buffer_full += (size_t) k;
@@ -777,6 +1315,11 @@ static int do_shovel(PTYForward *f) {
                                 memmove(f->out_buffer, f->out_buffer + k, f->out_buffer_full - k);
                                 f->out_buffer_full -= k;
                                 f->out_buffer_write_len -= k;
+
+                                if (pty_forward_query_pending(f)) {
+                                        assert(f->query_start >= (size_t) k);
+                                        f->query_start -= k;
+                                }
                         }
 
                         did_something = true;
@@ -804,13 +1347,13 @@ static int shovel(PTYForward *f) {
 
                 if ((f->out_buffer_write_len <= 0 || f->stdout_hangup) &&
                     (f->in_buffer_full <= 0 || f->master_hangup))
-                        return pty_forward_done(f, 0);
+                        return pty_forward_done(f, /* rcode= */ 0);
         }
 
         /* If we were asked to drain, and there's nothing more to handle from the master, then call the callback
          * too. */
         if (f->drain && drained(f))
-                return pty_forward_done(f, 0);
+                return pty_forward_done(f, /* rcode= */ 0);
 
         return 0;
 }
@@ -884,6 +1427,10 @@ static int on_sigwinch_event(sd_event_source *e, const struct signalfd_siginfo *
         if (ioctl(f->output_fd, TIOCGWINSZ, &ws) >= 0)
                 (void) ioctl(f->master, TIOCSWINSZ, &ws);
 
+        /* If CSI 2048/48 is enabled, report the new size. (ignore failures) */
+        if (pty_forward_inband_resize_maybe_report(f) > 0)
+                (void) pty_forward_add_defer(f);
+
         return 0;
 }
 
@@ -937,7 +1484,7 @@ int pty_forward_new(
                  * read-only mode. */
                 r = RET_NERRNO(fcntl(STDIN_FILENO, F_GETFL));
                 if (r < 0 && r != -EBADF)
-                        return log_debug_errno(errno, "Failed to query stdin flags: %m");
+                        return log_debug_errno(r, "Failed to query stdin flags: %m");
                 if (r == -EBADF || (r & O_ACCMODE_STRICT) == O_WRONLY)
                         flags |= PTY_FORWARD_READ_ONLY;
                 else {
@@ -958,7 +1505,20 @@ int pty_forward_new(
                 .master = -EBADF,
                 .input_fd = -EBADF,
                 .output_fd = -EBADF,
+                .query_parser.capture = true,
         };
+
+        if (FLAGS_SET(flags, PTY_FORWARD_ANSWER_QUERIES)) {
+                /* Report our own $TERM as terminfo name, if we have a meaningful one. Note that
+                 * nspawn/vmspawn tell the payload TERM=dumb if terminal_is_dumb() is true (e.g. because
+                 * our output is piped), hence don't claim anything else in that case. */
+                const char *t = getenv("TERM");
+                if (term_env_valid(t) && !terminal_is_dumb()) {
+                        r = strdup_to(&f->term, t);
+                        if (r < 0)
+                                return r;
+                }
+        }
 
         if (event)
                 f->event = sd_event_ref(event);
@@ -977,19 +1537,16 @@ int pty_forward_new(
                  * them. This has two advantages: when we are killed abruptly the stdin/stdout fds won't be
                  * left in O_NONBLOCK state for the next process using them. In addition, if some process
                  * running in the background wants to continue writing to our stdout it can do so without
-                 * being confused by O_NONBLOCK.
-                 * We keep O_APPEND (if present) on the output FD and (try to) keep current file position on
-                 * both input and output FD (principle of least surprise).
-                 */
+                 * being confused by O_NONBLOCK. Regular file output is dup'ed instead, to keep the file offset
+                 * shared with the caller. */
 
-                f->input_fd = fd_reopen_propagate_append_and_position(
-                                STDIN_FILENO, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                f->input_fd = fd_dup_or_reopen_stdio_nonblock(STDIN_FILENO, O_RDONLY);
                 if (f->input_fd < 0) {
                         /* Handle failures gracefully, after all certain fd types cannot be reopened
                          * (sockets, …) */
                         log_debug_errno(f->input_fd, "Failed to reopen stdin, using original fd: %m");
 
-                        r = fd_nonblock(STDIN_FILENO, true);
+                        r = fd_nonblock(STDIN_FILENO, /* nonblock= */ true);
                         if (r < 0)
                                 return r;
 
@@ -997,12 +1554,11 @@ int pty_forward_new(
                 } else
                         f->close_input_fd = true;
 
-                f->output_fd = fd_reopen_propagate_append_and_position(
-                                STDOUT_FILENO, O_WRONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                f->output_fd = fd_dup_or_reopen_stdio_nonblock(STDOUT_FILENO, O_WRONLY);
                 if (f->output_fd < 0) {
                         log_debug_errno(f->output_fd, "Failed to reopen stdout, using original fd: %m");
 
-                        r = fd_nonblock(STDOUT_FILENO, true);
+                        r = fd_nonblock(STDOUT_FILENO, /* nonblock= */ true);
                         if (r < 0)
                                 return r;
 
@@ -1011,7 +1567,7 @@ int pty_forward_new(
                         f->close_output_fd = true;
         }
 
-        r = fd_nonblock(master, true);
+        r = fd_nonblock(master, /* nonblock= */ true);
         if (r < 0)
                 return r;
 
@@ -1115,6 +1671,7 @@ PTYForward* pty_forward_free(PTYForward *f) {
         free(f->background_color);
         free(f->title);
         free(f->title_prefix);
+        free(f->term);
 
         return mfree(f);
 }
@@ -1181,9 +1738,11 @@ int pty_forward_set_priority(PTYForward *f, int64_t priority) {
                         return r;
         }
 
-        r = sd_event_source_set_priority(f->stdout_event_source, priority);
-        if (r < 0)
-                return r;
+        if (f->stdout_event_source) {
+                r = sd_event_source_set_priority(f->stdout_event_source, priority);
+                if (r < 0)
+                        return r;
+        }
 
         r = sd_event_source_set_priority(f->master_event_source, priority);
         if (r < 0)
@@ -1231,6 +1790,10 @@ int pty_forward_set_width_height(PTYForward *f, unsigned width, unsigned height)
 
         /* Make sure we ignore SIGWINCH window size events from now on */
         f->sigwinch_event_source = sd_event_source_unref(f->sigwinch_event_source);
+
+        /* If CSI 2048/48 is enabled, report the new size */
+        if (pty_forward_inband_resize_maybe_report(f) > 0)
+                (void) pty_forward_add_defer(f);
 
         return 0;
 }

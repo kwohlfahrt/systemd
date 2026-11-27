@@ -48,7 +48,6 @@ See [reporting of security vulnerabilities](https://systemd.io/SECURITY).
 * If the pull request stalls without review, post a ping in a comment after some time has passed.
   We are always short on reviewer time, and pull requests which haven't seen any recent activity can be easily forgotten.
 * Github will automatically add the `please-review` label when a pull request is opened or updated.
-  If you need more information after a review, you can comment `/please-review` on the pull request to have Github add the `please-review` label to the pull request.
 
 ## Policy on the use of Large Language Models (LLMs) and AI tooling
 
@@ -87,6 +86,29 @@ follows the project guidelines.
    including any AI-generated code, is compatible with the project's
    license as documented in
    [`LICENSES/README.md`](https://github.com/systemd/systemd/blob/main/LICENSES/README.md).
+
+<details>
+<summary>For the maintainers: template messages for rule violation</summary>
+
+#### First violation
+
+```
+It appears that you are using a Large Language Model (LLM) or other generative AI tool in violation of [systemd's Policy on the use of LLMs and AI tooling](https://github.com/systemd/systemd/blob/main/docs/CONTRIBUTING.md#policy-on-the-use-of-large-language-models-llms-and-ai-tooling). Please read the policy carefully.
+
+Specifically, we do not allow the use of such tools to communicate on your behalf. You must speak for yourself. It is not permissible to let such tools open pull requests or issues, leave or respond to comments, or post to the systemd-devel mailing list.
+
+This is your first violation. In accordance to the policy, you are receiving this warning. The next violation of this rule will result in a ban from participating in the systemd project.
+```
+
+#### Second violation
+
+```
+It appears that you are using a Large Language Model (LLM) or other generative AI tool in violation of [systemd's Policy on the use of LLMs and AI tooling](https://github.com/systemd/systemd/blob/main/docs/CONTRIBUTING.md#policy-on-the-use-of-large-language-models-llms-and-ai-tooling). Specifically, we do not allow the use of such tools to communicate on your behalf.
+
+This is your second violation. In accordance to the policy, you are banned from the systemd project.
+```
+
+</details>
 
 ## Reviewing Pull Requests
 

@@ -21,11 +21,17 @@ at_exit() {
     rm -rf /home/testuser/.local/state/machines/wamms ||:
     rm -rf /home/testuser/.local/state/machines/inodetest ||:
     rm -rf /home/testuser/.local/state/machines/inodetest2 ||:
+    rm -rf /home/testuser/.local/state/machines/unreadable ||:
+    rm -rf /home/testuser/.local/state/machines/unreadablestack.mstack ||:
     rm -rf /home/testuser/.local/state/machines/mangletest ||:
+    rm -rf /home/testuser/.local/state/machines/devnodetest ||:
     rm -rf /home/testuser/.local/state/machines/fdstore ||:
-    machinectl terminate zurps ||:
+    # If the system machined loads zurps with the wrong unit after the restart, "machinectl terminate zurps"
+    # stops the user manager of testuser. Stop the nspawn service of testuser directly instead.
+    systemctl --user --machine testuser@ stop systemd-nspawn@zurps.service ||:
     machinectl terminate exfiltrate ||:
     systemctl --user --machine testuser@ stop exfiltrate.service ||:
+    systemctl --user --machine testuser@ stop nsresourced-bind.service ||:
     systemctl --user --machine testuser@ stop systemd-nspawn@fdstore.service ||:
     rm -f /etc/polkit-1/rules.d/registermachinetest.rules
     machinectl terminate nurps ||:
@@ -36,7 +42,12 @@ at_exit() {
     rm -f /usr/share/polkit-1/rules.d/registermachinetest.rules
     rm -rf /var/tmp/mangletest
     rm -f /var/tmp/mangletest.tar.gz
-    rm -f /shouldnotwork
+    rm -rf /var/tmp/devnodetest
+    rm -f /var/tmp/devnodetest.tar
+    rm -f /shouldnotwork /tmp/foo /tmp/nsresourced-bind
+    if [[ -n "${nsresourced_bind_cg:-}" ]]; then
+        rmdir "$nsresourced_bind_cg" 2>/dev/null ||:
+    fi
     loginctl disable-linger testuser
 }
 
@@ -69,12 +80,41 @@ loginctl enable-linger testuser
 
 run0 -u testuser mkdir -p .config/systemd/nspawn/
 run0 -u testuser -i "echo -e \"[Exec]\nKillSignal=SIGKILL\n\" >.config/systemd/nspawn/zurps.nspawn"
+run0 -u testuser systemctl start --user systemd-machined.socket
 run0 -u testuser systemctl start --user systemd-nspawn@zurps.service
 
+user_unit="user@$(id -u testuser).service"
+subgroup=machine.slice/systemd-nspawn@zurps.service/payload
 machinectl status zurps
 machinectl status zurps | grep "UID:" | grep "$(id -u testuser)"
-machinectl status zurps | grep "Unit: user@" | grep "$(id -u testuser)"
-machinectl status zurps | grep "Subgroup: machine.slice/systemd-nspawn@zurps.service/payload"
+machinectl status zurps | grep -F "Unit: $user_unit"
+machinectl status zurps | grep -F "Subgroup: $subgroup"
+
+# After a restart, the system machined must still track zurps in a subgroup of the user manager unit. It must
+# not treat the whole user manager unit as the unit of zurps.
+user_manager_pid=$(systemctl show -P MainPID "$user_unit")
+leader=$(machinectl show -P Leader zurps)
+assert_gt "$user_manager_pid" 0
+assert_gt "$leader" 0
+systemctl restart systemd-machined.service
+
+get_machine_by_pid() {
+    busctl call org.freedesktop.machine1 /org/freedesktop/machine1 \
+        org.freedesktop.machine1.Manager GetMachineByPID u "$1"
+}
+
+assert_eq "$(systemctl show -P MainPID "$user_unit")" "$user_manager_pid"
+assert_eq "$(get_machine_by_pid "$leader")" 'o "/org/freedesktop/machine1/machine/zurps"'
+run_and_grep "PID $user_manager_pid does not belong to any known machine" \
+    assert_fail get_machine_by_pid "$user_manager_pid"
+assert_eq "$(machinectl show -P Unit zurps)" "$user_unit"
+assert_eq "$(machinectl show -P Subgroup zurps)" "$subgroup"
+
+# The per-user machined refers to the unit in the user's service manager
+run0 -u testuser machinectl --user status zurps
+run0 -u testuser machinectl --user status zurps | grep "Unit: systemd-nspawn@zurps.service"
+run0 -u testuser machinectl --user status zurps | grep "Subgroup: payload"
+run0 -u testuser machinectl --user kill --signal=SIGCONT zurps
 machinectl terminate zurps
 
 (! run0 -u testuser systemctl is-active --user systemd-nspawn@zurps.service)
@@ -191,6 +231,88 @@ exfiltrate_output="$(run0 -u testuser \
 (! echo "$exfiltrate_output" | grep "FOO=bar" >/dev/null)
 systemctl --user --machine testuser@ stop exfiltrate.service
 
+# Verify that nsresourced refuses to follow bind mounts over cgroup attributes in the caller's mount namespace.
+touch /tmp/nsresourced-bind
+chmod 600 /tmp/nsresourced-bind
+assert_eq "$(stat -c '%u:%g:%a' /tmp/nsresourced-bind)" "0:0:600"
+
+run0 -u testuser \
+    systemd-run --user --unit nsresourced-bind.service --service-type notify \
+        --property NotifyAccess=all --property Delegate=yes --property DelegateSubgroup=supervisor \
+        unshare --user \
+            varlinkctl --exec call \
+                --push-fd=/proc/self/ns/user \
+                /run/systemd/io.systemd.NamespaceResource \
+                io.systemd.NamespaceResource.AllocateUserRange \
+                '{"name":"cgbind","mangleName":true,"size":65536,"userNamespaceFileDescriptor":0}' \
+                -- sleep infinity
+userns_pid="$(systemctl --machine testuser@.host show --user -P MainPID nsresourced-bind.service)"
+assert_gt "$userns_pid" 0
+
+service_cg="$(systemctl --machine testuser@.host show --user -P ControlGroup nsresourced-bind.service)"
+nsresourced_bind_cg="/sys/fs/cgroup${service_cg:?}/nsresourced-bind"
+run0 -u testuser mkdir "$nsresourced_bind_cg"
+
+# Cross-filesystem bind mount over cgroup.procs must be rejected without touching the target file or cgroup.
+run0 --pipe -u testuser \
+    bash -euxo pipefail -c '
+        exec 3<"/proc/$1/ns/user"
+        unshare --map-root-user --user --mount \
+            bash -euxo pipefail -c '\''
+                mount --bind /tmp/nsresourced-bind "$1/cgroup.procs"
+                varlinkctl call --graceful=org.varlink.service.InvalidParameter \
+                    --push-fd=3 \
+                    --push-fd="$1" \
+                    /run/systemd/io.systemd.NamespaceResource \
+                    io.systemd.NamespaceResource.AddControlGroupToUserNamespace \
+                    "{\"userNamespaceFileDescriptor\":0,\"controlGroupFileDescriptor\":1}" |
+                    jq -e ".parameter == \"controlGroupFileDescriptor\"" >/dev/null
+            '\'' _ "$2"
+    ' _ "$userns_pid" "$nsresourced_bind_cg"
+assert_eq "$(stat -c '%u:%g:%a' /tmp/nsresourced-bind)" "0:0:600"
+assert_eq "$(stat -c '%u' "$nsresourced_bind_cg")" "$(id -u testuser)"
+
+# Same-filesystem bind mount (another cgroupfs file with the same st_dev) must also be rejected.
+run0 --pipe -u testuser \
+    bash -euxo pipefail -c '
+        exec 3<"/proc/$1/ns/user"
+        unshare --map-root-user --user --mount \
+            bash -euxo pipefail -c '\''
+                mount --bind /sys/fs/cgroup/cgroup.procs "$1/cgroup.procs"
+                varlinkctl call --graceful=org.varlink.service.InvalidParameter \
+                    --push-fd=3 \
+                    --push-fd="$1" \
+                    /run/systemd/io.systemd.NamespaceResource \
+                    io.systemd.NamespaceResource.AddControlGroupToUserNamespace \
+                    "{\"userNamespaceFileDescriptor\":0,\"controlGroupFileDescriptor\":1}" |
+                    jq -e ".parameter == \"controlGroupFileDescriptor\"" >/dev/null
+            '\'' _ "$2"
+    ' _ "$userns_pid" "$nsresourced_bind_cg"
+assert_eq "$(stat -c '%u:%g' /sys/fs/cgroup/cgroup.procs)" "0:0"
+assert_eq "$(stat -c '%u' "$nsresourced_bind_cg")" "$(id -u testuser)"
+
+# Without a bind mount, delegating the same cgroup must still succeed.
+run0 --pipe -u testuser \
+    bash -euxo pipefail -c '
+        varlinkctl call \
+            --push-fd="/proc/$1/ns/user" \
+            --push-fd="$2" \
+            /run/systemd/io.systemd.NamespaceResource \
+            io.systemd.NamespaceResource.AddControlGroupToUserNamespace \
+            "{\"userNamespaceFileDescriptor\":0,\"controlGroupFileDescriptor\":1}"
+    ' _ "$userns_pid" "$nsresourced_bind_cg"
+mapped_uid="$(awk '$1 == 0 { print $2 }' "/proc/$userns_pid/uid_map")"
+mapped_gid="$(awk '$1 == 0 { print $2 }' "/proc/$userns_pid/gid_map")"
+assert_eq "$(stat -c '%u:%g:%a' "$nsresourced_bind_cg")" "$mapped_uid:$mapped_gid:755"
+assert_eq "$(stat -c '%u:%g:%a' "$nsresourced_bind_cg/cgroup.procs")" "$mapped_uid:$mapped_gid:644"
+assert_eq "$(stat -c '%u:%g:%a' "$nsresourced_bind_cg/cgroup.subtree_control")" "$mapped_uid:$mapped_gid:644"
+assert_eq "$(stat -c '%u:%g:%a' "$nsresourced_bind_cg/cgroup.threads")" "$mapped_uid:$mapped_gid:644"
+assert_eq "$(stat -c '%u:%g:%a' /tmp/nsresourced-bind)" "0:0:600"
+
+systemctl --user --machine testuser@ stop nsresourced-bind.service
+rmdir "$nsresourced_bind_cg" 2>/dev/null ||:
+rm -f /tmp/nsresourced-bind
+
 run0 -u testuser mkdir /var/tmp/image-tar
 run0 -u testuser importctl --user export-tar zurps /var/tmp/image-tar/kurps.tar.gz -m
 run0 -u testuser importctl --user import-tar /var/tmp/image-tar/kurps.tar.gz -m
@@ -304,6 +426,24 @@ chown foreign-4711:foreign-4711 /home/testuser/.local/state/machines/inodetest/s
 run0 -u testuser machinectl --user remove inodetest
 run0 -u testuser machinectl --user remove inodetest2
 
+# Foreign-owned directories that the user may not read can be removed too, both as the image itself, and
+# below an image that the user owns (here the rw/ directory of an .mstack, which uses the former as layer),
+# also if they aren't writable by their owner
+for d in unreadable unreadablestack.mstack/rw; do
+    mkdir -p "/home/testuser/.local/state/machines/$d/sub"
+    touch "/home/testuser/.local/state/machines/$d/sub/file"
+    chown -R foreign-0:foreign-0 "/home/testuser/.local/state/machines/$d"
+    chmod 0700 "/home/testuser/.local/state/machines/$d"
+    chmod 0500 "/home/testuser/.local/state/machines/$d/sub"
+done
+chown testuser:testuser /home/testuser/.local/state/machines/unreadablestack.mstack
+ln -s ../unreadable /home/testuser/.local/state/machines/unreadablestack.mstack/layer@0
+run0 -u testuser machinectl --user remove unreadablestack
+test ! -e /home/testuser/.local/state/machines/unreadablestack.mstack
+test -e /home/testuser/.local/state/machines/unreadable/sub/file
+run0 -u testuser machinectl --user remove unreadable
+test ! -e /home/testuser/.local/state/machines/unreadable
+
 # Test tree mangling (i.e. moving the root dir one level up on extract)
 mkdir -p /var/tmp/mangletest/mangletest-0.1/usr/lib
 echo "ID=brumm" >/var/tmp/mangletest/mangletest-0.1/usr/lib/os-release
@@ -311,16 +451,42 @@ tar -C /var/tmp/mangletest/ -cvzf /var/tmp/mangletest.tar.gz mangletest-0.1
 run0 --pipe -u testuser importctl -m --user import-tar /var/tmp/mangletest.tar.gz
 cmp /var/tmp/mangletest/mangletest-0.1/usr/lib/os-release /home/testuser/.local/state/machines/mangletest/usr/lib/os-release
 
+# Character and block device nodes are skipped when unpacking in user mode, along with the hardlinks to them,
+# including 0:0 character devices. FIFOs need no privileges and are still unpacked.
+mkdir -p /var/tmp/devnodetest/usr/lib /var/tmp/devnodetest/dev
+echo "ID=devnode" >/var/tmp/devnodetest/usr/lib/os-release
+mknod /var/tmp/devnodetest/dev/console c 5 1
+ln /var/tmp/devnodetest/dev/console /var/tmp/devnodetest/dev/console.hard
+mknod /var/tmp/devnodetest/dev/loop0 b 7 0
+mknod /var/tmp/devnodetest/dev/whiteout c 0 0
+mkfifo /var/tmp/devnodetest/dev/initctl
+# GNU tar doesn't record hardlinks between device nodes, hence generate the archive ourselves and check that
+# it really contains one. Our own archiver leaves out FIFOs on the other hand, hence append that one with
+# GNU tar.
+systemd-dissect --make-archive /var/tmp/devnodetest /var/tmp/devnodetest.tar
+tar -C /var/tmp/devnodetest -rf /var/tmp/devnodetest.tar ./dev/initctl
+tar -tvf /var/tmp/devnodetest.tar | grep -E 'dev/console(\.hard)? link to (\./)?dev/console' >/dev/null
+tar -tvf /var/tmp/devnodetest.tar | grep 'dev/initctl' >/dev/null
+# The archive is only readable by root, hence pass it via stdin.
+run0 --pipe -u testuser importctl -m --user import-tar - devnodetest </var/tmp/devnodetest.tar
+cmp /var/tmp/devnodetest/usr/lib/os-release /home/testuser/.local/state/machines/devnodetest/usr/lib/os-release
+test ! -e /home/testuser/.local/state/machines/devnodetest/dev/console
+test ! -e /home/testuser/.local/state/machines/devnodetest/dev/console.hard
+test ! -e /home/testuser/.local/state/machines/devnodetest/dev/loop0
+test ! -e /home/testuser/.local/state/machines/devnodetest/dev/whiteout
+test -p /home/testuser/.local/state/machines/devnodetest/dev/initctl
+run0 -u testuser machinectl --user remove devnodetest
+
 # Verify the fd-store preservation chain works end-to-end across:
 #   payload (inside container) -> systemd-nspawn (user manager) -> user manager
 #   -> system PID 1 (user@<UID>.service fd store)
 # Then restart the nspawn service and verify the inner payload actually
 # receives the preserved fds back via LISTEN_FDS, with their original content.
+
+dummy_container_has /usr/bin/test-fdstore || exit 77
+
 create_dummy_container /home/testuser/.local/state/machines/fdstore
-if [[ ! -x /home/testuser/.local/state/machines/fdstore/usr/bin/test-fdstore ]]; then
-    echo >&2 "test-fdstore not available in the minimal container, skipping fdstore tests"
-    exit 0
-fi
+
 # The container init execs the helper directly so the FDSTORE notification is
 # sent from PID 1 (nspawn rejects notify messages from anyone but the inner
 # payload's init). The helper itself execs sleep on success to keep the
@@ -342,13 +508,19 @@ run0 -u testuser mkdir -p .config/systemd/nspawn/
 run0 -u testuser -i "cat >.config/systemd/nspawn/fdstore.nspawn <<EOF
 [Exec]
 KillSignal=SIGTERM
+NotifyReady=yes
 EOF"
 
 run0 -u testuser mkdir -p ".config/systemd/user/systemd-nspawn@fdstore.service.d/"
 run0 -u testuser -i "cat >.config/systemd/user/systemd-nspawn@fdstore.service.d/fdstore.conf <<EOF
+[Unit]
+StartLimitIntervalSec=0
+
 [Service]
 FileDescriptorStoreMax=8
 FileDescriptorStorePreserve=on-success
+NotifyAccess=all
+ExecReload=/bin/sh -c 'exec systemd-notify --fd=3 --fdname=nspawn-only 3</dev/null'
 EOF"
 run0 -u testuser systemctl --user daemon-reload
 
@@ -366,6 +538,33 @@ timeout 30s bash -c \
     "until [[ \"\$(systemctl show -P NFileDescriptorStore user@${TESTUSER_UID}.service)\" -ge 2 ]]; do sleep 0.5; done"
 n_user_at_fds=$(systemctl show -P NFileDescriptorStore "user@${TESTUSER_UID}.service")
 test "${n_user_at_fds}" -ge 2
+
+# user@ collects all user units' stores. Both units deliberately use the same FDNAME, so cleaning
+# one must remove only its indexed upstream copies, preserving the other unit's entries in user@.
+for name in clean keep; do
+    run0 -u testuser sh -c 'echo "$1" >"/home/testuser/fdstore-$1"' sh "$name"
+    run0 -u testuser systemd-run --user --wait --unit="fdstore-$name.service" \
+        -p Type=oneshot -p FileDescriptorStoreMax=1 -p FileDescriptorStorePreserve=yes \
+        /bin/sh -c 'exec systemd-notify --fd=3 --fdname=stored 3<"$1"' sh "/home/testuser/fdstore-$name"
+    assert_eq "$(run0 -u testuser systemctl --user show -P NFileDescriptorStore "fdstore-$name.service")" 1
+    timeout 30s bash -c \
+        'until systemd-analyze fdstore "$1" --json=short | jq -e --arg path "$2" "any(.[]; .path == \$path)"; do sleep 0.5; done' \
+        _ "user@${TESTUSER_UID}.service" "/home/testuser/fdstore-$name"
+done
+
+for name in clean keep; do
+    run0 -u testuser systemctl --user clean "fdstore-$name.service" --what=fdstore
+    timeout 30s bash -c \
+        'until systemd-analyze fdstore "$1" --json=short | jq -e --arg path "$2" "all(.[]; .path != \$path)"; do sleep 0.5; done' \
+        _ "user@${TESTUSER_UID}.service" "/home/testuser/fdstore-$name"
+
+    if [[ "$name" == clean ]]; then
+        assert_eq "$(run0 -u testuser systemctl --user show -P NFileDescriptorStore fdstore-keep.service)" 1
+        systemd-analyze fdstore "user@${TESTUSER_UID}.service" --json=short |
+            jq -e 'any(.[]; .path == "/home/testuser/fdstore-keep")'
+    fi
+done
+run0 -u testuser rm /home/testuser/fdstore-clean /home/testuser/fdstore-keep
 
 # 3) Stop the nspawn service: payload is gone but FileDescriptorStorePreserve=on-success
 # must keep the fds in the user-side fdstore (and propagated copy in PID 1).
@@ -392,6 +591,58 @@ timeout 30s bash -c \
     "until systemctl is-active 'user@${TESTUSER_UID}.service' >/dev/null; do sleep 0.5; done"
 run0 -u testuser systemctl --user start systemd-nspawn@fdstore.service
 run0 -u testuser systemctl is-active --user systemd-nspawn@fdstore.service
+
+# A payload wipe must remove restored and newly forwarded descriptors without removing unrelated entries.
+run0 -u testuser systemctl --user reload systemd-nspawn@fdstore.service
+assert_eq "$(run0 -u testuser systemctl --user show -P NFileDescriptorStore systemd-nspawn@fdstore.service)" 3
+
+timeout 30s bash -o pipefail -c \
+    'until systemd-analyze fdstore "$1" --json=short | jq -e "[.[].path] | contains([\"/memfd:test-fd-a (deleted)\", \"/memfd:test-fd-b (deleted)\"])"; do sleep 0.5; done' \
+    _ "user@${TESTUSER_UID}.service"
+
+for commands in "check wipe=missing*" "check wipe=" "check wipe=1" "check wipe=test-fd-" \
+                "check wipe=test-fd-[[:alpha:]]" "check wipe=test-fd-[a]" "wipe=test-fd-?" "store wipe=test-fd-[a-z]" \
+                "store wipe=*" "wipe"; do
+    case "$commands" in
+        "check wipe=missing*"|"check wipe="|"check wipe=1"|"check wipe=test-fd-"|"check wipe=test-fd-[[:alpha:]]")
+            n_fds=3
+            names='["nspawn-only", "payload-test-fd-a", "payload-test-fd-b"]'
+            paths='["/memfd:test-fd-a (deleted)", "/memfd:test-fd-b (deleted)"]'
+            ;;
+        "check wipe=test-fd-[a]")
+            n_fds=2
+            names='["nspawn-only", "payload-test-fd-b"]'
+            paths='["/memfd:test-fd-b (deleted)"]'
+            ;;
+        *)
+            n_fds=1
+            names='["nspawn-only"]'
+            paths='[]'
+            ;;
+    esac
+
+    cat >/home/testuser/.local/state/machines/fdstore/sbin/init <<EOF
+#!/usr/bin/env bash
+set -ef
+exec /usr/bin/test-fdstore $commands
+EOF
+    run0 -u testuser systemctl --user restart systemd-nspawn@fdstore.service
+    timeout 30s bash -c \
+        'until [[ "$(run0 -u testuser systemctl --user show -P NFileDescriptorStore systemd-nspawn@fdstore.service)" -eq "$1" ]]; do sleep 0.5; done' \
+        _ "$n_fds"
+    run0 -u testuser systemd-analyze --user fdstore systemd-nspawn@fdstore.service --json=short |
+        jq -e --argjson names "$names" '[.[].fdname] | sort == $names'
+    timeout 30s bash -o pipefail -c \
+        'until systemd-analyze fdstore "$1" --json=short | jq -e --argjson paths "$2" "[.[].path | select(. == \"/memfd:test-fd-a (deleted)\" or . == \"/memfd:test-fd-b (deleted)\")] | sort == \$paths"; do sleep 0.5; done' \
+        _ "user@${TESTUSER_UID}.service" "$paths"
+done
+
+cat >/home/testuser/.local/state/machines/fdstore/sbin/init <<'EOF'
+#!/usr/bin/env bash
+set -e
+exec /usr/bin/test-fdstore store
+EOF
+run0 -u testuser systemctl --user restart systemd-nspawn@fdstore.service
 
 # 7) Failure case: with FileDescriptorStorePreserve=on-success, the fdstore must
 # be dropped once the unit enters the permanent failed state (i.e. once all

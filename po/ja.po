@@ -7,7 +7,7 @@
 msgid ""
 msgstr ""
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-08-26 10:57+0100\n"
+"POT-Creation-Date: 2026-11-26 13:11+0000\n"
 "PO-Revision-Date: 2026-08-02 00:10+0000\n"
 "Last-Translator: Takuro Onoue <kusanaginoturugi@gmail.com>\n"
 "Language-Team: Japanese <https://translate.fedoraproject.org/projects/"
@@ -147,7 +147,8 @@ msgstr "ホームディレクトリの署名キーの管理"
 msgid "Authentication is required to manage signing keys for home directories."
 msgstr "ホームディレクトリの署名キーを管理するには認証が必要です。"
 
-#: src/home/pam_systemd_home.c:328
+#. ret_response=
+#: src/home/pam_systemd_home.c:324
 #, c-format
 msgid ""
 "Home of user %s is currently absent, please plug in the necessary storage "
@@ -156,30 +157,33 @@ msgstr ""
 "ユーザー %s のホーム領域は現在利用できません。必要なストレージデバイスまたは"
 "ホーム領域の保存先となるファイルシステムを接続してください。"
 
-#: src/home/pam_systemd_home.c:333
+#. ret_response=
+#: src/home/pam_systemd_home.c:329
 #, c-format
 msgid "Too frequent login attempts for user %s, try again later."
 msgstr "ユーザー %s のログイン試行が頻繁すぎます。後ほどやり直してください。"
 
-#: src/home/pam_systemd_home.c:345
+#: src/home/pam_systemd_home.c:341
 msgid "Password: "
 msgstr "パスワード： "
 
-#: src/home/pam_systemd_home.c:347
+#. ret_response=
+#: src/home/pam_systemd_home.c:343
 #, c-format
 msgid "Password incorrect or not sufficient for authentication of user %s."
 msgstr ""
 "ユーザー %s のパスワードが正しくないか、パスワードだけでは認証できません。"
 
-#: src/home/pam_systemd_home.c:348
+#: src/home/pam_systemd_home.c:344
 msgid "Sorry, try again: "
 msgstr "すみません、パスワードを再入力してください： "
 
-#: src/home/pam_systemd_home.c:370
+#: src/home/pam_systemd_home.c:366
 msgid "Recovery key: "
 msgstr "復旧キー： "
 
-#: src/home/pam_systemd_home.c:372
+#. ret_response=
+#: src/home/pam_systemd_home.c:368
 #, c-format
 msgid ""
 "Password/recovery key incorrect or not sufficient for authentication of user "
@@ -188,19 +192,21 @@ msgstr ""
 "ユーザー %s のパスワードまたは復旧キーが正しくないか、これだけでは認証できま"
 "せん。"
 
-#: src/home/pam_systemd_home.c:373
+#: src/home/pam_systemd_home.c:369
 msgid "Sorry, reenter recovery key: "
 msgstr "すみません、復旧キーを再入力してください： "
 
-#: src/home/pam_systemd_home.c:393
+#. ret_response=
+#: src/home/pam_systemd_home.c:389
 #, c-format
 msgid "Security token of user %s not inserted."
 msgstr "ユーザー %s のセキュリティトークンが挿入されていません。"
 
-#: src/home/pam_systemd_home.c:394 src/home/pam_systemd_home.c:397
+#: src/home/pam_systemd_home.c:390 src/home/pam_systemd_home.c:398
 msgid "Try again with password: "
 msgstr "パスワードを入力して再試行してください： "
 
+#. ret_response=
 #: src/home/pam_systemd_home.c:396
 #, c-format
 msgid ""
@@ -210,28 +216,32 @@ msgstr ""
 "ユーザー %s のパスワードが正しくないか、パスワードだけでは認証できません。ま"
 "た、設定済みのセキュリティトークンが挿入されていません。"
 
-#: src/home/pam_systemd_home.c:416
+#: src/home/pam_systemd_home.c:417
 msgid "Security token PIN: "
 msgstr "セキュリティトークンのPIN： "
 
-#: src/home/pam_systemd_home.c:433
+#. ret_response=
+#: src/home/pam_systemd_home.c:434
 #, c-format
 msgid "Please authenticate physically on security token of user %s."
 msgstr "ユーザー %s のセキュリティトークンを操作して認証してください。"
 
-#: src/home/pam_systemd_home.c:444
+#. ret_response=
+#: src/home/pam_systemd_home.c:445
 #, c-format
 msgid "Please confirm presence on security token of user %s."
 msgstr ""
 "ユーザー %s のセキュリティトークンで存在確認（タッチ操作など）を行ってくださ"
 "い。"
 
-#: src/home/pam_systemd_home.c:455
+#. ret_response=
+#: src/home/pam_systemd_home.c:456
 #, c-format
 msgid "Please verify user on security token of user %s."
 msgstr "ユーザー %s のセキュリティトークンで本人確認を行ってください。"
 
-#: src/home/pam_systemd_home.c:464
+#. ret_response=
+#: src/home/pam_systemd_home.c:465
 msgid ""
 "Security token PIN is locked, please unlock it first. (Hint: Removal and re-"
 "insertion might suffice.)"
@@ -239,84 +249,99 @@ msgstr ""
 "セキュリティトークンのPINがロックされています。ロックを解除してからもう一度お"
 "試しください。（ヒント：一旦トークンを外して再挿入してみてください。）"
 
-#: src/home/pam_systemd_home.c:472
+#. ret_response=
+#: src/home/pam_systemd_home.c:473
 #, c-format
 msgid "Security token PIN incorrect for user %s."
 msgstr "ユーザー %s のセキュリティトークンのPINが正しくありません。"
 
-#: src/home/pam_systemd_home.c:473 src/home/pam_systemd_home.c:492
-#: src/home/pam_systemd_home.c:511
+#: src/home/pam_systemd_home.c:474 src/home/pam_systemd_home.c:493
+#: src/home/pam_systemd_home.c:512
 msgid "Sorry, retry security token PIN: "
 msgstr "すみません、セキュリティトークンのPINを再入力してください： "
 
-#: src/home/pam_systemd_home.c:491
+#. ret_response=
+#: src/home/pam_systemd_home.c:492
 #, c-format
 msgid "Security token PIN of user %s incorrect (only a few tries left!)"
 msgstr ""
 "ユーザー %s のセキュリティトークンのPINが正しくありません（残り試行可能回数が"
 "少なくなっています！）"
 
-#: src/home/pam_systemd_home.c:510
+#. ret_response=
+#: src/home/pam_systemd_home.c:511
 #, c-format
 msgid "Security token PIN of user %s incorrect (only one try left!)"
 msgstr ""
 "ユーザー %s のセキュリティトークンのPINが正しくありません（残り試行可能回数が"
 "1回です！）"
 
-#: src/home/pam_systemd_home.c:677
+#. ret_response=
+#: src/home/pam_systemd_home.c:682
 #, c-format
 msgid "Home of user %s is currently not active, please log in locally first."
 msgstr ""
 "ユーザー %s のホーム領域がアクティブではありません。ローカル環境にログインし"
 "てください。"
 
-#: src/home/pam_systemd_home.c:679
+#. ret_response=
+#: src/home/pam_systemd_home.c:689
 #, c-format
 msgid "Home of user %s is currently locked, please unlock locally first."
 msgstr ""
 "ユーザー %s のホーム領域がロックされています。ローカル環境にてロックを解除し"
 "てからもう一度お試しください。"
 
-#: src/home/pam_systemd_home.c:713
+#. ret_response=
+#: src/home/pam_systemd_home.c:724
 #, c-format
 msgid "Too many unsuccessful login attempts for user %s, refusing."
 msgstr "ユーザー %s のログイン試行の失敗回数が多すぎたため、拒否されました。"
 
-#: src/home/pam_systemd_home.c:1015
+#. ret_response=
+#: src/home/pam_systemd_home.c:1026
 msgid "User record is blocked, prohibiting access."
 msgstr "ユーザー情報がブロックされたため、アクセスが禁止されています。"
 
-#: src/home/pam_systemd_home.c:1019
+#. ret_response=
+#: src/home/pam_systemd_home.c:1030
 msgid "User record is not valid yet, prohibiting access."
 msgstr "ユーザー情報がまだ有効でないため、アクセスが禁止されています。"
 
-#: src/home/pam_systemd_home.c:1023
+#. ret_response=
+#: src/home/pam_systemd_home.c:1034
 msgid "User record is not valid anymore, prohibiting access."
 msgstr "ユーザー情報がもはや有効でないため、アクセスが禁止されています。"
 
-#: src/home/pam_systemd_home.c:1028 src/home/pam_systemd_home.c:1077
+#. ret_response=
+#: src/home/pam_systemd_home.c:1039 src/home/pam_systemd_home.c:1088
 msgid "User record not valid, prohibiting access."
 msgstr "ユーザー情報が有効でないため、アクセスが禁止されています。"
 
-#: src/home/pam_systemd_home.c:1038
+#. ret_response=
+#: src/home/pam_systemd_home.c:1049
 #, c-format
 msgid "Too many logins, try again in %s."
 msgstr "ログイン回数が多すぎます。%s後に試してください。"
 
-#: src/home/pam_systemd_home.c:1049
+#. ret_response=
+#: src/home/pam_systemd_home.c:1060
 msgid "Password change required."
 msgstr "パスワードの更新が必要です。"
 
-#: src/home/pam_systemd_home.c:1053
+#. ret_response=
+#: src/home/pam_systemd_home.c:1064
 msgid "Password expired, change required."
 msgstr "パスワードの有効期限が切れたため、パスワードの更新が必要です。"
 
-#: src/home/pam_systemd_home.c:1059
+#. ret_response=
+#: src/home/pam_systemd_home.c:1070
 msgid "Password is expired, but can't change, refusing login."
 msgstr ""
 "パスワードの有効期限が切れましたが、更新できないため、ログインを拒否します。"
 
-#: src/home/pam_systemd_home.c:1063
+#. ret_response=
+#: src/home/pam_systemd_home.c:1074
 msgid "Password will expire soon, please change."
 msgstr "パスワードの有効期限がまもなく切れます。パスワードを更新してください。"
 
@@ -571,15 +596,15 @@ msgstr ""
 
 #: src/login/org.freedesktop.login1.policy:191
 msgid "Power off the system while an application is inhibiting this"
-msgstr "アプリケーションが使用されている状態でシステムの電源を切る"
+msgstr "アプリケーションがこの操作を阻害している状態でシステムの電源を切る"
 
 #: src/login/org.freedesktop.login1.policy:192
 msgid ""
 "Authentication is required to power off the system while an application is "
 "inhibiting this."
 msgstr ""
-"アプリケーションが使用されている状態でシステムの電源を切るには認証が必要で"
-"す。"
+"アプリケーションがこの操作を阻害している状態でシステムの電源を切るには認証が"
+"必要です。"
 
 #: src/login/org.freedesktop.login1.policy:202
 msgid "Reboot the system"
@@ -602,15 +627,15 @@ msgstr ""
 
 #: src/login/org.freedesktop.login1.policy:224
 msgid "Reboot the system while an application is inhibiting this"
-msgstr "アプリケーションが使用されている状態でシステムを再起動する"
+msgstr "アプリケーションがこの操作を阻害している状態でシステムを再起動する"
 
 #: src/login/org.freedesktop.login1.policy:225
 msgid ""
 "Authentication is required to reboot the system while an application is "
 "inhibiting this."
 msgstr ""
-"アプリケーションが使用されている状態でシステムを再起動するには認証が必要で"
-"す。"
+"アプリケーションがこの操作を阻害している状態でシステムを再起動するには認証が"
+"必要です。"
 
 #: src/login/org.freedesktop.login1.policy:235
 msgid "Halt the system"
@@ -633,14 +658,15 @@ msgstr ""
 
 #: src/login/org.freedesktop.login1.policy:257
 msgid "Halt the system while an application is inhibiting this"
-msgstr "アプリケーションが使用されている状態でシステムを停止する"
+msgstr "アプリケーションがこの操作を阻害している状態でシステムを停止する"
 
 #: src/login/org.freedesktop.login1.policy:258
 msgid ""
 "Authentication is required to halt the system while an application is "
 "inhibiting this."
 msgstr ""
-"アプリケーションが使用されている状態でシステムを停止するには認証が必要です。"
+"アプリケーションがこの操作を阻害している状態でシステムを停止するには認証が必"
+"要です。"
 
 #: src/login/org.freedesktop.login1.policy:268
 msgid "Suspend the system"
@@ -664,15 +690,15 @@ msgstr ""
 
 #: src/login/org.freedesktop.login1.policy:289
 msgid "Suspend the system while an application is inhibiting this"
-msgstr "アプリケーションが使用されている状態でシステムをサスペンドする"
+msgstr "アプリケーションがこの操作を阻害している状態でシステムをサスペンドする"
 
 #: src/login/org.freedesktop.login1.policy:290
 msgid ""
 "Authentication is required to suspend the system while an application is "
 "inhibiting this."
 msgstr ""
-"アプリケーションが使用されている状態でシステムをサスペンドするには認証が必要"
-"です。"
+"アプリケーションがこの操作を阻害している状態でシステムをサスペンドするには認"
+"証が必要です。"
 
 #: src/login/org.freedesktop.login1.policy:300
 msgid "Hibernate the system"
@@ -696,15 +722,16 @@ msgstr ""
 
 #: src/login/org.freedesktop.login1.policy:321
 msgid "Hibernate the system while an application is inhibiting this"
-msgstr "アプリケーションが使用されている状態でシステムをハイバネートする"
+msgstr ""
+"アプリケーションがこの操作を阻害している状態でシステムをハイバネートする"
 
 #: src/login/org.freedesktop.login1.policy:322
 msgid ""
 "Authentication is required to hibernate the system while an application is "
 "inhibiting this."
 msgstr ""
-"アプリケーションが使用されている状態でシステムをハイバネートするには認証が必"
-"要です。"
+"アプリケーションがこの操作を阻害している状態でシステムをハイバネートするには"
+"認証が必要です。"
 
 #: src/login/org.freedesktop.login1.policy:332
 msgid "Manage active sessions, users and seats"
@@ -724,44 +751,42 @@ msgstr "アクティブなセッションをロックまたはロック解除す
 
 #: src/login/org.freedesktop.login1.policy:352
 msgid "Set the reboot \"reason\" in the kernel"
-msgstr "再起動の理由を設定する"
+msgstr "カーネルに再起動の理由を設定する"
 
 #: src/login/org.freedesktop.login1.policy:353
 msgid "Authentication is required to set the reboot \"reason\" in the kernel."
-msgstr "再起動の理由を設定するには認証が必要です。"
+msgstr "カーネルに再起動の理由を設定するには認証が必要です。"
 
 #: src/login/org.freedesktop.login1.policy:363
 msgid "Indicate to the firmware to boot to setup interface"
-msgstr "ファームウェアに「インターフェースの設定を起動」を表示させる"
+msgstr "ファームウェアにセットアップ画面の起動を指示する"
 
 #: src/login/org.freedesktop.login1.policy:364
 msgid ""
 "Authentication is required to indicate to the firmware to boot to setup "
 "interface."
-msgstr ""
-"ファームウェアに「インターフェースの設定を起動」を表示させるには認証が必要で"
-"す。"
+msgstr "ファームウェアにセットアップ画面の起動を指示するには認証が必要です。"
 
 #: src/login/org.freedesktop.login1.policy:374
 msgid "Indicate to the boot loader to boot to the boot loader menu"
-msgstr "ブートローダーにメニューを起動するための項目を表示させる"
+msgstr "ブートローダーにブートローダーメニューの起動を指示する"
 
 #: src/login/org.freedesktop.login1.policy:375
 msgid ""
 "Authentication is required to indicate to the boot loader to boot to the "
 "boot loader menu."
 msgstr ""
-"ブートローダーにメニューを起動するための項目を表示させるには認証が必要です。"
+"ブートローダーにブートローダーメニューの起動を指示するには認証が必要です。"
 
 #: src/login/org.freedesktop.login1.policy:385
 msgid "Indicate to the boot loader to boot a specific entry"
-msgstr "ブートローダーに特定の項目を表示させる"
+msgstr "ブートローダーに特定の項目の起動を指示する"
 
 #: src/login/org.freedesktop.login1.policy:386
 msgid ""
 "Authentication is required to indicate to the boot loader to boot into a "
 "specific boot loader entry."
-msgstr "ブートローダーに特定の項目を表示させるには認証が必要です。"
+msgstr "ブートローダーに特定の項目の起動を指示するには認証が必要です。"
 
 #: src/login/org.freedesktop.login1.policy:396
 msgid "Set a wall message"
@@ -986,7 +1011,7 @@ msgstr "NTPの設定を破棄するには認証が必要です。"
 
 #: src/network/org.freedesktop.network1.policy:132
 msgid "Revert DNS settings"
-msgstr "DNSの設定を破棄"
+msgstr "DNSの設定の破棄"
 
 #: src/network/org.freedesktop.network1.policy:133
 msgid "Authentication is required to reset DNS settings."
@@ -1164,7 +1189,7 @@ msgstr "システム更新の確認"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:39
 msgid "Authentication is required to check for system updates."
-msgstr "システム更新の確認をするには認証が必要です。"
+msgstr "システム更新の確認には認証が必要です。"
 
 #: src/sysupdate/org.freedesktop.sysupdate1.policy:48
 msgid "Cancel checking for system updates"
@@ -1274,40 +1299,40 @@ msgid ""
 "shall be enabled."
 msgstr "ネットワーク経由の時刻同期を有効または無効にするには認証が必要です。"
 
-#: src/core/dbus-unit.c:372
+#: src/core/dbus-unit.c:373
 msgid "Authentication is required to start '$(unit)'."
 msgstr "'$(unit)'を開始するには認証が必要です。"
 
-#: src/core/dbus-unit.c:373
+#: src/core/dbus-unit.c:374
 msgid "Authentication is required to stop '$(unit)'."
 msgstr "'$(unit)'を停止するには認証が必要です。"
 
-#: src/core/dbus-unit.c:374
+#: src/core/dbus-unit.c:375
 msgid "Authentication is required to reload '$(unit)'."
 msgstr "'$(unit)'を再読み込みするには認証が必要です。"
 
-#: src/core/dbus-unit.c:375 src/core/dbus-unit.c:376
+#: src/core/dbus-unit.c:376 src/core/dbus-unit.c:377
 msgid "Authentication is required to restart '$(unit)'."
 msgstr "'$(unit)'を再起動するには認証が必要です。"
 
-#: src/core/dbus-unit.c:594
+#: src/core/dbus-unit.c:595
 msgid ""
 "Authentication is required to send a UNIX signal to the processes of '$"
 "(unit)'."
 msgstr "'$(unit)'のプロセスにUNIXシグナルを送るには認証が必要です。"
 
-#: src/core/dbus-unit.c:647
+#: src/core/dbus-unit.c:648
 msgid ""
 "Authentication is required to send a UNIX signal to the processes of "
 "subgroup of '$(unit)'."
 msgstr ""
 "'$(unit)'のサブグループ内のプロセスにUNIXシグナルを送るには認証が必要です。"
 
-#: src/core/dbus-unit.c:675
+#: src/core/dbus-unit.c:676
 msgid "Authentication is required to reset the \"failed\" state of '$(unit)'."
 msgstr "'$(unit)'の「失敗」状態をリセットするには認証が必要です。"
 
-#: src/core/dbus-unit.c:705
+#: src/core/dbus-unit.c:706
 msgid "Authentication is required to set properties on '$(unit)'."
 msgstr "'$(unit)'のプロパティを設定するには認証が必要です。"
 
@@ -1323,17 +1348,17 @@ msgid ""
 "Authentication is required to freeze or thaw the processes of '$(unit)' unit."
 msgstr "'$(unit)'のプロセスを凍結または凍結解除するには認証が必要です。"
 
-#: src/shared/libfido2-util.c:494 src/shared/libfido2-util.c:551
+#: src/shared/libfido2-util.c:697 src/shared/libfido2-util.c:754
 msgid "Please confirm presence on security token to unlock."
 msgstr ""
 "ロックを解除するには、セキュリティトークンで存在確認（タッチ操作など）を行っ"
 "てください。"
 
-#: src/shared/libfido2-util.c:510
+#: src/shared/libfido2-util.c:713
 msgid "Please verify user on security token to unlock."
 msgstr "ロックを解除するには、セキュリティトークンで本人確認を行ってください。"
 
-#: src/shared/libfido2-util.c:944
+#: src/shared/libfido2-util.c:1196
 #, c-format
 msgid ""
 "Please enter security token PIN (remaining attempts before lock-out: %d):"
@@ -1341,6 +1366,6 @@ msgstr ""
 "セキュリティトークンのPINを入力してください（ロックアウトされるまでの残り試行"
 "回数：%d）："
 
-#: src/shared/libfido2-util.c:955
+#: src/shared/libfido2-util.c:1207
 msgid "Please enter security token PIN:"
 msgstr "セキュリティトークンのPINを入力してください："

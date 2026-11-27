@@ -116,6 +116,8 @@ node /org/freedesktop/hostname1 {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly ay BootID = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly ay FileSystemID = [...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly u VSockCID = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s ChassisAssetTag = '...';
@@ -215,6 +217,8 @@ node /org/freedesktop/hostname1 {
     <variablelist class="dbus-property" generated="True" extra-ref="MachineID"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="BootID"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="FileSystemID"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="VSockCID"/>
 
@@ -329,6 +333,14 @@ node /org/freedesktop/hostname1 {
     <para><varname>BootID</varname> expose the 128bit boot ID, as per
     <filename>/proc/sys/kernel/random/boot_id</filename>.</para>
 
+    <para><varname>FileSystemID</varname> exposes the 128bit UUID of the file system backing
+    <filename>/var/</filename>, as reported by the kernel's <constant>FS_IOC_GETFSUUID</constant>
+    <citerefentry project="man-pages"><refentrytitle>ioctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>.
+    Since <filename>/var/</filename> carries the persistent, writable state of the system, this may be used
+    to identify a specific installation. An empty array if the file system does not report a UUID, or if
+    running in a container (as the file system is then typically owned by the host, and might be shared
+    with other containers).</para>
+
     <para><varname>VSockCID</varname> exposes the system's local <constant>AF_VSOCK</constant> CID (Context
     Identifier, i.e. address) for the system, if one is available in the virtual machine environment. Set to
     <constant>UINT32_MAX</constant> otherwise. See <citerefentry project="man-pages"><refentrytitle>vsock</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
@@ -390,11 +402,15 @@ node /org/freedesktop/hostname1 {
       the <varname>TAGS=</varname> field from <filename>/etc/machine-info</filename>.</para>
 
       <para><function>AddAndRemoveTags()</function> incrementally updates the <varname>Tags</varname>
-      property instead of replacing it. It takes two lists of machine tags: the tags in <varname>add</varname>
-      are added to the current list, and the tags in <varname>remove</varname> are dropped from it (the
-      resulting list is <varname>(current ∪ add) \ remove</varname>, sorted and deduplicated). This is useful
-      when several independent agents each manage a subset of the tags without racing on a read-modify-write
-      of the full list. Each tag must be a valid machine tag, as for <function>SetTags()</function>.</para>
+      property instead of replacing it. It takes two lists of machine tags: the tags in
+      <varname>add</varname> are added to the current list, and any tags matching the patterns in
+      <varname>remove</varname> are dropped from it (the resulting list is <varname>(current ∪ add) \
+      remove</varname>, sorted and deduplicated). A
+      <literal><replaceable>key</replaceable>=<replaceable>value</replaceable></literal> tag in
+      <varname>add</varname> replaces any assignment of the same key in the current list. This is useful when
+      several independent agents each manage a subset of the tags without racing on a read-modify-write of
+      the full list. Each tag to add must be a valid machine tag, as for
+      <function>SetTags()</function>.</para>
 
       <para><varname>PrettyHostname</varname>, <varname>IconName</varname>, <varname>Chassis</varname>,
       <varname>Deployment</varname>, <varname>Location</varname>, and <varname>Tags</varname> are stored in
@@ -524,23 +540,22 @@ node /org/freedesktop/hostname1 {
 
   <refsect1>
     <title>History</title>
-    <refsect2>
-      <title>The D-Bus API</title>
-      <para><varname>FirmwareVersion</varname> and
-      <function>GetHardwareSerial()</function> were added in version 251.</para>
-      <para><varname>OperatingSystemSupportEnd</varname>,
-      <varname>FirmwareVendor</varname>, and
-      <varname>FirmwareDate</varname> were added in version 253.</para>
-      <para><varname>MachineID</varname>, <varname>BootID</varname> and
-      <varname>VSockCID</varname> were added in version 256.</para>
-      <para><varname>ChassisAssetTag</varname>, <varname>OperatingSystemImageID</varname>,
-      <varname>OperatingSystemImageVersion</varname>, <varname>HardwareSKU</varname>, and
-      <varname>HardwareVersion</varname> were added in version 258.</para>
-      <para><varname>OperatingSystemFancyName</varname> was added in version 260.</para>
-      <para><function>GetMachineInfo()</function>, <varname>Tags</varname> and
-      <function>SetTags()</function> were added in version 261.</para>
-      <para><function>AddAndRemoveTags()</function> was added in version 262.</para>
-    </refsect2>
+    <para>The <interfacename>org.freedesktop.hostname1</interfacename> D-Bus API was added in version 25.</para>
+    <para><varname>FirmwareVersion</varname> and
+    <function>GetHardwareSerial()</function> were added in version 251.</para>
+    <para><varname>OperatingSystemSupportEnd</varname>,
+    <varname>FirmwareVendor</varname>, and
+    <varname>FirmwareDate</varname> were added in version 253.</para>
+    <para><varname>MachineID</varname>, <varname>BootID</varname> and
+    <varname>VSockCID</varname> were added in version 256.</para>
+    <para><varname>ChassisAssetTag</varname>, <varname>OperatingSystemImageID</varname>,
+    <varname>OperatingSystemImageVersion</varname>, <varname>HardwareSKU</varname>, and
+    <varname>HardwareVersion</varname> were added in version 258.</para>
+    <para><varname>OperatingSystemFancyName</varname> was added in version 260.</para>
+    <para><function>GetMachineInfo()</function>, <varname>Tags</varname> and
+    <function>SetTags()</function> were added in version 261.</para>
+    <para><function>AddAndRemoveTags()</function> was added in version 262.</para>
+    <para><varname>FileSystemID</varname> was added in version 263.</para>
   </refsect1>
 
   <refsect1>

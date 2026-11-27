@@ -61,10 +61,10 @@
 
 TEST(load_env_file_1) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
-        assert_se(write_tmpfile(name, env_file_1) == 0);
+        ASSERT_OK_ZERO(write_tmpfile(name, env_file_1));
 
         _cleanup_strv_free_ char **data = NULL;
-        assert_se(load_env_file(NULL, name, &data) == 0);
+        ASSERT_OK_ZERO(load_env_file(NULL, name, &data));
         ASSERT_STREQ(data[0], "a=a");
         ASSERT_STREQ(data[1], "b=bc");
         ASSERT_STREQ(data[2], "d=de  f");
@@ -76,20 +76,20 @@ TEST(load_env_file_1) {
 
 TEST(load_env_file_2) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
-        assert_se(write_tmpfile(name, env_file_2) == 0);
+        ASSERT_OK_ZERO(write_tmpfile(name, env_file_2));
 
         _cleanup_strv_free_ char **data = NULL;
-        assert_se(load_env_file(NULL, name, &data) == 0);
+        ASSERT_OK_ZERO(load_env_file(NULL, name, &data));
         ASSERT_STREQ(data[0], "a=a");
         ASSERT_NULL(data[1]);
 }
 
 TEST(load_env_file_3) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
-        assert_se(write_tmpfile(name, env_file_3) == 0);
+        ASSERT_OK_ZERO(write_tmpfile(name, env_file_3));
 
         _cleanup_strv_free_ char **data = NULL;
-        assert_se(load_env_file(NULL, name, &data) == 0);
+        ASSERT_OK_ZERO(load_env_file(NULL, name, &data));
         ASSERT_STREQ(data[0], "normal1=line111");
         ASSERT_STREQ(data[1], "normal2=line222");
         ASSERT_NULL(data[2]);
@@ -97,10 +97,10 @@ TEST(load_env_file_3) {
 
 TEST(load_env_file_4) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
-        assert_se(write_tmpfile(name, env_file_4) == 0);
+        ASSERT_OK_ZERO(write_tmpfile(name, env_file_4));
 
         _cleanup_strv_free_ char **data = NULL;
-        assert_se(load_env_file(NULL, name, &data) == 0);
+        ASSERT_OK_ZERO(load_env_file(NULL, name, &data));
         ASSERT_STREQ(data[0], "HWMON_MODULES=coretemp f71882fg");
         ASSERT_STREQ(data[1], "MODULE_0=coretemp");
         ASSERT_STREQ(data[2], "MODULE_1=f71882fg");
@@ -109,10 +109,10 @@ TEST(load_env_file_4) {
 
 TEST(load_env_file_5) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
-        assert_se(write_tmpfile(name, env_file_5) == 0);
+        ASSERT_OK_ZERO(write_tmpfile(name, env_file_5));
 
         _cleanup_strv_free_ char **data = NULL;
-        assert_se(load_env_file(NULL, name, &data) == 0);
+        ASSERT_OK_ZERO(load_env_file(NULL, name, &data));
         ASSERT_STREQ(data[0], "a=");
         ASSERT_STREQ(data[1], "b=");
         ASSERT_NULL(data[2]);
@@ -120,10 +120,10 @@ TEST(load_env_file_5) {
 
 TEST(load_env_file_6) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
-        assert_se(write_tmpfile(name, env_file_6) == 0);
+        ASSERT_OK_ZERO(write_tmpfile(name, env_file_6));
 
         _cleanup_strv_free_ char **data = NULL;
-        assert_se(load_env_file(NULL, name, &data) == 0);
+        ASSERT_OK_ZERO(load_env_file(NULL, name, &data));
         ASSERT_STREQ(data[0], "a= n t x y '");
         ASSERT_STREQ(data[1], "b=$'");
         ASSERT_STREQ(data[2], "c= \\n\\t\\$\\`\\\\\n");
@@ -142,11 +142,11 @@ TEST(load_env_file_invalid_utf8) {
                        "foo=b\uffffar",
                        "baz=hello world\ufffe") {
                 _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
-                assert_se(write_tmpfile(name, s) == 0);
+                ASSERT_OK_ZERO(write_tmpfile(name, s));
 
                 _cleanup_strv_free_ char **data = NULL;
-                assert_se(load_env_file(NULL, name, &data) == -EINVAL);
-                assert_se(!data);
+                ASSERT_ERROR(load_env_file(NULL, name, &data), EINVAL);
+                ASSERT_NULL(data);
         }
 }
 
@@ -169,21 +169,21 @@ TEST(write_and_load_env_file) {
                 _cleanup_pclose_ FILE *f = NULL;
                 size_t sz;
 
-                assert_se(tempfn_random_child(NULL, NULL, &p) >= 0);
+                ASSERT_OK(tempfn_random_child(NULL, /* extra= */ NULL, &p));
 
-                assert_se(j = strjoin("TEST=", v));
-                assert_se(write_env_file(AT_FDCWD, p, STRV_MAKE("# header 1", "", "# header 2"), STRV_MAKE(j), /* flags= */ 0) >= 0);
+                ASSERT_NOT_NULL(j = strjoin("TEST=", v));
+                ASSERT_OK(write_env_file(AT_FDCWD, p, STRV_MAKE("# header 1", "", "# header 2"), STRV_MAKE(j), /* flags= */ 0));
 
-                assert_se(cmd = strjoin(". ", p, " && /bin/echo -n \"$TEST\""));
-                assert_se(f = popen(cmd, "re"));
-                assert_se(read_full_stream(f, &from_shell, &sz) >= 0);
-                assert_se(sz == strlen(v));
+                ASSERT_NOT_NULL(cmd = strjoin(". ", p, " && /bin/echo -n \"$TEST\""));
+                ASSERT_NOT_NULL(f = popen(cmd, "re"));
+                ASSERT_OK(read_full_stream(f, &from_shell, &sz));
+                ASSERT_EQ(sz, strlen(v));
                 ASSERT_STREQ(from_shell, v);
 
-                assert_se(load_env_file(NULL, p, &l) >= 0);
-                assert_se(strv_equal(l, STRV_MAKE(j)));
+                ASSERT_OK(load_env_file(NULL, p, &l));
+                ASSERT_STRV_EQ_SET(l, j);
 
-                assert_se(parse_env_file(NULL, p, "TEST", &w) >= 0);
+                ASSERT_OK(parse_env_file(NULL, p, "TEST", &w));
                 ASSERT_STREQ(w, v);
         }
 }
@@ -446,6 +446,27 @@ TEST(merge_env_file_invalid) {
                 log_debug("Got: <%s>", *i);
 
         ASSERT_TRUE(strv_isempty(a));
+}
+
+TEST(merge_env_file_invalid_utf8) {
+        _cleanup_(unlink_tempfilep) char t[] = "/tmp/test-fileio-XXXXXX";
+        _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_strv_free_ char **a = NULL;
+
+        ASSERT_OK(fmkostemp_safe(t, "w", &f));
+
+        /* Assignments with invalid UTF-8 in the value shall be skipped,
+         * without affecting the assignments before and after. */
+        ASSERT_OK(write_string_stream(f,
+                                      "one=1\n"
+                                      "two=\xff\n"
+                                      "three=${one}\xff\n"
+                                      "four=4\n",
+                                      WRITE_STRING_FILE_AVOID_NEWLINE));
+
+        ASSERT_OK(merge_env_file(&a, NULL, t));
+
+        ASSERT_TRUE(strv_equal(a, STRV_MAKE("one=1", "four=4")));
 }
 
 static void check_file_pairs_one(char **l) {

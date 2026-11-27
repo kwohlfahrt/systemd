@@ -48,7 +48,7 @@ static int server(void *userdata) {
 
         ASSERT_OK(sd_id128_randomize(&id));
 
-        ASSERT_OK(fd = sd_fiber_accept(listen_fd, NULL, NULL, SOCK_CLOEXEC|SOCK_NONBLOCK));
+        ASSERT_OK(fd = sd_fiber_accept(listen_fd, /* addr= */ NULL, /* addrlen= */ NULL, SOCK_CLOEXEC|SOCK_NONBLOCK));
 
         ASSERT_OK(sd_bus_new(&bus));
         ASSERT_OK(sd_bus_set_fd(bus, fd, fd));
@@ -91,7 +91,7 @@ static int server(void *userdata) {
 
         const char *comm;
         ASSERT_OK(sd_bus_creds_get_comm(c, &comm));
-        ASSERT_OK(pid_get_comm(0, &our_comm));
+        ASSERT_OK(pid_get_comm(/* pid= */ 0, &our_comm));
         ASSERT_STREQ(comm, our_comm);
 
         const char *description;
@@ -125,10 +125,10 @@ static int client(void *userdata) {
         ASSERT_OK(sd_bus_new(&bus));
         ASSERT_OK(sd_bus_set_description(bus, "wuffwuff"));
         ASSERT_OK(sd_bus_set_address(bus, userdata));
-        ASSERT_OK(sd_bus_attach_event(bus, sd_fiber_get_event(), 0));
+        ASSERT_OK(sd_bus_attach_event(bus, sd_fiber_get_event(), /* priority= */ 0));
         ASSERT_OK(sd_bus_start(bus));
 
-        ASSERT_OK(sd_bus_call_method(bus, "foo.foo", "/foo", "foo.foo", "Foo", NULL, &reply, "s", "foo"));
+        ASSERT_OK(sd_bus_call_method(bus, "foo.foo", "/foo", "foo.foo", "Foo", /* reterr_error= */ NULL, &reply, "s", "foo"));
 
         ASSERT_OK(sd_bus_message_read(reply, "s", &z));
         ASSERT_STREQ(z, "bar");
@@ -160,10 +160,10 @@ TEST(description) {
         ASSERT_OK(sd_event_new(&e));
         ASSERT_OK(sd_event_set_exit_on_idle(e, true));
 
-        ASSERT_OK(sd_fiber_new(e, "server", server, INT_TO_PTR(fd), /* destroy= */ NULL, &f_server));
+        ASSERT_OK(sd_fiber_new(e, "server", server, INT_TO_PTR(fd), &f_server));
         TAKE_FD(fd);
 
-        ASSERT_OK(sd_fiber_new(e, "client", client, a, /* destroy= */ NULL, &f_client));
+        ASSERT_OK(sd_fiber_new(e, "client", client, a, &f_client));
 
         ASSERT_OK(sd_event_loop(e));
 

@@ -11,7 +11,7 @@ FSTYPE=$(stat --file-system --format "%T" /usr)
 
 shopt -s nullglob
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 at_exit() {
     set +ex
 
@@ -97,20 +97,15 @@ prepare_root() {
     prepend_trap "cleanup_os_release ${root@Q}"
 }
 
+# shellcheck disable=SC2317,SC2329
 cleanup_os_release() {
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     local root=${1:-}
 
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     rm -f "$root/usr/lib/os-release"
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     if [[ -e $root/usr/lib/os-release.orig ]]; then
-        # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
         mv "$root/usr/lib/os-release.orig" "$root/usr/lib/os-release"
     fi
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     if [[ -e $root/etc/os-release.orig ]]; then
-        # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
         mv "$root/etc/os-release.orig" "$root/etc/os-release"
     fi
 }
@@ -157,6 +152,42 @@ prepare_extension_image_with_matching_id_like() {
     ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
     mkdir -p "${ext_release%/*}"
     echo "ID=test_alike" >"$ext_release"
+    mkdir -p "$ext_dir/$hierarchy"
+    touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
+
+    prepend_trap "rm -rf ${ext_dir@Q}"
+}
+
+prepare_extension_image_with_image_id() {
+    local root=${1:-}
+    local hierarchy=${2:?}
+    local image_id=${3:?}
+    local ext_dir ext_release name
+
+    name="test-extension-image-id"
+    ext_dir="$root/var/lib/extensions/$name"
+    ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
+    mkdir -p "${ext_release%/*}"
+    {
+        echo "ID=testtest"
+        echo "IMAGE_ID=$image_id"
+    } >"$ext_release"
+    mkdir -p "$ext_dir/$hierarchy"
+    touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
+
+    prepend_trap "rm -rf ${ext_dir@Q}"
+}
+
+prepare_extension_image_with_match() {
+    local root=${1:-}
+    local hierarchy=${2:?}
+    local ext_dir ext_release name
+
+    name="test-extension-match"
+    ext_dir="$root/var/lib/extensions/$name"
+    ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
+    mkdir -p "${ext_release%/*}"
+    echo "ID=_any" >"$ext_release"
     mkdir -p "$ext_dir/$hierarchy"
     touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
 
@@ -1253,6 +1284,189 @@ extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
 
 
 ( init_trap
+: "Check if merging an extension with matching IMAGE_ID succeeds"
+fake_root=${roots_dir:+"$roots_dir/matching-image-id"}
+hierarchy=/opt
+
+prepare_root "$fake_root" "$hierarchy"
+echo "IMAGE_ID=testimage" >>"$fake_root/usr/lib/os-release"
+prepare_extension_image_with_image_id "$fake_root" "$hierarchy" "testimage"
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+run_systemd_sysext "$fake_root" merge
+extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+
+run_systemd_sysext "$fake_root" unmerge
+extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+)
+
+
+( init_trap
+: "Check if merging an extension with mismatched IMAGE_ID fails"
+fake_root=${roots_dir:+"$roots_dir/mismatched-image-id"}
+hierarchy=/opt
+
+prepare_root "$fake_root" "$hierarchy"
+echo "IMAGE_ID=testimage" >>"$fake_root/usr/lib/os-release"
+prepare_extension_image_with_image_id "$fake_root" "$hierarchy" "otherid"
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+run_systemd_sysext "$fake_root" merge
+extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+)
+
+
+( init_trap
+: "Check if merging an extension with IMAGE_ID fails when host has no IMAGE_ID"
+fake_root=${roots_dir:+"$roots_dir/image-id-no-host"}
+hierarchy=/opt
+
+prepare_root "$fake_root" "$hierarchy"
+prepare_extension_image_with_image_id "$fake_root" "$hierarchy" "testimage"
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+run_systemd_sysext "$fake_root" merge
+extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+)
+
+
+( init_trap
+: "Check that extensions are restricted to systems via MATCH_*= in extension-release and user.uapi.match_* xattrs"
+fake_root=${roots_dir:+"$roots_dir/match-host"}
+hierarchy=/opt
+name=test-extension-match
+ext_dir="$fake_root/var/lib/extensions/$name"
+ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
+
+prepare_root "$fake_root" "$hierarchy"
+prepare_extension_image_with_match "$fake_root" "$hierarchy"
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+if [[ -n "$fake_root" ]]; then
+    mkdir -p "$fake_root/etc"
+    echo sysexthost >"$fake_root/etc/hostname"
+    echo 4b1f7c950d4f4e1a9e8f3d22576180a3 >"$fake_root/etc/machine-id"
+    host=sysexthost
+    machine_id=4b1f7c950d4f4e1a9e8f3d22576180a3
+else
+    host="$(hostname)"
+    machine_id="$(</etc/machine-id)"
+fi
+
+# Matching rules in extension-release: merged
+printf 'ID=_any\nMATCH_HOSTNAME="nomatch %s"\nMATCH_MACHINE_ID="%s"\n' "$host" "${machine_id:0:8}*" >"$ext_release"
+run_systemd_sysext "$fake_root" merge
+extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+run_systemd_sysext "$fake_root" unmerge
+extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+
+# Non-matching rules in extension-release: gracefully skipped
+printf 'ID=_any\nMATCH_HOSTNAME="%s"\nMATCH_MACHINE_ID=00000000000000000000000000000000\n' "$host" >"$ext_release"
+run_systemd_sysext "$fake_root" merge
+extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+printf 'ID=_any\nMATCH_MACHINE_TAGS=nomatch\n' >"$ext_release"
+run_systemd_sysext "$fake_root" merge
+extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+
+# Rules on os-release properties: ID=testtest matches, no VERSION_ID= never matches
+printf 'ID=_any\nMATCH_OS_ID="nomatch test*"\n' >"$ext_release"
+run_systemd_sysext "$fake_root" merge
+extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+run_systemd_sysext "$fake_root" unmerge
+extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+printf 'ID=_any\nMATCH_OS_ID=testtest\nMATCH_OS_VERSION=">=1"\n' >"$ext_release"
+run_systemd_sysext "$fake_root" merge
+extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+
+if setfattr -n user.uapi.match_hostname -v nomatch "$ext_dir"; then
+    # Non-matching xattr on the image: skipped
+    echo "ID=_any" >"$ext_release"
+    run_systemd_sysext "$fake_root" merge
+    extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+
+    # Matching xattr, contradicting extension-release: both honoured, i.e. skipped, with a warning
+    setfattr -n user.uapi.match_hostname -v "$host" "$ext_dir"
+    printf 'ID=_any\nMATCH_HOSTNAME=nomatch\n' >"$ext_release"
+    run_systemd_sysext "$fake_root" merge 2>&1 | grep "contradicts MATCH_HOSTNAME=nomatch" >/dev/null
+    extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+
+    # Matching xattr, identical extension-release: merged
+    printf 'ID=_any\nMATCH_HOSTNAME="%s"\n' "$host" >"$ext_release"
+    run_systemd_sysext "$fake_root" merge
+    extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+    run_systemd_sysext "$fake_root" unmerge
+    extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+
+    # --force skips the checks
+    setfattr -n user.uapi.match_hostname -v nomatch "$ext_dir"
+    run_systemd_sysext "$fake_root" merge --force
+    extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+    run_systemd_sysext "$fake_root" unmerge
+    extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+fi
+)
+
+
+( init_trap
+: "Check if merging an extension with matching IMAGE_ID and IMAGE_VERSION succeeds"
+fake_root=${roots_dir:+"$roots_dir/matching-image-version"}
+hierarchy=/opt
+
+prepare_root "$fake_root" "$hierarchy"
+echo -e "IMAGE_ID=testimage\nIMAGE_VERSION=1.0" >>"$fake_root/usr/lib/os-release"
+
+name="test-extension-image-version"
+ext_dir="$fake_root/var/lib/extensions/$name"
+ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
+mkdir -p "${ext_release%/*}"
+{
+    echo "ID=testtest"
+    echo "IMAGE_ID=testimage"
+    echo "IMAGE_VERSION=1.0"
+} >"$ext_release"
+mkdir -p "$ext_dir/$hierarchy"
+touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
+prepend_trap "rm -rf ${ext_dir@Q}"
+
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+run_systemd_sysext "$fake_root" merge
+extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+
+run_systemd_sysext "$fake_root" unmerge
+extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+)
+
+
+( init_trap
+: "Check if merging an extension with matching IMAGE_ID but mismatched IMAGE_VERSION fails"
+fake_root=${roots_dir:+"$roots_dir/mismatched-image-version"}
+hierarchy=/opt
+
+prepare_root "$fake_root" "$hierarchy"
+echo -e "IMAGE_ID=testimage\nIMAGE_VERSION=1.0" >>"$fake_root/usr/lib/os-release"
+
+name="test-extension-image-version"
+ext_dir="$fake_root/var/lib/extensions/$name"
+ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
+mkdir -p "${ext_release%/*}"
+{
+    echo "ID=testtest"
+    echo "IMAGE_ID=testimage"
+    echo "IMAGE_VERSION=2.0"
+} >"$ext_release"
+mkdir -p "$ext_dir/$hierarchy"
+touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
+prepend_trap "rm -rf ${ext_dir@Q}"
+
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+run_systemd_sysext "$fake_root" merge
+extension_verify_status_json "$fake_root" "$hierarchy" '[]'
+)
+
+
+( init_trap
 : "Check if merging fails in case of invalid mutable directory permissions"
 
 fake_root=${roots_dir:+"$roots_dir/mutable-directory-with-invalid-permissions"}
@@ -1925,6 +2139,221 @@ if systemctl --quiet is-active "$ext_unit"; then
     echo >&2 "Missing stop of extension unit"
     exit 1
 fi
+)
+
+( init_trap
+: "Check that running units an extension masks are stopped when listed for restart or reload"
+# Talks to the real service manager, skip the --root= variant (it is a no-op there)
+if [ "$roots_dir" != "" ]; then
+    exit 0
+fi
+
+unit_ext_name="test-mask-unit-extension"
+unit_ext_dir="/var/lib/extensions/$unit_ext_name"
+mask_ext_name="test-mask-extension"
+mask_ext_dir="/var/lib/extensions/$mask_ext_name"
+mask_ext_dir_moved="/var/lib/$mask_ext_name.moved"
+unit="test-mask.service"
+restart_unit="test-mask-restart.service"
+dep_unit="test-mask-dep.service"
+requiring_unit="test-mask-requiring.service"
+
+# The units come from an extension as well, because a mask below /usr/ cannot override a unit file in /run/
+mkdir -p "$unit_ext_dir/usr/lib/extension-release.d" "$unit_ext_dir/usr/lib/systemd/system"
+prepend_trap "rm -rf ${unit_ext_dir@Q}"
+prepend_trap "systemctl stop ${unit@Q} ${restart_unit@Q} ${requiring_unit@Q} ${dep_unit@Q} 2>/dev/null || :"
+cat >"$unit_ext_dir/usr/lib/extension-release.d/extension-release.$unit_ext_name" <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RELOAD_MANAGER=1
+EOF
+for u in "$unit" "$restart_unit" "$dep_unit"; do
+    cat >"$unit_ext_dir/usr/lib/systemd/system/$u" <<EOF
+[Service]
+Type=simple
+ExecStart=sleep 9999
+EOF
+done
+cat >"$unit_ext_dir/usr/lib/systemd/system/$requiring_unit" <<EOF
+[Unit]
+Requires=$dep_unit
+
+[Service]
+Type=simple
+ExecStart=sleep 9999
+EOF
+
+systemd-sysext merge
+systemctl start "$unit" "$restart_unit" "$requiring_unit"
+requiring_pid_before=$(systemctl show -P MainPID "$requiring_unit")
+
+# The masks go to /usr/local/lib/systemd/system/, which has a higher priority than /usr/lib/systemd/system/
+mkdir -p "$mask_ext_dir/usr/lib/extension-release.d" "$mask_ext_dir/usr/local/lib/systemd/system"
+prepend_trap "rm -rf ${mask_ext_dir@Q} ${mask_ext_dir_moved@Q}"
+cat >"$mask_ext_dir/usr/lib/extension-release.d/extension-release.$mask_ext_name" <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RESTART_UNITS="$restart_unit $requiring_unit"
+EXTENSION_RELOAD_OR_RESTART_UNITS="$unit"
+EOF
+for u in "$unit" "$restart_unit" "$dep_unit"; do
+    ln -s /dev/null "$mask_ext_dir/usr/local/lib/systemd/system/$u"
+done
+
+# refresh: the service manager keeps the masked units running -> fallback to StopUnit
+systemd-sysext refresh
+for u in "$unit" "$restart_unit"; do
+    if [ "$(systemctl show -P LoadState "$u")" != "masked" ]; then
+        echo >&2 "Missing mask of unit $u"
+        exit 1
+    fi
+    if systemctl --quiet is-active "$u"; then
+        echo >&2 "Missing stop of masked unit $u"
+        exit 1
+    fi
+done
+# The restart of a unit is also refused as masked when only a dependency is masked -> no fallback to StopUnit
+if ! systemctl --quiet is-active "$requiring_unit"; then
+    echo >&2 "Unexpected stop of unit with masked dependency"
+    exit 1
+fi
+if [ "$(systemctl show -P MainPID "$requiring_unit")" != "$requiring_pid_before" ]; then
+    echo >&2 "Unexpected restart of unit with masked dependency"
+    exit 1
+fi
+
+# refresh without the masks: the units are still listed by the extension that was merged before -> started
+# again. The extension is moved away and not removed, to not change a lower layer of the mounted overlayfs.
+mv "$mask_ext_dir" "$mask_ext_dir_moved"
+systemd-sysext refresh
+for u in "$unit" "$restart_unit"; do
+    if [ "$(systemctl show -P LoadState "$u")" != "loaded" ]; then
+        echo >&2 "Mask of unit $u is still in place"
+        exit 1
+    fi
+    if ! systemctl --quiet is-active "$u"; then
+        echo >&2 "Missing start of unit $u after its mask was dropped"
+        exit 1
+    fi
+done
+
+systemd-sysext unmerge
+)
+
+( init_trap
+: "Check refresh also handles the units listed by an extension that is gone or replaced afterwards"
+# Talks to the real service manager, skip the --root= variant (it is a no-op there)
+if [ "$roots_dir" != "" ]; then
+    exit 0
+fi
+
+ext_name="test-refresh-drop-extension"
+ext_dir="/var/lib/extensions/$ext_name"
+ext_dir_moved="/var/lib/$ext_name.moved"
+keep_ext_name="test-refresh-keep-extension"
+keep_ext_dir="/var/lib/extensions/$keep_ext_name"
+host_unit="test-refresh-drop-host.service"
+host_unit_file="/run/systemd/system/$host_unit"
+ext_unit="test-refresh-drop-ext.service"
+host_stamp="/run/test-refresh-drop-host.stamp"
+
+cat >"$host_unit_file" <<EOF
+[Service]
+Type=simple
+ExecStart=sleep 9999
+ExecReload=touch $host_stamp
+EOF
+prepend_trap "rm -f ${host_unit_file@Q} ${host_stamp@Q}; systemctl stop ${host_unit@Q} 2>/dev/null || :"
+systemctl daemon-reload
+systemctl start "$host_unit"
+
+mkdir -p "$ext_dir/usr/lib/extension-release.d" "$ext_dir/usr/lib/systemd/system"
+prepend_trap "rm -rf ${ext_dir@Q} ${ext_dir_moved@Q}; systemctl stop ${ext_unit@Q} 2>/dev/null || :"
+cat >"$ext_dir/usr/lib/extension-release.d/extension-release.$ext_name" <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RESTART_UNITS="$host_unit $ext_unit"
+EOF
+cat >"$ext_dir/usr/lib/systemd/system/$ext_unit" <<EOF
+[Service]
+Type=simple
+ExecStart=sleep 9999
+EOF
+
+# A second extension that stays, so that the refresh below merges again instead of unmerging
+mkdir -p "$keep_ext_dir/usr/lib/extension-release.d"
+prepend_trap "rm -rf ${keep_ext_dir@Q}"
+cat >"$keep_ext_dir/usr/lib/extension-release.d/extension-release.$keep_ext_name" <<EOF
+ID=_any
+ARCHITECTURE=_any
+EOF
+
+systemd-sysext merge
+if ! systemctl --quiet is-active "$ext_unit"; then
+    echo >&2 "Missing start of extension unit"
+    exit 1
+fi
+host_pid_merged=$(systemctl show -P MainPID "$host_unit")
+
+# refresh without the first extension: nothing lists the units anymore, but the host unit file is still
+# in /run -> restart (new PID), and the extension unit file is gone -> fallback to StopUnit.
+# The extension is moved away and not removed, to not change a lower layer of the mounted overlayfs.
+mv "$ext_dir" "$ext_dir_moved"
+systemd-sysext refresh
+host_pid_refreshed=$(systemctl show -P MainPID "$host_unit")
+if [ "$host_pid_merged" = "$host_pid_refreshed" ]; then
+    echo >&2 "Missing restart of host unit after its extension was dropped"
+    exit 1
+fi
+if ! systemctl --quiet is-active "$host_unit"; then
+    echo >&2 "Unexpected stop of host unit after its extension was dropped"
+    exit 1
+fi
+if systemctl --quiet is-active "$ext_unit"; then
+    echo >&2 "Missing stop of extension unit after its extension was dropped"
+    exit 1
+fi
+
+# refresh with the first extension again: the extension unit is started
+mv "$ext_dir_moved" "$ext_dir"
+systemd-sysext refresh
+if ! systemctl --quiet is-active "$ext_unit"; then
+    echo >&2 "Missing start of extension unit after its extension came back"
+    exit 1
+fi
+host_pid_merged=$(systemctl show -P MainPID "$host_unit")
+
+# refresh with a new version of the first extension, which does not ship the extension unit anymore and
+# only asks for a reload of the host unit: the old version listed the host unit for restart, which takes
+# precedence -> restart (new PID, no stamp file), and the extension unit file is gone -> fallback to StopUnit
+mv "$ext_dir" "$ext_dir_moved"
+mkdir -p "$ext_dir/usr/lib/extension-release.d"
+cat >"$ext_dir/usr/lib/extension-release.d/extension-release.$ext_name" <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RELOAD_OR_RESTART_UNITS="$host_unit"
+EOF
+rm -f "$host_stamp"
+systemd-sysext refresh
+host_pid_refreshed=$(systemctl show -P MainPID "$host_unit")
+if [ "$host_pid_merged" = "$host_pid_refreshed" ]; then
+    echo >&2 "Missing restart of host unit after its extension was replaced"
+    exit 1
+fi
+if ! systemctl --quiet is-active "$host_unit"; then
+    echo >&2 "Unexpected stop of host unit after its extension was replaced"
+    exit 1
+fi
+if [ -e "$host_stamp" ]; then
+    echo >&2 "Unexpected reload of host unit after its extension was replaced (should have restarted only)"
+    exit 1
+fi
+if systemctl --quiet is-active "$ext_unit"; then
+    echo >&2 "Missing stop of extension unit after its extension was replaced"
+    exit 1
+fi
+
+systemd-sysext unmerge
 )
 
 ( init_trap
